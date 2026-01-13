@@ -1,0 +1,243 @@
+import socket
+import threading
+import sys
+
+# --- Configuration ---
+LISTEN_ADDR = '0.0.0.0'
+LISTEN_PORT = 61621       # Port the Controller connects to
+TARGET_ADDR = '127.0.0.1' # The IP of your ActiveMQ Broker
+TARGET_PORT = 61613       # The actual ActiveMQ STOMP port
+
+# Credentials to inject into CONNECT frame if missing
+AUTH_USER = "admin"
+AUTH_PASS = "password"
+
+def print_banner():
+    """Prints the initialization details of the proxy."""
+    print("="*65)
+    print("        STOMP PROTOCOL FIXER & DEBUG PROXY")
+    print("="*65)
+    print(f" Status:           [RUNNING]")
+    print(f" Proxy Mode:       [CONTROLLER] <-> [BROKER]")
+    print(f" Local Listener:   {LISTEN_ADDR}:{LISTEN_PORT}")
+    print(f" Remote Target:    {TARGET_ADDR}:{TARGET_PORT}")
+    print(f" Fixes Enabled:    Double Newline Injection, Null-byte Check")
+    print("="*65)
+    print(" Directional Legend:")
+    print("   >>>>  CONTROLLER to BROKER (Outgoing Request)")
+    print("   <<<<  BROKER to CONTROLLER (Incoming Response/Event)")
+    print("="*65)
+    sys.stdout.flush()
+
+import re
+
+def fix_stomp_format(raw_data):
+    """
+    Enhanced STOMP Frame Fixer:
+    1. Forces double newline (\n\n) between Header and Body
+    2. Re-calculates content-length
+    3. Ensures exactly one NULL byte (\0) at the end
+    
+    Core fix: Resolves issue where Controller sends SEND frames without double newline,
+    causing ActiveMQ to misinterpret Body as STOMP commands.
+    """
+    try:
+        # Check if this is a STOMP command frame
+        decoded_header_part = raw_data[:512].decode('utf-8', errors='ignore')
+        
+        # If not SEND or MESSAGE frame, just handle NULL byte
+        if "SEND" not in decoded_header_part and "MESSAGE" not in decoded_header_part:
+            if not raw_data.endswith(b'\0'): 
+                return raw_data + b'\0'
+            return raw_data
+
+        print(f"[!] FIXING STOMP Frame...")
+        
+        # Try to find the boundary between Header and Body
+        header_block = None
+        body_with_null = None
+        separator = b'\n\n'
+        
+        # First try standard double newline split
+        if b'\n\n' in raw_data:
+            header_block, body_with_null = raw_data.split(b'\n\n', 1)
+            separator = b'\n\n'
+            print(f"[!] Found standard \\n\\n separator")
+        elif b'\r\n\r\n' in raw_data:
+            header_block, body_with_null = raw_data.split(b'\r\n\r\n', 1)
+            separator = b'\r\n\r\n'
+            print(f"[!] Found Windows \\r\\n\\r\\n separator")
+        else:
+            # Critical fix: If no double newline found, force insert one!
+            print(f"[!] WARNING: No double newline found! Force inserting...")
+            
+            # Try to find the last header line (usually ends with content-length, content-type, etc.)
+            # Strategy: Find first single newline followed by non-ASCII or non-header content
+            lines = raw_data.split(b'\n')
+            header_end_index = 0
+            
+            for i, line in enumerate(lines):
+                decoded_line = line.decode('utf-8', errors='ignore').strip()
+                # Header lines are typically "key:value" format or STOMP commands
+                if decoded_line and ':' not in decoded_line and i > 0:
+                    # This might be the start of Body
+                    header_end_index = i
+                    break
+                elif i > 0 and len(line) > 0 and line[0] >= 0x80:
+                    # Encountered binary data, Body should start here
+                    header_end_index = i
+                    break
+            
+            if header_end_index == 0:
+                # Can't find clear boundary, assume all "key:value" lines are headers
+                header_end_index = len([l for l in lines if b':' in l or l.startswith(b'SEND') or l.startswith(b'MESSAGE')])
+            
+            # Reconstruct: previous lines + double newline + remaining content
+            header_block = b'\n'.join(lines[:header_end_index])
+            body_with_null = b'\n'.join(lines[header_end_index:])
+            separator = b'\n\n'
+            print(f"[!] REPAIRED: Inserted double newline after line {header_end_index}")
+
+        # Clean Body (remove old NULL byte to get raw data)
+        raw_body = body_with_null.split(b'\0', 1)[0] if b'\0' in body_with_null else body_with_null
+        actual_length = len(raw_body)
+
+        # Update Content-Length
+        header_text = header_block.decode('utf-8', errors='ignore')
+        
+        if "content-length:" in header_text.lower():
+            print(f"[!] REPAIR: Updating content-length to {actual_length}")
+            header_text = re.sub(r'content-length:\s*\d+', f'content-length:{actual_length}', 
+                               header_text, flags=re.IGNORECASE)
+        else:
+            # If content-length is missing but it's a binary message, add it
+            if "application/vnd.bbf.usp.msg" in header_text or len(raw_body) > 0:
+                print(f"[!] REPAIR: Adding missing content-length:{actual_length}")
+                header_text += f"\ncontent-length:{actual_length}"
+
+        # Reconstruct complete STOMP frame: Headers + \n\n + Body + \0
+        fixed_frame = header_text.encode('utf-8') + separator + raw_body + b'\0'
+        
+        print(f"[✓] Frame fixed: {len(header_text)} bytes header + {len(raw_body)} bytes body")
+        return fixed_frame
+
+    except Exception as e:
+        print(f"[!] Repair Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return raw_data
+
+def proxy_flow(source, destination, direction):
+    """
+    Handles data transfer and fixes f-string backslash errors.
+    """
+    print(f"[*] proxy_flow started: {direction}")
+    sys.stdout.flush()
+    
+    try:
+        while True:
+            chunk = source.recv(32768)
+            if not chunk:
+                print(f"[*] {direction}: Connection closed (no data)")
+                sys.stdout.flush()
+                break
+            
+            chunk = fix_stomp_format(chunk)
+            
+            prefix = ">>>>" if direction == "to_broker" else "<<<<"
+            label = "CTRL -> BROKER" if direction == "to_broker" else "BROKER -> CTRL"
+            
+            print(f"\n{prefix} {label} {prefix}")
+            try:
+                text = chunk.decode('utf-8', errors='ignore')
+                if '\n\n' in text:
+                    headers, body = text.split('\n\n', 1)
+                    # FIX: Move replace() outside of the f-string curly braces
+                    safe_body = body.replace('\0', '[NULL]').strip()
+                    print(f"{headers.strip()}\n\n[BODY CONTENT]\n{safe_body}")
+                else:
+                    # FIX: Apply same logic for short text frames
+                    safe_text = text.replace('\0', '[NULL]').strip()
+                    print(safe_text)
+            except:
+                print(f"[Binary Data] {len(chunk)} bytes")
+            
+            print("-" * 50)
+            sys.stdout.flush()
+            destination.sendall(chunk)
+            
+    except Exception as e:
+        # Ignore common socket closing errors to keep logs clean
+        if not any(err in str(e) for err in ["Bad file descriptor", "Connection reset", "10054"]):
+            print(f"\n[!] Connection info ({direction}): {e}")
+    finally:
+        # Ensure both sockets are closed when the thread exits
+        try:
+            source.close()
+            destination.close()
+        except:
+            pass
+
+def handle_connection(client, addr):
+    """
+    Handles a new connection from the Controller.
+    """
+    print(f"\n[*] New Connection from {addr}")
+    sys.stdout.flush()
+    
+    try:
+        # Connect to the actual ActiveMQ broker
+        broker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        broker.connect((TARGET_ADDR, TARGET_PORT))
+        print(f"[*] Connected to broker {TARGET_ADDR}:{TARGET_PORT}")
+        sys.stdout.flush()
+        
+        # Create two threads for bidirectional proxying (non-daemon)
+        t1 = threading.Thread(target=proxy_flow, args=(client, broker, "to_broker"), daemon=False)
+        t2 = threading.Thread(target=proxy_flow, args=(broker, client, "to_controller"), daemon=False)
+        
+        t1.start()
+        t2.start()
+        
+        print(f"[*] Proxy threads started for {addr}")
+        sys.stdout.flush()
+        
+        # Note: We don't join() here to avoid blocking the main accept() loop
+        # Threads will clean up when connection closes
+        
+    except Exception as e:
+        print(f"[!] Error handling connection from {addr}: {e}")
+        sys.stdout.flush()
+        try:
+            client.close()
+        except:
+            pass
+
+def main():
+    print_banner()
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    try:
+        server.bind((LISTEN_ADDR, LISTEN_PORT))
+        server.listen(10)
+    except Exception as e:
+        print(f"[CRITICAL] Binding failed: {e}")
+        return
+
+    print(f"[*] Waiting for connections on {LISTEN_ADDR}:{LISTEN_PORT}...")
+    sys.stdout.flush()
+    
+    try:
+        while True:
+            client, addr = server.accept()
+            # Handle each connection in a separate thread to avoid blocking
+            handler_thread = threading.Thread(target=handle_connection, args=(client, addr), daemon=True)
+            handler_thread.start()
+    except KeyboardInterrupt:
+        print("\n[*] Proxy server stopped by user.")
+    finally:
+        server.close()
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+# Core dependencies for USP/STOMP Controller
+
+# Protocol Buffers - Required for real USP message encoding/decoding
+protobuf>=4.21.0
+
+# Optional: More robust STOMP client library (if you want to replace custom implementation)
+# stomp.py>=8.1.0
+
+# Optional: For better binary data handling
+# hexdump>=3.3
