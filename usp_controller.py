@@ -391,6 +391,11 @@ class IPCServer(threading.Thread):
             while self.running:
                 client, addr = self.server_sock.accept()
                 self._handle_client(client)
+        except OSError as e:
+            if e.errno == 98:  # Address already in use
+                print(f"[!] IPC Server port {IPC_PORT} already in use (daemon running?)")
+            else:
+                print(f"[!] IPC Server error: {e}")
         except Exception as e:
             print(f"[!] IPC Server error: {e}")
 
@@ -550,23 +555,27 @@ def main():
     stomp_mgr = STOMPManager()
     if not stomp_mgr.connect():
         sys.exit(1)
-        
-    # Start IPC Server (Always run IPC, so even interactive mode can be queried if needed, or disable if risky)
-    # For now, we enable it in both modes to satisfy "Trigger way for Gemini"
-    ipc_server = IPCServer(stomp_mgr)
-    ipc_server.start()
     
+    # Start IPC Server only in daemon mode
+    ipc_server = None
     if args.daemon:
-        print("[Mode] Daemon Started. IPC enabled on port 6000.")
+        ipc_server = IPCServer(stomp_mgr)
+        ipc_server.start()
+        time.sleep(0.1)  # Give IPC server time to start
+        print(f"[Mode] Daemon Started. IPC listening on {IPC_HOST}:{IPC_PORT}")
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
-            print("Stopping...")
+            print("\n[*] Stopping daemon...")
     else:
+        print("\n[Mode] Interactive Shell")
+        print(f"[*] To use with AI tools, start daemon with: ./usp_controller.py --daemon")
         interactive_mode(stomp_mgr)
         
     stomp_mgr.running = False
+    if ipc_server:
+        ipc_server.running = False
     if stomp_mgr.sock: stomp_mgr.sock.close()
 
 if __name__ == "__main__":

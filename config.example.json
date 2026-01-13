@@ -1,0 +1,24 @@
+{
+  "stomp_proxy": {
+    "listen_addr": "0.0.0.0",
+    "listen_port": 61621,
+    "target_addr": "127.0.0.1",
+    "target_port": 61613,
+    "auth_user": "admin",
+    "auth_pass": "password"
+  },
+  "usp_controller": {
+    "broker_host": "127.0.0.1",
+    "broker_port": 61613,
+    "username": "admin",
+    "password": "password",
+    "controller_endpoint_id": "proto::controller-1",
+    "receive_topic": "/topic/my_send_q",
+    "send_destination": "/topic/agent",
+    "devices_file": "devices.json"
+  },
+  "ipc": {
+    "host": "127.0.0.1",
+    "port": 6001
+  }
+}
