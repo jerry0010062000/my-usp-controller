@@ -429,9 +429,65 @@ class IPCServer(threading.Thread):
                     endpoint = cmd_parts[1]
                     path = cmd_parts[2]
                     success = self._send_usp_get(endpoint, path)
-                    response = {"status": "ok" if success else "failed"}
+                    response = {"status": "ok" if success else "failed", "msg": f"GET sent to {endpoint}"}
                 else:
                     response = {"status": "error", "msg": "usage: get <endpoint> <path>"}
+            
+            elif cmd == "set":
+                # set <endpoint> <path> <value>
+                if len(cmd_parts) >= 4:
+                    endpoint = cmd_parts[1]
+                    path = cmd_parts[2]
+                    value = " ".join(cmd_parts[3:])
+                    success = self._send_usp_set(endpoint, path, value)
+                    response = {"status": "ok" if success else "failed", "msg": f"SET sent to {endpoint}"}
+                else:
+                    response = {"status": "error", "msg": "usage: set <endpoint> <path> <value>"}
+            
+            elif cmd == "add":
+                # add <endpoint> <obj_path>
+                if len(cmd_parts) >= 3:
+                    endpoint = cmd_parts[1]
+                    obj_path = cmd_parts[2]
+                    success = self._send_usp_add(endpoint, obj_path)
+                    response = {"status": "ok" if success else "failed", "msg": f"ADD sent to {endpoint}"}
+                else:
+                    response = {"status": "error", "msg": "usage: add <endpoint> <obj_path>"}
+            
+            elif cmd == "delete":
+                # delete <endpoint> <obj_path>
+                if len(cmd_parts) >= 3:
+                    endpoint = cmd_parts[1]
+                    obj_path = cmd_parts[2]
+                    success = self._send_usp_delete(endpoint, obj_path)
+                    response = {"status": "ok" if success else "failed", "msg": f"DELETE sent to {endpoint}"}
+                else:
+                    response = {"status": "error", "msg": "usage: delete <endpoint> <obj_path>"}
+            
+            elif cmd == "discover" or cmd == "getsupporteddm":
+                # discover <endpoint> [obj_path]
+                if len(cmd_parts) >= 2:
+                    endpoint = cmd_parts[1]
+                    obj_path = cmd_parts[2] if len(cmd_parts) >= 3 else "Device."
+                    success = self._send_usp_get_supported_dm(endpoint, obj_path)
+                    response = {"status": "ok" if success else "failed", "msg": f"GetSupportedDM sent to {endpoint}"}
+                else:
+                    response = {"status": "error", "msg": "usage: discover <endpoint> [obj_path]"}
+            
+            elif cmd == "operate":
+                # operate <endpoint> <command_path> [key=value ...]
+                if len(cmd_parts) >= 3:
+                    endpoint = cmd_parts[1]
+                    command_path = cmd_parts[2]
+                    kwargs = {}
+                    for arg in cmd_parts[3:]:
+                        if '=' in arg:
+                            k, v = arg.split('=', 1)
+                            kwargs[k] = v
+                    success = self._send_usp_operate(endpoint, command_path, **kwargs)
+                    response = {"status": "ok" if success else "failed", "msg": f"OPERATE sent to {endpoint}"}
+                else:
+                    response = {"status": "error", "msg": "usage: operate <endpoint> <command> [key=value ...]"}
             
             client.sendall(json.dumps(response).encode('utf-8'))
             client.close()
@@ -442,13 +498,99 @@ class IPCServer(threading.Thread):
             except: pass
 
     def _send_usp_get(self, endpoint, path):
-        # Helper to construct USP Get
+        """Helper to construct USP Get"""
         msg_id = str(uuid.uuid4())
         usp_msg = msg_pb2.Msg()
         usp_msg.header.msg_id = msg_id
         usp_msg.header.msg_type = msg_pb2.Header.MsgType.GET
         usp_msg.body.request.get.param_paths.append(path)
         
+        return self._send_usp_message(endpoint, usp_msg)
+    
+    def _send_usp_set(self, endpoint, path, value):
+        """Helper to construct USP Set"""
+        msg_id = str(uuid.uuid4())
+        usp_msg = msg_pb2.Msg()
+        usp_msg.header.msg_id = msg_id
+        usp_msg.header.msg_type = msg_pb2.Header.MsgType.SET
+        
+        update_obj = usp_msg.body.request.set.update_objs.add()
+        # Extract object path and parameter name
+        parts = path.rsplit('.', 1)
+        if len(parts) == 2:
+            update_obj.obj_path = parts[0] + '.'
+            param_setting = update_obj.param_settings.add()
+            param_setting.param = parts[1]
+            param_setting.value = value
+            param_setting.required = True
+        else:
+            update_obj.obj_path = path
+            param_setting = update_obj.param_settings.add()
+            param_setting.param = "Value"
+            param_setting.value = value
+            param_setting.required = True
+        
+        return self._send_usp_message(endpoint, usp_msg)
+    
+    def _send_usp_add(self, endpoint, obj_path):
+        """Helper to construct USP Add"""
+        msg_id = str(uuid.uuid4())
+        usp_msg = msg_pb2.Msg()
+        usp_msg.header.msg_id = msg_id
+        usp_msg.header.msg_type = msg_pb2.Header.MsgType.ADD
+        
+        create_obj = usp_msg.body.request.add.create_objs.add()
+        create_obj.obj_path = obj_path
+        
+        return self._send_usp_message(endpoint, usp_msg)
+    
+    def _send_usp_delete(self, endpoint, obj_path):
+        """Helper to construct USP Delete"""
+        msg_id = str(uuid.uuid4())
+        usp_msg = msg_pb2.Msg()
+        usp_msg.header.msg_id = msg_id
+        usp_msg.header.msg_type = msg_pb2.Header.MsgType.DELETE
+        
+        usp_msg.body.request.delete.allow_partial = True
+        usp_msg.body.request.delete.obj_paths.append(obj_path)
+        
+        return self._send_usp_message(endpoint, usp_msg)
+    
+    def _send_usp_get_supported_dm(self, endpoint, obj_path="Device."):
+        """Helper to construct USP GetSupportedDM"""
+        msg_id = str(uuid.uuid4())
+        usp_msg = msg_pb2.Msg()
+        usp_msg.header.msg_id = msg_id
+        usp_msg.header.msg_type = msg_pb2.Header.MsgType.GET_SUPPORTED_DM
+        
+        usp_msg.body.request.get_supported_dm.obj_paths.append(obj_path)
+        usp_msg.body.request.get_supported_dm.first_level_only = False
+        usp_msg.body.request.get_supported_dm.return_commands = True
+        usp_msg.body.request.get_supported_dm.return_events = True
+        usp_msg.body.request.get_supported_dm.return_params = True
+        
+        return self._send_usp_message(endpoint, usp_msg)
+    
+    def _send_usp_operate(self, endpoint, command_path, **kwargs):
+        """Helper to construct USP Operate"""
+        msg_id = str(uuid.uuid4())
+        usp_msg = msg_pb2.Msg()
+        usp_msg.header.msg_id = msg_id
+        usp_msg.header.msg_type = msg_pb2.Header.MsgType.OPERATE
+        
+        usp_msg.body.request.operate.command = command_path
+        usp_msg.body.request.operate.send_resp = True
+        
+        # Add input arguments if provided
+        for key, value in kwargs.items():
+            arg = usp_msg.body.request.operate.command_key.add()
+            arg.key = key
+            arg.value = str(value)
+        
+        return self._send_usp_message(endpoint, usp_msg)
+    
+    def _send_usp_message(self, endpoint, usp_msg):
+        """Common method to wrap USP message in Record and send"""
         msg_bytes = usp_msg.SerializeToString()
         
         usp_rec = record_pb2.Record()
@@ -471,6 +613,105 @@ def interactive_mode(stomp_mgr):
     print("\n[Mode] Interactive Shell Started")
     print("Type 'help' for commands")
     
+    # Create helper instance for sending USP messages
+    class USPHelper:
+        def __init__(self, stomp):
+            self.stomp = stomp
+        
+        def send_get(self, endpoint, path):
+            msg_id = str(uuid.uuid4())
+            usp_msg = msg_pb2.Msg()
+            usp_msg.header.msg_id = msg_id
+            usp_msg.header.msg_type = msg_pb2.Header.MsgType.GET
+            usp_msg.body.request.get.param_paths.append(path)
+            return self._wrap_and_send(endpoint, usp_msg)
+        
+        def send_set(self, endpoint, path, value):
+            msg_id = str(uuid.uuid4())
+            usp_msg = msg_pb2.Msg()
+            usp_msg.header.msg_id = msg_id
+            usp_msg.header.msg_type = msg_pb2.Header.MsgType.SET
+            
+            update_obj = usp_msg.body.request.set.update_objs.add()
+            parts = path.rsplit('.', 1)
+            if len(parts) == 2:
+                update_obj.obj_path = parts[0] + '.'
+                param_setting = update_obj.param_settings.add()
+                param_setting.param = parts[1]
+                param_setting.value = value
+                param_setting.required = True
+            else:
+                update_obj.obj_path = path
+                param_setting = update_obj.param_settings.add()
+                param_setting.value = value
+                param_setting.required = True
+            return self._wrap_and_send(endpoint, usp_msg)
+        
+        def send_add(self, endpoint, obj_path):
+            msg_id = str(uuid.uuid4())
+            usp_msg = msg_pb2.Msg()
+            usp_msg.header.msg_id = msg_id
+            usp_msg.header.msg_type = msg_pb2.Header.MsgType.ADD
+            
+            create_obj = usp_msg.body.request.add.create_objs.add()
+            create_obj.obj_path = obj_path
+            return self._wrap_and_send(endpoint, usp_msg)
+        
+        def send_delete(self, endpoint, obj_path):
+            msg_id = str(uuid.uuid4())
+            usp_msg = msg_pb2.Msg()
+            usp_msg.header.msg_id = msg_id
+            usp_msg.header.msg_type = msg_pb2.Header.MsgType.DELETE
+            
+            usp_msg.body.request.delete.allow_partial = True
+            usp_msg.body.request.delete.obj_paths.append(obj_path)
+            return self._wrap_and_send(endpoint, usp_msg)
+        
+        def send_discover(self, endpoint, obj_path="Device."):
+            msg_id = str(uuid.uuid4())
+            usp_msg = msg_pb2.Msg()
+            usp_msg.header.msg_id = msg_id
+            usp_msg.header.msg_type = msg_pb2.Header.MsgType.GET_SUPPORTED_DM
+            
+            usp_msg.body.request.get_supported_dm.obj_paths.append(obj_path)
+            usp_msg.body.request.get_supported_dm.first_level_only = False
+            usp_msg.body.request.get_supported_dm.return_commands = True
+            usp_msg.body.request.get_supported_dm.return_events = True
+            usp_msg.body.request.get_supported_dm.return_params = True
+            return self._wrap_and_send(endpoint, usp_msg)
+        
+        def send_operate(self, endpoint, command_path, args_dict):
+            msg_id = str(uuid.uuid4())
+            usp_msg = msg_pb2.Msg()
+            usp_msg.header.msg_id = msg_id
+            usp_msg.header.msg_type = msg_pb2.Header.MsgType.OPERATE
+            
+            usp_msg.body.request.operate.command = command_path
+            usp_msg.body.request.operate.send_resp = True
+            
+            for key, value in args_dict.items():
+                arg = usp_msg.body.request.operate.command_key.add()
+                arg.key = key
+                arg.value = str(value)
+            return self._wrap_and_send(endpoint, usp_msg)
+        
+        def _wrap_and_send(self, endpoint, usp_msg):
+            msg_bytes = usp_msg.SerializeToString()
+            
+            usp_rec = record_pb2.Record()
+            usp_rec.version = "1.4"
+            usp_rec.to_id = endpoint
+            usp_rec.from_id = CONTROLLER_ENDPOINT_ID
+            usp_rec.payload_security = record_pb2.Record.PayloadSecurity.PLAINTEXT
+            usp_rec.no_session_context.payload = msg_bytes
+            
+            dev = self.stomp.devices.get(endpoint)
+            dest = dev['reply_to'] if dev else SEND_DESTINATION
+            
+            return self.stomp.send(dest, usp_rec.SerializeToString(), reply_to=REPLY_TO_QUEUE)
+    
+    helper = USPHelper(stomp_mgr)
+    
     while True:
         try:
             cmd_str = input("usp-cli> ").strip()
@@ -483,18 +724,43 @@ def interactive_mode(stomp_mgr):
                 break
                 
             elif cmd == 'help':
-                print("Commands: list, status, get <id> <path>, send <dest> <msg>")
+                print("\n" + "="*60)
+                print("USP Controller - Available Commands")
+                print("="*60)
+                print("Basic:")
+                print("  help                        - Show this help")
+                print("  list                        - List known devices")
+                print("  status                      - Show connection status")
+                print("  exit/quit                   - Exit program")
+                print("\nUSP Operations:")
+                print("  get <ep> <path>             - Get parameter value")
+                print("  set <ep> <path> <value>     - Set parameter value")
+                print("  add <ep> <obj_path>         - Add object instance")
+                print("  delete <ep> <obj_path>      - Delete object instance")
+                print("  discover <ep> [obj_path]    - Get supported data model")
+                print("  operate <ep> <cmd> [k=v...] - Execute command")
+                print("\nAdvanced:")
+                print("  send <dest> <msg>           - Send raw message")
+                print("\nExamples:")
+                print("  get proto::agent-001 Device.DeviceInfo.")
+                print("  set proto::agent-001 Device.X_Test.Value 123")
+                print("  discover proto::agent-001")
+                print("  operate proto::agent-001 Device.Reboot() Cause=Upgrade")
+                print("="*60 + "\n")
                 
             elif cmd == 'list':
                 print(f"\nKnown Devices ({len(stomp_mgr.devices)}):")
                 for ep, info in stomp_mgr.devices.items():
-                    print(f"  - {ep} (via {info['reply_to']})")
+                    print(f"  - {ep}")
+                    print(f"    Reply-To: {info['reply_to']}")
                     print(f"    Last seen: {info['last_seen']}")
                 print("")
                 
             elif cmd == 'status':
                 print(f"Connected: {stomp_mgr.connected}")
                 print(f"Broker: {BROKER_HOST}:{BROKER_PORT}")
+                print(f"Controller ID: {CONTROLLER_ENDPOINT_ID}")
+                print(f"Known devices: {len(stomp_mgr.devices)}")
                 
             elif cmd == 'get':
                 if len(parts) < 3:
@@ -502,28 +768,59 @@ def interactive_mode(stomp_mgr):
                     continue
                 ep = parts[1]
                 path = parts[2]
+                print(f"[→] Sending GET to {ep}...")
+                helper.send_get(ep, path)
                 
-                # Manual construction similar to IPC helper
-                msg_id = str(uuid.uuid4())
-                usp_msg = msg_pb2.Msg()
-                usp_msg.header.msg_id = msg_id
-                usp_msg.header.msg_type = msg_pb2.Header.MsgType.GET
-                usp_msg.body.request.get.param_paths.append(path)
-                msg_bytes = usp_msg.SerializeToString()
-                
-                usp_rec = record_pb2.Record()
-                usp_rec.version = "1.4"
-                usp_rec.to_id = ep
-                usp_rec.from_id = CONTROLLER_ENDPOINT_ID
-                usp_rec.payload_security = record_pb2.Record.PayloadSecurity.PLAINTEXT
-                usp_rec.no_session_context.payload = msg_bytes
-                
-                # Find dest
-                dev = stomp_mgr.devices.get(ep)
-                dest = dev['reply_to'] if dev else SEND_DESTINATION
-                
-                print(f"Sending GET to {dest}...")
-                stomp_mgr.send(dest, usp_rec.SerializeToString(), reply_to=REPLY_TO_QUEUE)
+            elif cmd == 'set':
+                if len(parts) < 4:
+                    print("Usage: set <endpoint_id> <path> <value>")
+                    continue
+                ep = parts[1]
+                path = parts[2]
+                value = " ".join(parts[3:])
+                print(f"[→] Sending SET to {ep}: {path} = {value}")
+                helper.send_set(ep, path, value)
+            
+            elif cmd == 'add':
+                if len(parts) < 3:
+                    print("Usage: add <endpoint_id> <obj_path>")
+                    continue
+                ep = parts[1]
+                obj_path = parts[2]
+                print(f"[→] Sending ADD to {ep}: {obj_path}")
+                helper.send_add(ep, obj_path)
+            
+            elif cmd == 'delete':
+                if len(parts) < 3:
+                    print("Usage: delete <endpoint_id> <obj_path>")
+                    continue
+                ep = parts[1]
+                obj_path = parts[2]
+                print(f"[→] Sending DELETE to {ep}: {obj_path}")
+                helper.send_delete(ep, obj_path)
+            
+            elif cmd == 'discover':
+                if len(parts) < 2:
+                    print("Usage: discover <endpoint_id> [obj_path]")
+                    continue
+                ep = parts[1]
+                obj_path = parts[2] if len(parts) >= 3 else "Device."
+                print(f"[→] Sending GetSupportedDM to {ep} for {obj_path}")
+                helper.send_discover(ep, obj_path)
+            
+            elif cmd == 'operate':
+                if len(parts) < 3:
+                    print("Usage: operate <endpoint_id> <command> [key=value ...]")
+                    continue
+                ep = parts[1]
+                command_path = parts[2]
+                args_dict = {}
+                for arg in parts[3:]:
+                    if '=' in arg:
+                        k, v = arg.split('=', 1)
+                        args_dict[k] = v
+                print(f"[→] Sending OPERATE to {ep}: {command_path}")
+                helper.send_operate(ep, command_path, args_dict)
                 
             elif cmd == 'send':
                 # Raw send
@@ -533,9 +830,10 @@ def interactive_mode(stomp_mgr):
                 dest = parts[1]
                 body = " ".join(parts[2:]).encode('utf-8')
                 stomp_mgr.send(dest, body, content_type="text/plain", reply_to=REPLY_TO_QUEUE)
+                print(f"[→] Sent to {dest}")
                 
             else:
-                print("Unknown command")
+                print(f"Unknown command: {cmd}. Type 'help' for available commands.")
                 
         except KeyboardInterrupt:
             break
