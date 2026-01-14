@@ -53,12 +53,144 @@ RECEIVE_TOPIC = '/topic/my_send_q'
 SEND_DESTINATION = '/topic/agent'
 REPLY_TO_QUEUE = f'/queue/{CONTROLLER_ENDPOINT_ID}'
 DEVICES_FILE = 'devices.json'
+PID_FILE = '/tmp/usp_controller.pid'
 
 # IPC Configuration (For Gemini/Daemon communication)
 IPC_HOST = '127.0.0.1'
 IPC_PORT = 6001
 
-DEBUG_MODE = False
+# Debug Levels
+DEBUG_LEVEL = 0
+"""
+Debug Levels:
+  0 - Agent Only: Only show agent response data (DM values)
+  1 - Both Payloads: Show controller requests + agent responses (USP messages)
+  2 - Full Details: Show complete STOMP headers + payloads
+"""
+
+class Logger:
+    """Centralized logging with debug levels"""
+    
+    @staticmethod
+    def critical(msg):
+        """Always show critical messages"""
+        print(f"[!] {msg}")
+    
+    @staticmethod
+    def info(msg, level=1):
+        """Show info messages based on debug level"""
+        if DEBUG_LEVEL >= level:
+            print(f"[*] {msg}")
+    
+    @staticmethod
+    def success(msg, level=1):
+        """Show success messages"""
+        if DEBUG_LEVEL >= level:
+            print(f"[✓] {msg}")
+    
+    @staticmethod
+    def data(msg, level=0):
+        """Show response data (level 0+)"""
+        if DEBUG_LEVEL >= level:
+            print(msg)
+    
+    @staticmethod
+    def stomp_frame(direction, headers, body_preview=None, level=2):
+        """Display STOMP frame information"""
+        if DEBUG_LEVEL < level:
+            return
+        
+        arrow = ">>>>" if direction == "send" else "<<<<"
+        print(f"\n{arrow} STOMP Frame {arrow}")
+        
+        # Show headers at level 2+
+        if DEBUG_LEVEL >= 2 and headers:
+            for key, value in headers.items():
+                print(f"  {key}: {value}")
+        
+        # Show body preview at level 3+
+        if DEBUG_LEVEL >= 3 and body_preview:
+            if isinstance(body_preview, bytes):
+                if len(body_preview) > 100:
+                    print(f"  Body: {body_preview[:100].hex()}... ({len(body_preview)} bytes)")
+                else:
+                    print(f"  Body: {body_preview.hex()}")
+            else:
+                print(f"  Body: {body_preview}")
+        print("")
+    
+    @staticmethod
+    def usp_message(direction, endpoint, msg_type, details=None, level=1):
+        """Display USP message information"""
+        if DEBUG_LEVEL < level:
+            return
+        
+        arrow = "→" if direction == "send" else "←"
+        print(f"{arrow} USP {msg_type} {arrow} {endpoint}")
+        
+        if DEBUG_LEVEL >= 2 and details:
+            for key, value in details.items():
+                print(f"    {key}: {value}")
+
+DEBUG_MODE = False  # Legacy, kept for compatibility
+
+def check_and_kill_old_daemon(force=False):
+    """Check if old daemon is running and kill it"""
+    import signal
+    
+    if not os.path.exists(PID_FILE):
+        return True
+    
+    try:
+        with open(PID_FILE, 'r') as f:
+            old_pid = int(f.read().strip())
+        
+        # Check if process exists
+        try:
+            os.kill(old_pid, 0)  # Signal 0 checks if process exists
+            # Process exists
+            if force:
+                print(f"[*] Found old daemon (PID {old_pid}), terminating...")
+                os.kill(old_pid, signal.SIGTERM)
+                time.sleep(0.5)
+                # Check if still alive, force kill
+                try:
+                    os.kill(old_pid, 0)
+                    print(f"[*] Force killing old daemon...")
+                    os.kill(old_pid, signal.SIGKILL)
+                    time.sleep(0.3)
+                except ProcessLookupError:
+                    pass
+                print(f"[✓] Old daemon terminated")
+                return True
+            else:
+                print(f"[!] Daemon already running (PID {old_pid})")
+                print(f"    Use --force to terminate old daemon and start new one")
+                print(f"    Or manually kill it: kill {old_pid}")
+                return False
+        except ProcessLookupError:
+            # Process doesn't exist, remove stale PID file
+            os.remove(PID_FILE)
+            return True
+    except Exception as e:
+        print(f"[!] Error checking old daemon: {e}")
+        return False
+
+def write_pid_file():
+    """Write current PID to file"""
+    try:
+        with open(PID_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        print(f"[!] Warning: Could not write PID file: {e}")
+
+def remove_pid_file():
+    """Remove PID file on exit"""
+    try:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+    except Exception as e:
+        print(f"[!] Warning: Could not remove PID file: {e}")
 
 class STOMPManager:
     """Manages STOMP connection and state"""
@@ -79,10 +211,10 @@ class STOMPManager:
             if os.path.exists(DEVICES_FILE):
                 with open(DEVICES_FILE, 'r') as f:
                     self.devices = json.load(f)
-                print(f"[*] Loaded {len(self.devices)} devices from {DEVICES_FILE}")
+                Logger.info(f"Loaded {len(self.devices)} devices from {DEVICES_FILE}", level=1)
                 return True
         except Exception as e:
-            print(f"[!] Failed to load devices: {e}")
+            Logger.critical(f"Failed to load devices: {e}")
         return False
 
     def save_devices(self):
@@ -91,7 +223,7 @@ class STOMPManager:
             with open(DEVICES_FILE, 'w') as f:
                 json.dump(self.devices, f, indent=2)
         except Exception as e:
-            print(f"[!] Failed to save devices: {e}")
+            Logger.critical(f"Failed to save devices: {e}")
 
     def connect(self):
         try:
@@ -118,7 +250,7 @@ class STOMPManager:
             if response and b'CONNECTED' in response:
                 self.connected = True
                 self.running = True
-                print(f"[✓] Connected to STOMP Broker ({BROKER_HOST}:{BROKER_PORT})")
+                Logger.success(f"Connected to STOMP Broker ({BROKER_HOST}:{BROKER_PORT})", level=0)
                 
                 # Start receiver thread
                 self.recv_thread = threading.Thread(target=self._receiver_loop, daemon=True)
@@ -134,16 +266,16 @@ class STOMPManager:
                 self.load_devices()
                 for endpoint, info in self.devices.items():
                     if 'reply_to' in info:
-                        print(f"[*] Restoring subscription for {endpoint}: {info['reply_to']}")
+                        Logger.info(f"Restoring subscription for {endpoint}: {info['reply_to']}", level=1)
                         self.subscribe(info['reply_to'])
                 
                 return True
             else:
-                print(f"[!] Connection failed. Response: {response}")
+                Logger.critical(f"Connection failed. Response: {response}")
                 return False
                 
         except Exception as e:
-            print(f"[!] Connection error: {e}")
+            Logger.critical(f"Connection error: {e}")
             return False
 
     def subscribe(self, destination):
@@ -159,27 +291,31 @@ class STOMPManager:
         )
         self.sock.sendall(frame.encode('utf-8'))
         self.subscription_ids[destination] = sub_id
-        if DEBUG_MODE: print(f"[DEBUG] Subscribed to {destination}")
 
     def send(self, destination, body_bytes, content_type='application/vnd.bbf.usp.msg', reply_to=None):
         if not self.connected: return False
         
         try:
-            headers = [
-                f"SEND",
-                f"destination:{destination}",
-                f"content-type:{content_type}",
-                f"content-length:{len(body_bytes)}"
-            ]
+            headers = {
+                "destination": destination,
+                "content-type": content_type,
+                "content-length": str(len(body_bytes))
+            }
             if reply_to:
-                headers.append(f"reply-to-dest:{reply_to}")
+                headers["reply-to-dest"] = reply_to
             
-            frame = '\n'.join(headers).encode('utf-8') + b'\n\n' + body_bytes + b'\0'
+            # Log STOMP frame
+            Logger.stomp_frame("send", headers, body_bytes, level=2)
+            
+            header_list = [f"SEND"]
+            for k, v in headers.items():
+                header_list.append(f"{k}:{v}")
+            
+            frame = '\n'.join(header_list).encode('utf-8') + b'\n\n' + body_bytes + b'\0'
             self.sock.sendall(frame)
-            if DEBUG_MODE: print(f"[DEBUG] Sent {len(body_bytes)} bytes to {destination}")
             return True
         except Exception as e:
-            print(f"[!] Send error: {e}")
+            Logger.critical(f"Send error: {e}")
             return False
 
     def _recv_frame_raw(self):
@@ -284,14 +420,13 @@ class STOMPManager:
                     k, v = line.split(':', 1)
                     headers[k.strip()] = v.strip()
             
-            if command:
-                if DEBUG_MODE: print(f"[DEBUG] Received STOMP {command} from {headers.get('destination', 'unknown')}")
-            
+            # Log STOMP frame at level 2
             if command == "MESSAGE":
+                Logger.stomp_frame("recv", headers, body if len(body) < 200 else body[:200])
                 self._handle_message(headers, body)
                 
         except Exception as e:
-            print(f"[!] Frame processing error: {e}")
+            Logger.critical(f"Frame processing error: {e}")
 
     def _handle_message(self, headers, body):
         # 1. Device Discovery logic
@@ -324,52 +459,111 @@ class STOMPManager:
                     msg = msg_pb2.Msg()
                     msg.ParseFromString(rec.no_session_context.payload)
                     mtype = msg_pb2.Header.MsgType.Name(msg.header.msg_type)
-                    print(f"\n[<<<<] USP {mtype} from {sender}")
+                    
+                    details = {"msg_id": msg.header.msg_id} if DEBUG_LEVEL >= 2 else None
+                    Logger.usp_message("recv", sender, mtype, details)
                     
                     if msg.body.HasField('response'):
-                        resp = msg.body.response
-                        if resp.HasField('get_resp'):
-                            for r in resp.get_resp.req_path_results:
-                                print(f"  Path: {r.requested_path} ({'✓' if r.err_code==0 else '✗'})")
-                                for res in r.resolved_path_results:
-                                    print(f"    - {res.resolved_path}")
-                                    for p, v in res.result_params.items():
-                                        print(f"      {p} = {v}")
-                        elif resp.HasField('error'):
-                            print(f"  [!] Error {resp.error.err_code}: {resp.error.err_msg}")
+                        self._handle_usp_response(sender, msg)
+                    elif msg.body.HasField('request'):
+                        Logger.info(f"Received USP Request from {sender}", level=2)
+                    elif msg.body.HasField('error'):
+                        Logger.critical(f"USP Error from {sender}: {msg.body.error.err_msg}")
+                        
             except Exception as e:
-                print(f"[!] USP Parsing Error: {e}")
-                print(f"    Body Length: {len(body)}")
-                print(f"    Body Hex: {body.hex()}")
-
-        if sender and sender != CONTROLLER_ENDPOINT_ID:
+                Logger.critical(f"USP parsing error: {e}")
+        
+        # 2. Store discovered device
+        if sender and reply_to:
             with self.lock:
-                is_new = sender not in self.devices
+                if sender not in self.devices:
+                    Logger.success(f"Discovered new device: {sender}", level=1)
+                    self.subscribe(reply_to)
                 
-                # Preserve existing reply_to if not provided in new message
-                existing_reply = self.devices.get(sender, {}).get('reply_to')
-                new_reply = clean_reply if reply_to else (existing_reply if existing_reply else f"/queue/{sender}")
-
                 self.devices[sender] = {
-                    'endpoint_id': sender,
-                    'last_seen': datetime.now().isoformat(),
-                    'reply_to': new_reply,
-                    'last_msg_len': len(body)
+                    'reply_to': reply_to,
+                    'last_seen': datetime.now().isoformat()
                 }
                 self.last_active_device = sender
-                
-                if is_new:
-                    print(f"\n[+] New Device Discovered: {sender}")
-                    print(f"    Reply Path: {self.devices[sender]['reply_to']}")
-                    # Auto subscribe to reply path to receive messages from agent
-                    self.subscribe(self.devices[sender]['reply_to'])
                 
                 # Save to disk
                 self.save_devices()
         
-        # 2. Notify callbacks (IPC, UI)
+        # 3. Notify callbacks (IPC, UI)
         for cb in self.msg_callbacks:
             cb(headers, body, sender)
+    
+    def _handle_usp_response(self, sender, msg):
+        """Handle and display USP response messages"""
+        resp = msg.body.response
+        
+        if resp.HasField('get_resp'):
+            for r in resp.get_resp.req_path_results:
+                status = '✓' if r.err_code == 0 else '✗'
+                Logger.data(f"  Path: {r.requested_path} ({status})")
+                for res in r.resolved_path_results:
+                    Logger.data(f"    {res.resolved_path}")
+                    for p, v in res.result_params.items():
+                        Logger.data(f"      {p} = {v}")
+                        
+        elif resp.HasField('get_supported_dm_resp'):
+            count = 0
+            for r in resp.get_supported_dm_resp.req_obj_results:
+                for obj in r.supported_objs:
+                    # Object info
+                    obj_info = obj.supported_obj_path
+                    if obj.is_multi_instance:
+                        obj_info += " (multi-instance)"
+                    Logger.data(f"    {obj_info}")
+                    count += 1
+                    
+                    # Parameters with access rights
+                    for p in obj.supported_params:
+                        access = msg_pb2.GetSupportedDMResp.ParamAccessType.Name(p.access)
+                        access_short = "RW" if access == "PARAM_READ_WRITE" else "R"
+                        Logger.data(f"      {p.param_name} [{access_short}]")
+                        count += 1
+                    
+                    # Commands with type
+                    for c in obj.supported_commands:
+                        cmd_type = msg_pb2.GetSupportedDMResp.CmdType.Name(c.command_type)
+                        cmd_short = "async" if cmd_type == "CMD_ASYNC" else "sync"
+                        Logger.data(f"      {c.command_name}() [{cmd_short}]")
+                        count += 1
+                    
+                    # Events
+                    for e in obj.supported_events:
+                        Logger.data(f"      {e.event_name}! [event]")
+                        count += 1
+            Logger.data(f"  Total: {count} items")
+            
+        elif resp.HasField('set_resp'):
+            for r in resp.set_resp.updated_obj_results:
+                status = '✓' if len(r.oper_failure) == 0 else '✗'
+                Logger.data(f"  Object: {r.requested_path} ({status})")
+                for op in r.oper_success:
+                    for k, v in op.updated_params.items():
+                        Logger.data(f"    {k} = {v}")
+                        
+        elif resp.HasField('add_resp'):
+            for r in resp.add_resp.created_obj_results:
+                status = '✓' if len(r.oper_failure) == 0 else '✗'
+                Logger.data(f"  Created: {r.requested_path} ({status})")
+                for op in r.oper_success:
+                    Logger.data(f"    Instance: {op.instantiated_path}")
+                    
+        elif resp.HasField('delete_resp'):
+            for r in resp.delete_resp.deleted_obj_results:
+                status = '✓' if len(r.oper_failure) == 0 else '✗'
+                Logger.data(f"  Deleted: {r.requested_path} ({status})")
+                
+        elif resp.HasField('operate_resp'):
+            for r in resp.operate_resp.operation_results:
+                Logger.data(f"  Command: {r.executed_command}")
+                Logger.data(f"    Output: {r.output_args}")
+                
+        elif resp.HasField('error'):
+            Logger.critical(f"Error {resp.error.err_code}: {resp.error.err_msg}")
 
 
 class IPCServer(threading.Thread):
@@ -381,11 +575,14 @@ class IPCServer(threading.Thread):
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.running = True
+        self.started = False
+        self.error = None
         
     def run(self):
         try:
             self.server_sock.bind((IPC_HOST, IPC_PORT))
             self.server_sock.listen(5)
+            self.started = True
             print(f"[*] IPC Server listening on {IPC_HOST}:{IPC_PORT}")
             
             while self.running:
@@ -393,10 +590,15 @@ class IPCServer(threading.Thread):
                 self._handle_client(client)
         except OSError as e:
             if e.errno == 98:  # Address already in use
-                print(f"[!] IPC Server port {IPC_PORT} already in use (daemon running?)")
+                self.error = f"Port {IPC_PORT} already in use"
+                print(f"[!] IPC Server: {self.error}")
+                print(f"[!] Another daemon may be running. Check with: ps aux | grep 'usp_controller.py --daemon'")
+                print(f"[!] To stop existing daemon: pkill -f 'usp_controller.py --daemon'")
             else:
+                self.error = str(e)
                 print(f"[!] IPC Server error: {e}")
         except Exception as e:
+            self.error = str(e)
             print(f"[!] IPC Server error: {e}")
 
     def _handle_client(self, client):
@@ -464,15 +666,15 @@ class IPCServer(threading.Thread):
                 else:
                     response = {"status": "error", "msg": "usage: delete <endpoint> <obj_path>"}
             
-            elif cmd == "discover" or cmd == "getsupporteddm":
-                # discover <endpoint> [obj_path]
+            elif cmd == "get_supported" or cmd == "getsupporteddm":
+                # get_supported <endpoint> [obj_path]
                 if len(cmd_parts) >= 2:
                     endpoint = cmd_parts[1]
                     obj_path = cmd_parts[2] if len(cmd_parts) >= 3 else "Device."
                     success = self._send_usp_get_supported_dm(endpoint, obj_path)
                     response = {"status": "ok" if success else "failed", "msg": f"GetSupportedDM sent to {endpoint}"}
                 else:
-                    response = {"status": "error", "msg": "usage: discover <endpoint> [obj_path]"}
+                    response = {"status": "error", "msg": "usage: get_supported <endpoint> [obj_path]"}
             
             elif cmd == "operate":
                 # operate <endpoint> <command_path> [key=value ...]
@@ -712,6 +914,19 @@ def interactive_mode(stomp_mgr):
     
     helper = USPHelper(stomp_mgr)
     
+    # Command aliases
+    ALIASES = {
+        'ls': 'list',
+        'h': 'help',
+        'q': 'quit',
+        'exit': 'quit',
+        'disc': 'discover',
+        'gsdm': 'get_supported'
+    }
+    
+    print("\n[*] Interactive mode ready. Type 'help' for commands, 'quit' to exit.")
+    print("[*] Note: Use 'quit' or 'exit' to leave (Ctrl+C is disabled)\n")
+    
     while True:
         try:
             cmd_str = input("usp-cli> ").strip()
@@ -720,7 +935,12 @@ def interactive_mode(stomp_mgr):
             parts = cmd_str.split()
             cmd = parts[0].lower()
             
-            if cmd in ['exit', 'quit']:
+            # Handle aliases
+            if cmd in ALIASES:
+                cmd = ALIASES[cmd]
+                parts[0] = cmd
+            
+            if cmd == 'quit':
                 break
                 
             elif cmd == 'help':
@@ -728,25 +948,54 @@ def interactive_mode(stomp_mgr):
                 print("USP Controller - Available Commands")
                 print("="*60)
                 print("Basic:")
-                print("  help                        - Show this help")
-                print("  list                        - List known devices")
+                print("  help (h)                    - Show this help")
+                print("  list (ls)                   - List known devices")
                 print("  status                      - Show connection status")
-                print("  exit/quit                   - Exit program")
+                print("  debug [0-2]                 - Show/set debug level")
+                print("  quit (q, exit)              - Exit program")
                 print("\nUSP Operations:")
                 print("  get <ep> <path>             - Get parameter value")
                 print("  set <ep> <path> <value>     - Set parameter value")
                 print("  add <ep> <obj_path>         - Add object instance")
                 print("  delete <ep> <obj_path>      - Delete object instance")
-                print("  discover <ep> [obj_path]    - Get supported data model")
+                print("  discover (disc) <ep> [obj]  - Get supported data model")
                 print("  operate <ep> <cmd> [k=v...] - Execute command")
+                print("\nDebug Levels:")
+                print("  0 - Agent Only: Only agent response data (default)")
+                print("  1 - Both Payloads: Controller + Agent USP messages")
+                print("  2 - Full Details: STOMP headers + payloads")
                 print("\nAdvanced:")
                 print("  send <dest> <msg>           - Send raw message")
+                print("\nCommand Aliases:")
+                print("  ls=list, h=help, q=quit, disc=discover, gsdm=get_supported")
                 print("\nExamples:")
+                print("  debug 1                     - See both USP messages")
                 print("  get proto::agent-001 Device.DeviceInfo.")
                 print("  set proto::agent-001 Device.X_Test.Value 123")
-                print("  discover proto::agent-001")
+                print("  disc proto::agent-001       - Discover data model")
                 print("  operate proto::agent-001 Device.Reboot() Cause=Upgrade")
                 print("="*60 + "\n")
+                
+            elif cmd == 'debug':
+                global DEBUG_LEVEL
+                if len(parts) < 2:
+                    level_names = ["Agent Only", "Both Payloads", "Full Details"]
+                    print(f"Current debug level: {DEBUG_LEVEL} ({level_names[DEBUG_LEVEL]})")
+                    print("Usage: debug <0|1|2>")
+                    print("  0 - Agent Only: Only agent response data")
+                    print("  1 - Both Payloads: Controller + Agent USP messages")
+                    print("  2 - Full Details: STOMP headers + payloads")
+                else:
+                    try:
+                        new_level = int(parts[1])
+                        if 0 <= new_level <= 2:
+                            DEBUG_LEVEL = new_level
+                            level_names = ["Agent Only", "Both Payloads", "Full Details"]
+                            print(f"[✓] Debug level set to {DEBUG_LEVEL} ({level_names[DEBUG_LEVEL]})")
+                        else:
+                            print("[!] Debug level must be 0-2")
+                    except ValueError:
+                        print("[!] Invalid debug level. Use 0, 1, or 2")
                 
             elif cmd == 'list':
                 print(f"\nKnown Devices ({len(stomp_mgr.devices)}):")
@@ -757,10 +1006,12 @@ def interactive_mode(stomp_mgr):
                 print("")
                 
             elif cmd == 'status':
+                level_names = ["Quiet", "Normal", "Verbose", "Full"]
                 print(f"Connected: {stomp_mgr.connected}")
                 print(f"Broker: {BROKER_HOST}:{BROKER_PORT}")
                 print(f"Controller ID: {CONTROLLER_ENDPOINT_ID}")
                 print(f"Known devices: {len(stomp_mgr.devices)}")
+                print(f"Debug level: {DEBUG_LEVEL} ({level_names[DEBUG_LEVEL]})")
                 
             elif cmd == 'get':
                 if len(parts) < 3:
@@ -768,7 +1019,7 @@ def interactive_mode(stomp_mgr):
                     continue
                 ep = parts[1]
                 path = parts[2]
-                print(f"[→] Sending GET to {ep}...")
+                Logger.usp_message("send", ep, "GET", {"path": path})
                 helper.send_get(ep, path)
                 
             elif cmd == 'set':
@@ -778,7 +1029,7 @@ def interactive_mode(stomp_mgr):
                 ep = parts[1]
                 path = parts[2]
                 value = " ".join(parts[3:])
-                print(f"[→] Sending SET to {ep}: {path} = {value}")
+                Logger.usp_message("send", ep, "SET", {"path": path, "value": value})
                 helper.send_set(ep, path, value)
             
             elif cmd == 'add':
@@ -787,7 +1038,7 @@ def interactive_mode(stomp_mgr):
                     continue
                 ep = parts[1]
                 obj_path = parts[2]
-                print(f"[→] Sending ADD to {ep}: {obj_path}")
+                Logger.usp_message("send", ep, "ADD", {"obj_path": obj_path})
                 helper.send_add(ep, obj_path)
             
             elif cmd == 'delete':
@@ -796,16 +1047,16 @@ def interactive_mode(stomp_mgr):
                     continue
                 ep = parts[1]
                 obj_path = parts[2]
-                print(f"[→] Sending DELETE to {ep}: {obj_path}")
+                Logger.usp_message("send", ep, "DELETE", {"obj_path": obj_path})
                 helper.send_delete(ep, obj_path)
             
-            elif cmd == 'discover':
+            elif cmd == 'get_supported' or cmd == 'discover':
                 if len(parts) < 2:
                     print("Usage: discover <endpoint_id> [obj_path]")
                     continue
                 ep = parts[1]
                 obj_path = parts[2] if len(parts) >= 3 else "Device."
-                print(f"[→] Sending GetSupportedDM to {ep} for {obj_path}")
+                Logger.usp_message("send", ep, "GetSupportedDM", {"obj_path": obj_path})
                 helper.send_discover(ep, obj_path)
             
             elif cmd == 'operate':
@@ -819,7 +1070,7 @@ def interactive_mode(stomp_mgr):
                     if '=' in arg:
                         k, v = arg.split('=', 1)
                         args_dict[k] = v
-                print(f"[→] Sending OPERATE to {ep}: {command_path}")
+                Logger.usp_message("send", ep, "OPERATE", {"command": command_path}, level=1)
                 helper.send_operate(ep, command_path, args_dict)
                 
             elif cmd == 'send':
@@ -836,6 +1087,10 @@ def interactive_mode(stomp_mgr):
                 print(f"Unknown command: {cmd}. Type 'help' for available commands.")
                 
         except KeyboardInterrupt:
+            print("\n[!] Use 'quit' or 'exit' to leave the program.")
+            continue
+        except EOFError:
+            print("\n[*] EOF detected, exiting...")
             break
         except Exception as e:
             print(f"Error: {e}")
@@ -844,10 +1099,16 @@ def main():
     parser = argparse.ArgumentParser(description="USP Controller")
     parser.add_argument('--daemon', action='store_true', help='Run in headless daemon mode with IPC')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    parser.add_argument('--force', action='store_true', help='Force kill old daemon if running')
     args = parser.parse_args()
     
     global DEBUG_MODE
     DEBUG_MODE = args.debug
+    
+    # Check for old daemon in daemon mode
+    if args.daemon:
+        if not check_and_kill_old_daemon(force=args.force):
+            sys.exit(1)
     
     # Init STOMP
     stomp_mgr = STOMPManager()
@@ -857,15 +1118,22 @@ def main():
     # Start IPC Server only in daemon mode
     ipc_server = None
     if args.daemon:
+        # Write PID file
+        write_pid_file()
+        atexit.register(remove_pid_file)
+        
         ipc_server = IPCServer(stomp_mgr)
         ipc_server.start()
-        time.sleep(0.1)  # Give IPC server time to start
-        print(f"[Mode] Daemon Started. IPC listening on {IPC_HOST}:{IPC_PORT}")
+        time.sleep(0.2)  # Give IPC server time to start
+        
+        print(f"[✓] Daemon Started (PID: {os.getpid()})")
+        print(f"[✓] IPC listening on {IPC_HOST}:{IPC_PORT}")
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
             print("\n[*] Stopping daemon...")
+            remove_pid_file()
     else:
         print("\n[Mode] Interactive Shell")
         print(f"[*] To use with AI tools, start daemon with: ./usp_controller.py --daemon")

@@ -4,5 +4,19 @@
     "last_seen": "2026-01-12T11:38:17.830414",
     "reply_to": "/topic/usp/endpoint/os::8082FE-SN8082FE636B60",
     "last_msg_len": 3915
+  },
+  "proto::agent-id": {
+    "reply_to": "/topic/agent-path",
+    "last_seen": "2026-01-14T14:52:52.305884"
+  },
+  "proto::controller-temp": {
+    "endpoint_id": "proto::controller-temp",
+    "last_seen": "2026-01-13T17:50:30.257332",
+    "reply_to": "/queue/proto::controller-temp",
+    "last_msg_len": 107
+  },
+  "proto::controller-1": {
+    "reply_to": "/queue/proto\\c\\ccontroller-1",
+    "last_seen": "2026-01-14T14:52:52.284423"
   }
 }

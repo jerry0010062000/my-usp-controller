@@ -194,39 +194,95 @@ print(result)
 .
 ├── usp_controller.py         # 主程式（雙模式）
 ├── usp_client.py             # IPC 客戶端工具
-├── mock_agent.py             # USP Agent 模擬器（測試用）
+├── config.json               # 配置文件（不納入版本控制）
+├── config.example.json       # 配置範本
 ├── devices.json              # 設備清單（自動生成）
 ├── usp_msg_1_4_pb2.py        # USP Message Protobuf
 ├── usp_record_1_4_pb2.py     # USP Record Protobuf
 ├── usp-msg-1-4.proto         # Protobuf 定義
 ├── usp-record-1-4.proto      # Protobuf 定義
 ├── requirements.txt          # Python 依賴
+├── tools/                    # 測試與開發工具
+│   ├── mock_agent.py         # USP Agent 模擬器
+│   ├── collect_dm.py         # 數據模型收集工具
+│   ├── debug_proto.py        # 協定除錯工具
+│   └── ...                   # 其他測試腳本
 └── README.md                 # 本文件
 ```
 
 ## 🔍 除錯模式
 
-啟用除錯訊息：
+### Debug Level 系統
 
+控制器提供 3 個 debug level，可在 runtime 動態調整：
+
+| Level | 名稱 | 顯示內容 |
+|-------|------|----------|
+| **0** | Agent Only | 只顯示 agent 回應數據 (DM 值) **預設** |
+| **1** | Both Payloads | 顯示 controller 請求 + agent 回應 (USP 訊息) |
+| **2** | Full Details | 完整 STOMP headers + payloads |
+
+### 使用方式
+
+**互動模式：**
 ```bash
-./usp_controller.py --debug
-./usp_controller.py --daemon --debug
+usp-cli> debug        # 查看目前 level
+usp-cli> debug 1      # 設定為 Both Payloads
+usp-cli> debug 0      # 設定為 Agent Only（只看結果）
 ```
 
-## ⚠️ 注意事項
+**啟動時設定：**
+```bash
+./usp_controller.py --debug          # 啟用舊的 DEBUG_MODE
+# 建議在程式啟動後用 debug 命令調整 level
+```
 
-1. **互動模式與 Daemon 不衝突**：互動模式不啟動 IPC Server，可與背景 daemon 同時運行
-2. **設備清單持久化**：已發現的設備會儲存到 `devices.json`，重啟後自動恢復訂閱
-3. **STOMP 訂閱**：自動訂閱 wildcard (`/topic/>`, `/queue/>`) 以接收所有訊息
-4. **Port 佔用**：Daemon 使用 port 6001，確保沒有其他程式佔用
+### Debug Level 輸出範例
+
+**Level 0 (Agent Only):**
+```
+  Path: Device.DeviceInfo. (✓)
+    Device.DeviceInfo.
+      Manufacturer = OpenSync
+      ModelName = HomeGateway
+```
+
+**Level 1 (Both Payloads):**
+```
+→ USP GET → proto::agent-id
+← USP GET_RESP ← proto::agent-id
+  Path: Device.DeviceInfo. (✓)
+    Device.DeviceInfo.
+      Manufacturer = OpenSync
+```
+
+**Level 2 (Full Details):**
+```
+>>>> STOMP Frame >>>>
+  destination: /topic/agent
+  content-type: application/vnd.bbf.usp.msg
+  content-length: 114
+
+→ USP GET → proto::agent-id
+    msg_id: c8bd0df6-3857-449f-9c02-6bd85118fa76
+
+<<<< STOMP Frame <<<<
+  destination: /queue/controller
+  content-type: application/vnd.bbf.usp.msg
+  content-length: 234
+
+← USP GET_RESP ← proto::agent-id
+    msg_id: c8bd0df6-3857-449f-9c02-6bd85118fa76
+  Path: Device.DeviceInfo. (✓)
+```
 
 ## 🐛 常見問題
 
 **Q: 為何出現 "Address already in use" 錯誤？**
 
-A: Daemon 已在背景運行。請先終止：
+A: Daemon 已在背景運行。使用 `--force` 自動終止舊 daemon：
 ```bash
-pkill -f "usp_controller.py --daemon"
+./usp_controller.py --daemon --force
 ```
 
 **Q: 如何查看目前是否有 daemon 運行？**
@@ -234,11 +290,26 @@ pkill -f "usp_controller.py --daemon"
 A: 使用以下命令：
 ```bash
 ps aux | grep "usp_controller.py --daemon"
+# 或查看 PID 文件
+cat /tmp/usp_controller.pid
 ```
 
 **Q: 互動模式能與 daemon 同時使用嗎？**
 
 A: 可以！互動模式不啟動 IPC Server，不會衝突。
+
+**Q: 如何調整顯示的詳細程度？**
+
+A: 使用 `debug` 命令動態調整 level (0-2)：
+```bash
+usp-cli> debug 0    # 只看結果數據
+usp-cli> debug 1    # 看雙向 USP 訊息
+usp-cli> debug 2    # 看完整 STOMP 訊息
+```
+
+**Q: 測試腳本在哪裡？**
+
+A: 已移至 `tools/` 目錄，保持根目錄整潔。
 
 ## 📝 開發資訊
 
