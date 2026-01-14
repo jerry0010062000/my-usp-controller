@@ -1,12 +1,4 @@
 {
-  "stomp_proxy": {
-    "listen_addr": "0.0.0.0",
-    "listen_port": 61621,
-    "target_addr": "127.0.0.1",
-    "target_port": 61613,
-    "auth_user": "admin",
-    "auth_pass": "password"
-  },
   "usp_controller": {
     "broker_host": "127.0.0.1",
     "broker_port": 61613,
