@@ -471,7 +471,10 @@ class STOMPManager:
                         Logger.critical(f"USP Error from {sender}: {msg.body.error.err_msg}")
                         
             except Exception as e:
+                import traceback
                 Logger.critical(f"USP parsing error: {e}")
+                if DEBUG_LEVEL >= 2:
+                    Logger.critical(f"Traceback: {traceback.format_exc()}")
         
         # 2. Store discovered device
         if sender and reply_to:
@@ -505,7 +508,7 @@ class STOMPManager:
                     Logger.data(f"    {res.resolved_path}")
                     for p, v in res.result_params.items():
                         Logger.data(f"      {p} = {v}")
-                        
+                    
         elif resp.HasField('get_supported_dm_resp'):
             count = 0
             for r in resp.get_supported_dm_resp.req_obj_results:
@@ -539,23 +542,35 @@ class STOMPManager:
             
         elif resp.HasField('set_resp'):
             for r in resp.set_resp.updated_obj_results:
-                status = '✓' if len(r.oper_failure) == 0 else '✗'
-                Logger.data(f"  Object: {r.requested_path} ({status})")
-                for op in r.oper_success:
-                    for k, v in op.updated_params.items():
-                        Logger.data(f"    {k} = {v}")
+                if r.oper_status.HasField('oper_success'):
+                    Logger.data(f"  Object: {r.requested_path} (✓)")
+                    for param, value in r.oper_status.oper_success.updated_inst_results[0].updated_params.items():
+                        Logger.data(f"    {param} = {value}")
+                elif r.oper_status.HasField('oper_failure'):
+                    Logger.data(f"  Object: {r.requested_path} (✗)")
+                    fail = r.oper_status.oper_failure
+                    Logger.critical(f"    Error {fail.err_code}: {fail.err_msg}")
                         
         elif resp.HasField('add_resp'):
             for r in resp.add_resp.created_obj_results:
-                status = '✓' if len(r.oper_failure) == 0 else '✗'
-                Logger.data(f"  Created: {r.requested_path} ({status})")
-                for op in r.oper_success:
-                    Logger.data(f"    Instance: {op.instantiated_path}")
+                if r.oper_status.HasField('oper_success'):
+                    Logger.data(f"  Created: {r.requested_path} (✓)")
+                    Logger.data(f"    Instance: {r.oper_status.oper_success.instantiated_path}")
+                elif r.oper_status.HasField('oper_failure'):
+                    Logger.data(f"  Created: {r.requested_path} (✗)")
+                    fail = r.oper_status.oper_failure
+                    Logger.critical(f"    Error {fail.err_code}: {fail.err_msg}")
                     
         elif resp.HasField('delete_resp'):
             for r in resp.delete_resp.deleted_obj_results:
-                status = '✓' if len(r.oper_failure) == 0 else '✗'
-                Logger.data(f"  Deleted: {r.requested_path} ({status})")
+                if r.oper_status.HasField('oper_success'):
+                    Logger.data(f"  Deleted: {r.requested_path} (✓)")
+                    for path in r.oper_status.oper_success.affected_paths:
+                        Logger.data(f"    {path}")
+                elif r.oper_status.HasField('oper_failure'):
+                    Logger.data(f"  Deleted: {r.requested_path} (✗)")
+                    fail = r.oper_status.oper_failure
+                    Logger.critical(f"    Error {fail.err_code}: {fail.err_msg}")
                 
         elif resp.HasField('operate_resp'):
             for r in resp.operate_resp.operation_results:

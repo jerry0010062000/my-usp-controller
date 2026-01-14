@@ -7,7 +7,7 @@
   },
   "proto::agent-id": {
     "reply_to": "/topic/agent-path",
-    "last_seen": "2026-01-14T14:52:52.305884"
+    "last_seen": "2026-01-14T15:29:34.483736"
   },
   "proto::controller-temp": {
     "endpoint_id": "proto::controller-temp",
@@ -17,6 +17,6 @@
   },
   "proto::controller-1": {
     "reply_to": "/queue/proto\\c\\ccontroller-1",
-    "last_seen": "2026-01-14T14:52:52.284423"
+    "last_seen": "2026-01-14T15:23:34.242629"
   }
 }
