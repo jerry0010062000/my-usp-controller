@@ -145,30 +145,54 @@ def set_debug_level(level):
     return False
 
 class Logger:
-    """Centralized logging with debug levels"""
-    
+    """Centralized logging with debug levels and memory buffer for IPC"""
+    HISTORY_SIZE = 1000
+    history = []  # List of dict
+    log_counter = 0
+    lock = threading.Lock()
+
+    @classmethod
+    def _add_history(cls, type_str, msg):
+        with cls.lock:
+            ts = datetime.now().strftime("%H:%M:%S")
+            entry = {
+                'id': cls.log_counter,
+                'time': ts, 
+                'type': type_str, 
+                'msg': str(msg)
+            }
+            cls.log_counter += 1
+            cls.history.append(entry)
+            if len(cls.history) > cls.HISTORY_SIZE:
+                cls.history.pop(0)
+
     @staticmethod
     def critical(msg):
         """Always show critical messages"""
         print(f"[!] {msg}")
+        Logger._add_history("critical", msg)
     
     @staticmethod
     def info(msg, level=1):
         """Show info messages based on debug level"""
         if DEBUG_LEVEL >= level:
             print(f"[*] {msg}")
+            Logger._add_history("info", msg)
     
     @staticmethod
     def success(msg, level=1):
         """Show success messages"""
         if DEBUG_LEVEL >= level:
             print(f"[✓] {msg}")
+            Logger._add_history("success", msg)
     
     @staticmethod
     def data(msg, level=0):
         """Show response data (level 0+)"""
         if DEBUG_LEVEL >= level:
             print(msg)
+            Logger._add_history("data", msg)
+
     
     @staticmethod
     def stomp_frame(direction, headers, body_preview=None, level=2):
@@ -202,11 +226,14 @@ class Logger:
             return
         
         arrow = "→" if direction == "send" else "←"
-        print(f"{arrow} USP {msg_type} {arrow} {endpoint}")
+        log_msg = f"{arrow} USP {msg_type} {arrow} {endpoint}"
+        print(log_msg)
+        Logger._add_history("usp", log_msg)
         
         if DEBUG_LEVEL >= 2 and details:
             for key, value in details.items():
                 print(f"    {key}: {value}")
+                Logger._add_history("detail", f"    {key}: {value}")
 
 DEBUG_MODE = False  # Legacy, kept for compatibility
 
@@ -943,6 +970,22 @@ class IPCServer(threading.Thread):
                     response = {"status": "ok" if success else "failed", "msg": f"OPERATE sent to {endpoint}"}
                 else:
                     response = {"status": "error", "msg": "usage: operate <endpoint> <command> [key=value ...]"}
+
+            elif cmd == "poll_logs":
+                # poll_logs [last_id]
+                last_id = -1
+                if len(cmd_parts) >= 2:
+                    try: last_id = int(cmd_parts[1])
+                    except: pass
+                
+                with Logger.lock:
+                    # Provide logs with id > last_id
+                    new_logs = [log for log in Logger.history if log['id'] > last_id]
+                    response = {
+                        "status": "ok", 
+                        "logs": new_logs, 
+                        "last_id": Logger.history[-1]['id'] if Logger.history else -1
+                    }
             
             client.sendall(json.dumps(response).encode('utf-8'))
             client.close()
