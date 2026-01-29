@@ -2,11 +2,10 @@
   "usp_controller": {
     "broker_host": "127.0.0.1",
     "broker_port": 61613,
-    "username": "admin",
-    "password": "password",
-    "controller_endpoint_id": "proto::controller-1",
-    "receive_topic": "/topic/my_send_q",
-    "send_destination": "/topic/agent",
+    "username": "guest",
+    "password": "guest",
+    "controller_endpoint_id": "proto::controller.jerry-laptop",
+    "receive_topic": "/queue/usp.controller.jerry-laptop",
     "devices_file": "devices.json"
   },
   "ipc": {

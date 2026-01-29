@@ -3,6 +3,9 @@
 # Protocol Buffers - Required for real USP message encoding/decoding
 protobuf>=4.21.0
 
+# Windows compatibility - readline support for interactive mode
+pyreadline3>=3.4.1; sys_platform == 'win32'
+
 # Optional: More robust STOMP client library (if you want to replace custom implementation)
 # stomp.py>=8.1.0
 

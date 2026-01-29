@@ -6,7 +6,6 @@
     "password": "password",
     "controller_endpoint_id": "proto::controller-1",
     "receive_topic": "/topic/my_send_q",
-    "send_destination": "/topic/agent",
     "devices_file": "devices.json"
   },
   "ipc": {

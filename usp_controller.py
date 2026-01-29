@@ -5,18 +5,20 @@ Mode 1: Interactive Shell (User)
 Mode 2: Background Daemon with IPC (Automation)
 """
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 __author__ = "Jerry Bai"
 
 import socket
 import threading
 import time
 import sys
+import os
 import uuid
 import json
 import select
 from datetime import datetime
 import argparse
+import platform
 
 # Import USP protobuf definitions
 try:
@@ -41,32 +43,106 @@ try:
 except ImportError:
     pass
 
-# --- Configuration ---
-BROKER_HOST = '127.0.0.1'
-BROKER_PORT = 61613
-USERNAME = 'admin'
-PASSWORD = 'password'
+# --- Load Configuration from config.json ---
+def load_config(config_file='config.json'):
+    """Load configuration from JSON file"""
+    try:
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        return config
+    except FileNotFoundError:
+        print(f"[!] Config file '{config_file}' not found. Using defaults.")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"[!] Error parsing config file: {e}")
+        return None
 
-# Controller Identity
-CONTROLLER_ENDPOINT_ID = 'proto::controller-1'
-RECEIVE_TOPIC = '/topic/my_send_q'
-SEND_DESTINATION = '/topic/agent'
-REPLY_TO_QUEUE = f'/queue/{CONTROLLER_ENDPOINT_ID}'
-DEVICES_FILE = 'devices.json'
-PID_FILE = '/tmp/usp_controller.pid'
+# Configuration defaults (only for optional settings)
+DEFAULT_CONFIG = {
+    'broker_host': '127.0.0.1',
+    'broker_port': 61613,
+    'username': 'guest',
+    'password': 'guest',
+    'devices_file': 'devices.json',
+    'ipc_host': '127.0.0.1',
+    'ipc_port': 6001,
+    'debug_level': 0,
+    'auto_subscribe_wildcard': True
+}
 
-# IPC Configuration (For Gemini/Daemon communication)
-IPC_HOST = '127.0.0.1'
-IPC_PORT = 6001
+def validate_config(config):
+    """Validate required configuration fields"""
+    if not config:
+        print("[!] Error: config.json not found or invalid")
+        print("[!] Please create config.json from config.example.json")
+        return False
+    
+    if 'usp_controller' not in config:
+        print("[!] Error: 'usp_controller' section missing in config.json")
+        return False
+    
+    usp_config = config['usp_controller']
+    required = ['controller_endpoint_id', 'receive_topic']
+    
+    for field in required:
+        if field not in usp_config:
+            print(f"[!] Error: Required field '{field}' missing in config.json")
+            print(f"[!] Please check config.example.json for reference")
+            return False
+    
+    return True
 
-# Debug Levels
-DEBUG_LEVEL = 0
+# Load configuration
+CONFIG = load_config()
+
+if not validate_config(CONFIG):
+    print("\n[!] Configuration validation failed. Exiting.")
+    sys.exit(1)
+
+# Apply configuration with defaults for optional fields
+usp_config = CONFIG['usp_controller']
+BROKER_HOST = usp_config.get('broker_host', DEFAULT_CONFIG['broker_host'])
+BROKER_PORT = usp_config.get('broker_port', DEFAULT_CONFIG['broker_port'])
+USERNAME = usp_config.get('username', DEFAULT_CONFIG['username'])
+PASSWORD = usp_config.get('password', DEFAULT_CONFIG['password'])
+CONTROLLER_ENDPOINT_ID = usp_config['controller_endpoint_id']  # Required
+RECEIVE_TOPIC = usp_config['receive_topic']  # Required
+DEVICES_FILE = usp_config.get('devices_file', DEFAULT_CONFIG['devices_file'])
+
+# Derived configuration
+REPLY_TO_QUEUE = usp_config.get('reply_to_queue', f'/queue/{CONTROLLER_ENDPOINT_ID}')
+
+# IPC Configuration
+ipc_config = CONFIG.get('ipc', {})
+IPC_HOST = ipc_config.get('host', DEFAULT_CONFIG['ipc_host'])
+IPC_PORT = ipc_config.get('port', DEFAULT_CONFIG['ipc_port'])
+
+# Advanced options
+AUTO_SUBSCRIBE_WILDCARD = usp_config.get('auto_subscribe_wildcard', DEFAULT_CONFIG['auto_subscribe_wildcard'])
+
+# System-specific configuration
+import platform
+if platform.system() == 'Windows':
+    PID_FILE = os.path.join(os.environ.get('TEMP', 'C:\\Temp'), 'usp_controller.pid')
+else:
+    PID_FILE = '/tmp/usp_controller.pid'
+
+# Debug Levels (can be overridden by config or command line)
+DEBUG_LEVEL = 2  # Default: Full Details for better troubleshooting
 """
 Debug Levels:
   0 - Agent Only: Only show agent response data (DM values)
   1 - Both Payloads: Show controller requests + agent responses (USP messages)
-  2 - Full Details: Show complete STOMP headers + payloads
+  2 - Full Details: Show complete STOMP headers + payloads (Default)
 """
+
+def set_debug_level(level):
+    """Set debug level at runtime"""
+    global DEBUG_LEVEL
+    if 0 <= level <= 2:
+        DEBUG_LEVEL = level
+        return True
+    return False
 
 class Logger:
     """Centralized logging with debug levels"""
@@ -256,18 +332,19 @@ class STOMPManager:
                 self.recv_thread = threading.Thread(target=self._receiver_loop, daemon=True)
                 self.recv_thread.start()
                 
-                # Subscribe to self and wildcards
+                # Controller 只訂閱自己的接收佇列
                 self.subscribe(RECEIVE_TOPIC)
-                self.subscribe(REPLY_TO_QUEUE)
-                self.subscribe("/topic/>")
-                self.subscribe("/queue/>")
-
-                # Load and subscribe to known devices
+                Logger.info(f"Subscribed to: {RECEIVE_TOPIC}", level=1)
+                
+                # 如果 reply_to_queue 不同，也訂閱
+                if RECEIVE_TOPIC != REPLY_TO_QUEUE:
+                    self.subscribe(REPLY_TO_QUEUE)
+                    Logger.info(f"Subscribed to: {REPLY_TO_QUEUE}", level=1)
+                
+                # 載入已知設備（只記錄 reply_to，不訂閱）
                 self.load_devices()
-                for endpoint, info in self.devices.items():
-                    if 'reply_to' in info:
-                        Logger.info(f"Restoring subscription for {endpoint}: {info['reply_to']}", level=1)
-                        self.subscribe(info['reply_to'])
+                if self.devices:
+                    Logger.info(f"Loaded {len(self.devices)} known devices (reply addresses stored)", level=1)
                 
                 return True
             else:
@@ -429,70 +506,171 @@ class STOMPManager:
             Logger.critical(f"Frame processing error: {e}")
 
     def _handle_message(self, headers, body):
-        # 1. Device Discovery logic
-        sender = None
+        """
+        處理收到的 STOMP 訊息
+        
+        處理流程:
+        1. 提取 reply-to 地址 (用於回覆)
+        2. 從 USP Record 提取 sender endpoint ID
+        3. 解析 USP 訊息內容
+        4. 根據訊息類型分發處理 (Response/Request/Error)
+        5. 註冊/更新設備資訊到 devices.json
+        6. 通知 callback (IPC, UI)
+        """
+        
+        # ==================== Step 1: 提取回覆地址 ====================
+        # reply-to-dest 是 agent 告訴我們的回覆目的地，直接使用即可
         reply_to = headers.get('reply-to-dest')
+        sender = None  # endpoint ID，需從 USP Record.from_id 獲取
         
-        # Try to parse sender from reply-to header
+        # Debug: 顯示收到的訊息基本資訊
+        Logger.info(f"Incoming message from destination: {headers.get('destination', 'unknown')}", level=1)
         if reply_to:
-            # Clean ActiveMQ format \c -> :
-            clean_reply = reply_to.replace('\\c', ':')
-            # Extract ID if present (simple heuristic)
-            if 'proto::' in clean_reply or 'os::' in clean_reply:
-                # Assuming queue name contains ID or IS the ID prefixed
-                # Typical: /queue/proto::agent-1
-                parts = clean_reply.split('/')
-                for p in parts:
-                    if '::' in p:
-                        sender = p
-                        break
+            Logger.info(f"  reply-to address: {reply_to}", level=1)
+        else:
+            Logger.critical(f"  ⚠ No reply-to-dest header! Cannot reply to this agent.")
         
-        # If not found, try parsing USP record
+        # ==================== Step 2: 解析 USP Record 獲取 endpoint ID ====================
+        # 如果是 USP 訊息，從 protobuf 中提取 from_id 和訊息內容
         if 'application/vnd.bbf.usp.msg' in headers.get('content-type', ''):
             try:
+                # 解析 USP Record（外層封裝）
                 rec = record_pb2.Record()
                 rec.ParseFromString(body)
-                sender = rec.from_id
                 
-                # Parsing for logging
+                # 從 USP Record 獲取 sender endpoint ID（標準做法）
+                sender = rec.from_id
+                Logger.info(f"  Endpoint ID (from_id): {sender}", level=1)
+                Logger.info(f"  Target (to_id): {rec.to_id}", level=2)
+                
+                # ==================== Step 3: 解析 USP Message（內層訊息）====================
+                # USP Record 可能使用 no_session_context 或 session_context
+                payload = None
+                
                 if rec.HasField('no_session_context'):
+                    # 無會話上下文（最常見）
+                    payload = rec.no_session_context.payload
+                    Logger.info(f"  ✓ Found no_session_context", level=2)
+                    
+                elif rec.HasField('session_context'):
+                    # 有會話上下文
+                    payload = rec.session_context.payload
+                    Logger.info(f"  ✓ Found session_context (session_id: {rec.session_context.session_id})", level=1)
+                    
+                else:
+                    # 可能是連接/斷線訊息 - 顯示詳細內容
+                    Logger.info(f"  ⚠ No payload context found in USP record", level=1)
+                    
+                    if rec.HasField('websocket_connect'):
+                        Logger.info(f"    → WebSocket Connect message", level=0)
+                        
+                    elif rec.HasField('mqtt_connect'):
+                        Logger.info(f"    → MQTT Connect message", level=0)
+                        mqtt = rec.mqtt_connect
+                        Logger.info(f"       Version: {mqtt.version}", level=0)
+                        Logger.info(f"       Subscribed Topic: {mqtt.subscribed_topic}", level=0)
+                        
+                    elif rec.HasField('stomp_connect'):
+                        Logger.info(f"    → STOMP Connect message", level=0)
+                        stomp = rec.stomp_connect
+                        Logger.info(f"       Version: {stomp.version}", level=0)
+                        Logger.info(f"       Subscribed Destination: {stomp.subscribed_destination}", level=0)
+                        if DEBUG_LEVEL >= 2:
+                            Logger.info(f"       Full STOMP Connect data: {stomp}", level=2)
+                        
+                    elif rec.HasField('disconnect'):
+                        Logger.info(f"    → Disconnect message", level=0)
+                        disc = rec.disconnect
+                        Logger.info(f"       Reason: {disc.reason if disc.reason else 'Normal disconnect'}", level=0)
+                        Logger.info(f"       Reason Code: {disc.reason_code}", level=0)
+                        
+                    elif rec.HasField('uds_connect'):
+                        Logger.info(f"    → UDS Connect message", level=0)
+                        
+                    else:
+                        Logger.critical(f"    ❌ Unknown record type!")
+                        if DEBUG_LEVEL >= 2:
+                            Logger.critical(f"       Record fields: {rec.ListFields()}")
+                
+                # 如果有 payload，解析 USP 訊息
+                if payload:
+                    # 解析實際的 USP 訊息
                     msg = msg_pb2.Msg()
-                    msg.ParseFromString(rec.no_session_context.payload)
+                    msg.ParseFromString(payload)
                     mtype = msg_pb2.Header.MsgType.Name(msg.header.msg_type)
                     
+                    # 記錄收到的 USP 訊息類型
                     details = {"msg_id": msg.header.msg_id} if DEBUG_LEVEL >= 2 else None
                     Logger.usp_message("recv", sender, mtype, details)
                     
+                    # ==================== Step 5: 根據訊息類型分發處理 ====================
                     if msg.body.HasField('response'):
+                        # Response: agent 回覆 controller 的查詢（GET_RESP, SET_RESP 等）
                         self._handle_usp_response(sender, msg)
+                        
                     elif msg.body.HasField('request'):
-                        Logger.info(f"Received USP Request from {sender}", level=2)
+                        # Request: agent 主動發送請求給 controller（通常是 NOTIFY）
+                        Logger.info(f"Received USP Request from {sender}", level=0)
+                        self._handle_usp_request(sender, msg)
+                        
                     elif msg.body.HasField('error'):
+                        # Error: agent 回報錯誤
                         Logger.critical(f"USP Error from {sender}: {msg.body.error.err_msg}")
                         
             except Exception as e:
+                # ==================== 解析失敗處理 ====================
                 import traceback
-                Logger.critical(f"USP parsing error: {e}")
+                Logger.critical(f"❌ USP parsing error: {e}")
+                Logger.critical(f"  Headers: {headers}")
+                Logger.critical(f"  Body length: {len(body)} bytes")
+                if DEBUG_LEVEL >= 1:
+                    Logger.critical(f"  Body hex (first 100 bytes): {body[:100].hex()}...")
                 if DEBUG_LEVEL >= 2:
                     Logger.critical(f"Traceback: {traceback.format_exc()}")
+        else:
+            # ==================== 非 USP 訊息 ====================
+            content_type = headers.get('content-type', 'unknown')
+            Logger.info(f"  ℹ Non-USP message, content-type: {content_type}", level=1)
+            Logger.info(f"  Body preview: {body[:200]}", level=2)
         
-        # 2. Store discovered device
+        # ==================== Step 5: 註冊/更新設備資訊 ====================
+        # 只有同時有 sender 和 reply_to 才能註冊設備
         if sender and reply_to:
             with self.lock:
-                if sender not in self.devices:
-                    Logger.success(f"Discovered new device: {sender}", level=1)
-                    self.subscribe(reply_to)
+                is_new_device = sender not in self.devices
                 
+                if is_new_device:
+                    Logger.success(f"✓ Discovered new device: {sender}", level=0)
+                    Logger.info(f"  Reply address stored: {reply_to}", level=1)
+                else:
+                    Logger.info(f"  ↻ Updated existing device: {sender}", level=1)
+                
+                # 儲存設備資訊（endpoint_id -> reply_to 的映射）
                 self.devices[sender] = {
                     'reply_to': reply_to,
                     'last_seen': datetime.now().isoformat()
                 }
                 self.last_active_device = sender
                 
-                # Save to disk
+                # 持久化到 devices.json
                 self.save_devices()
+                
+        elif sender:
+            # 有 sender 但沒有 reply_to：agent 沒告訴我們回覆地址
+            Logger.critical(f"⚠ Endpoint ID identified ({sender}) but no reply-to-dest header!")
+            Logger.critical(f"    Cannot reply to this agent - missing reply address")
+            
+        elif reply_to:
+            # 有 reply_to 但沒有 sender：無法識別是哪個設備（USP 解析失敗？）
+            Logger.critical(f"⚠ Reply address provided ({reply_to}) but endpoint ID unknown!")
+            Logger.critical(f"    Check if USP record parsing failed or non-USP message")
+            
+        else:
+            # 兩者都沒有：無法處理的訊息
+            Logger.info(f"  ℹ No endpoint ID or reply address, message not stored", level=1)
         
-        # 3. Notify callbacks (IPC, UI)
+        # ==================== Step 6: 通知 callbacks ====================
+        # 將訊息轉發給所有註冊的 callback（例如 IPC Server）
         for cb in self.msg_callbacks:
             cb(headers, body, sender)
     
@@ -579,6 +757,66 @@ class STOMPManager:
                 
         elif resp.HasField('error'):
             Logger.critical(f"Error {resp.error.err_code}: {resp.error.err_msg}")
+    
+    def _handle_usp_request(self, sender, msg):
+        """Handle USP request from agent and send appropriate response"""
+        req = msg.body.request
+        msg_id = msg.header.msg_id
+        
+        # Determine request type for logging
+        req_type = "UNKNOWN"
+        if req.HasField('get'):
+            req_type = "GET"
+        elif req.HasField('set'):
+            req_type = "SET"
+        elif req.HasField('add'):
+            req_type = "ADD"
+        elif req.HasField('delete'):
+            req_type = "DELETE"
+        elif req.HasField('operate'):
+            req_type = "OPERATE"
+        elif req.HasField('get_supported_dm'):
+            req_type = "GET_SUPPORTED_DM"
+        elif req.HasField('get_instances'):
+            req_type = "GET_INSTANCES"
+        elif req.HasField('notify'):
+            req_type = "NOTIFY"
+            # Notify is special - it doesn't expect a response
+            Logger.info(f"  Received NOTIFY from {sender}", level=0)
+            # Extract and display notify details
+            if DEBUG_LEVEL >= 1:
+                for sub_id in req.notify.subscription_id:
+                    Logger.data(f"    Subscription: {sub_id}")
+                for send_obj in req.notify.send_objs:
+                    Logger.data(f"    Object: {send_obj.obj_path}")
+            return  # Don't send error response for notify
+        
+        Logger.info(f"  Request type: {req_type} (not yet supported by controller)", level=1)
+        
+        # Create error response
+        resp_msg = msg_pb2.Msg()
+        resp_msg.header.msg_id = str(uuid.uuid4())
+        resp_msg.header.msg_type = msg_pb2.Header.MsgType.ERROR
+        
+        error = resp_msg.body.error
+        error.err_code = 7004  # Request denied
+        error.err_msg = f"Controller does not process {req_type} requests from agents"
+        
+        # Send error response
+        device = self.devices.get(sender)
+        if device and 'reply_to' in device:
+            # Wrap in USP Record
+            usp_rec = record_pb2.Record()
+            usp_rec.version = "1.4"
+            usp_rec.to_id = sender
+            usp_rec.from_id = CONTROLLER_ENDPOINT_ID
+            usp_rec.payload_security = record_pb2.Record.PayloadSecurity.PLAINTEXT
+            usp_rec.no_session_context.payload = resp_msg.SerializeToString()
+            
+            self.send(device['reply_to'], usp_rec.SerializeToString(), reply_to=REPLY_TO_QUEUE)
+            Logger.info(f"  Sent error response to {sender}", level=1)
+        else:
+            Logger.critical(f"Cannot send response: device {sender} not registered")
 
 
 class IPCServer(threading.Thread):
@@ -819,9 +1057,12 @@ class IPCServer(threading.Thread):
         
         rec_bytes = usp_rec.SerializeToString()
         
-        # Determine destination
+        # Determine destination from device info (agent must have registered)
         device = self.stomp.devices.get(endpoint)
-        dest = device['reply_to'] if device else SEND_DESTINATION
+        if not device or 'reply_to' not in device:
+            print(f"[!] Unknown device {endpoint}. Wait for agent to register first.")
+            return False
+        dest = device['reply_to']
         
         return self.stomp.send(dest, rec_bytes, reply_to=REPLY_TO_QUEUE)
 
@@ -923,7 +1164,10 @@ def interactive_mode(stomp_mgr):
             usp_rec.no_session_context.payload = msg_bytes
             
             dev = self.stomp.devices.get(endpoint)
-            dest = dev['reply_to'] if dev else SEND_DESTINATION
+            if not dev or 'reply_to' not in dev:
+                print(f"[!] Unknown device {endpoint}. Wait for agent to register first.")
+                return False
+            dest = dev['reply_to']
             
             return self.stomp.send(dest, usp_rec.SerializeToString(), reply_to=REPLY_TO_QUEUE)
     
@@ -1111,19 +1355,57 @@ def interactive_mode(stomp_mgr):
             print(f"Error: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description="USP Controller")
-    parser.add_argument('--daemon', action='store_true', help='Run in headless daemon mode with IPC')
-    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-    parser.add_argument('--force', action='store_true', help='Force kill old daemon if running')
+    parser = argparse.ArgumentParser(
+        description="USP STOMP Controller - Dual Mode (Interactive/Daemon)",
+        epilog="Example: python usp_controller.py --daemon --debug 1"
+    )
+    parser.add_argument('--daemon', action='store_true', 
+                       help='Run as background daemon with IPC')
+    parser.add_argument('--debug', type=int, choices=[0, 1, 2], metavar='LEVEL',
+                       help='Set debug level: 0=Agent Only, 1=Both Payloads, 2=Full Details')
+    parser.add_argument('--force', action='store_true', 
+                       help='Force kill old daemon before starting')
+    parser.add_argument('--config', type=str, default='config.json', 
+                       help='Config file path (default: config.json)')
+    parser.add_argument('--endpoint-id', type=str, 
+                       help='Override controller endpoint ID from config')
+    parser.add_argument('--broker', type=str, 
+                       help='Override broker address (format: host:port)')
     args = parser.parse_args()
     
-    global DEBUG_MODE
-    DEBUG_MODE = args.debug
+    # Apply command line overrides
+    global DEBUG_LEVEL, CONTROLLER_ENDPOINT_ID, BROKER_HOST, BROKER_PORT, REPLY_TO_QUEUE
+    
+    if args.debug is not None:
+        DEBUG_LEVEL = args.debug
+    
+    # 顯示當前 debug level
+    debug_names = ["Agent Only", "Both Payloads", "Full Details"]
+    print(f"[*] Debug Level: {DEBUG_LEVEL} ({debug_names[DEBUG_LEVEL]})")
+    
+    if args.endpoint_id:
+        CONTROLLER_ENDPOINT_ID = args.endpoint_id
+        REPLY_TO_QUEUE = f'/queue/{CONTROLLER_ENDPOINT_ID}'
+        print(f"[*] Controller Endpoint ID overridden: {CONTROLLER_ENDPOINT_ID}")
+    
+    if args.broker:
+        if ':' in args.broker:
+            host, port = args.broker.split(':', 1)
+            BROKER_HOST = host
+            BROKER_PORT = int(port)
+        else:
+            BROKER_HOST = args.broker
+        print(f"[*] Broker overridden: {BROKER_HOST}:{BROKER_PORT}")
     
     # Check for old daemon in daemon mode
     if args.daemon:
         if not check_and_kill_old_daemon(force=args.force):
             sys.exit(1)
+    
+    # 顯示配置資訊
+    print(f"[*] Controller: {CONTROLLER_ENDPOINT_ID}")
+    print(f"[*] Broker: {BROKER_HOST}:{BROKER_PORT}")
+    print(f"[*] Receive Topic: {RECEIVE_TOPIC}")
     
     # Init STOMP
     stomp_mgr = STOMPManager()

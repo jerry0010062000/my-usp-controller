@@ -6,8 +6,8 @@
     "last_msg_len": 3915
   },
   "proto::agent-id": {
-    "reply_to": "/topic/agent-path",
-    "last_seen": "2026-01-14T15:29:34.483736"
+    "reply_to": "/queue/usp.agent.atnt-prpl",
+    "last_seen": "2026-01-29T10:57:46.756749"
   },
   "proto::controller-temp": {
     "endpoint_id": "proto::controller-temp",
@@ -18,5 +18,9 @@
   "proto::controller-1": {
     "reply_to": "/queue/proto\\c\\ccontroller-1",
     "last_seen": "2026-01-14T15:23:34.242629"
+  },
+  "proto::controller.jerry-laptop": {
+    "reply_to": "/queue/proto\\c\\ccontroller.jerry-laptop",
+    "last_seen": "2026-01-27T15:42:13.116198"
   }
 }
