@@ -15,6 +15,9 @@
 │  互動式 Shell        │      IPC 客戶端                  │
 │  ./usp_controller.py │   ./usp_client.py <cmd>          │
 │         │            │            │                     │
+│  Windows GUI         │      Python Script               │
+│  python usp_gui.py   │   (自動化任務)                   │
+│         │            │            │                     │
 │         └────────────┼────────────┘                     │
 │                      │                                  │
 │              ┌───────▼────────┐                         │
@@ -69,10 +72,28 @@ pip install -r requirements.txt
 
 詳細安裝：[WINDOWS_INSTALL.md](WINDOWS_INSTALL.md)
 
-## 
-```bash
-# 啟動 daemon
-./usp_controller.py --daemon &
+## 使用方式
+
+### Windows GUI 圖形介面（推薦）
+
+**前提：** 先啟動 daemon 模式
+
+```powershell
+# 1. 啟動 daemon（背景執行）
+python usp_controller.py --daemon
+
+# 2. 啟動 GUI
+python usp_gui.py
+```
+
+**GUI 功能：**
+- 📊 **即時監控**：設備狀態、連線狀態、即時日誌
+- 🎮 **互動操作**：Get/Set 參數、命令執行、歷史記錄
+- ⚙️ **設定管理**：Broker 配置、Debug 級別、mDNS 控制
+- 🔍 **mDNS 發現**：自動掃描網路上的 USP Agent、服務監控
+- 📝 **日誌查看**：支援右鍵複製、自動捲動、多層級顯示
+- 🎯 **命令歷史**：儲存執行過的命令、快速重新執行
+
 ### 互動模式
 
 ```bash
@@ -87,12 +108,16 @@ usp-cli> set <endpoint_id> <path> <value>  # 設定參數
 usp-cli> debug 0                           # 調整顯示層級 (0-2)
 ```
 
-### Daemon 模式
+### Daemon 模式 + IPC 客戶端
 
 ```bash
-./usp_controller.py --daemon
+# 啟動 daemon
+./usp_controller.py --daemon &
+
+# 使用 IPC 客戶端
 ./usp_client.py status
 ./usp_client.py get <endpoint_id> <path>
+./usp_client.py set <endpoint_id> <path> <value>
 ```
 
 ## 配置
@@ -108,7 +133,8 @@ usp-cli> debug 0                           # 調整顯示層級 (0-2)
     "password": "guest",
     "controller_endpoint_id": "proto::controller-1",
     "receive_topic": "/queue/usp/controller/controller-1",
-    "devices_file": "devices.json"
+    "devices_file": "devices.json",
+    "enable_mdns_discovery": true
   },
   "ipc": {
     "host": "127.0.0.1",
@@ -118,6 +144,25 @@ usp-cli> debug 0                           # 調整顯示層級 (0-2)
 ```
 
 Agent 會主動註冊到 controller，無需手動配置 destination。
+
+## 功能特色
+
+### 🔍 mDNS 自動發現
+- 自動掃描區網 USP Agent（`_usp-agent._tcp.local.`）
+- 被動監聽 + 主動掃描雙模式
+- 發現後自動註冊到 devices.json
+- 詳細文檔：[MDNS_DISCOVERY.md](MDNS_DISCOVERY.md)
+
+### 🖥️ Windows GUI
+- Tkinter 原生介面，無需額外安裝
+- 三大功能分頁：監控、設定、mDNS Debug
+- 即時日誌、命令歷史、右鍵複製
+- 完整 IPC 整合
+
+### 🔧 多模式運行
+- **互動 Shell**：人工操作測試
+- **Daemon + IPC**：自動化腳本
+- **GUI 介面**：視覺化管理
 
 ---
 
