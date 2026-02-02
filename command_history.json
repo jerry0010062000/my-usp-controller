@@ -1,0 +1,58 @@
+[
+  {
+    "timestamp": "2026-02-02T10:11:17.048565",
+    "action": "GET",
+    "endpoint": "proto::agent-id",
+    "path": "Device.WiFi.",
+    "value": "",
+    "status": "pending"
+  },
+  {
+    "timestamp": "2026-01-29T17:54:40.534731",
+    "action": "GET",
+    "endpoint": "proto::agent-id",
+    "path": "Device.LocalAgent.",
+    "value": "",
+    "status": "pending"
+  },
+  {
+    "timestamp": "2026-01-29T17:45:25.259164",
+    "action": "SET",
+    "endpoint": "proto::agent-id",
+    "path": "Device.LocalAgent.",
+    "value": "test",
+    "status": "success"
+  },
+  {
+    "timestamp": "2026-01-29T17:47:10.091729",
+    "action": "DISCOVER",
+    "endpoint": "proto::agent-id",
+    "path": "Device.LocalAgent.",
+    "value": "test",
+    "status": "success"
+  },
+  {
+    "timestamp": "2026-01-29T17:52:44.970478",
+    "action": "GET",
+    "endpoint": "proto::agent-id",
+    "path": "Device.LocalAgent.1.",
+    "value": "",
+    "status": "success"
+  },
+  {
+    "timestamp": "2026-01-29T17:53:38.664374",
+    "action": "GET",
+    "endpoint": "proto::agent-id",
+    "path": "Device.LocalAgent.MTP.1.",
+    "value": "",
+    "status": "success"
+  },
+  {
+    "timestamp": "2026-01-30T15:14:30.581323",
+    "action": "DISCOVER",
+    "endpoint": "proto::agent-id",
+    "path": "Device.LocalAgent.",
+    "value": "",
+    "status": "error"
+  }
+]

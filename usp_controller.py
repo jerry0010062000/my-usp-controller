@@ -19,6 +19,7 @@ import select
 from datetime import datetime
 import argparse
 import platform
+import atexit
 
 # Import USP protobuf definitions
 try:
@@ -38,7 +39,8 @@ try:
         readline.set_history_length(1000)
     except FileNotFoundError:
         pass
-    import atexit
+    
+    # atexit imported globally now
     atexit.register(readline.write_history_file, histfile)
 except ImportError:
     pass
@@ -56,6 +58,16 @@ def load_config(config_file='config.json'):
     except json.JSONDecodeError as e:
         print(f"[!] Error parsing config file: {e}")
         return None
+
+def save_config(config, config_file='config.json'):
+    """Save configuration to JSON file"""
+    try:
+        with open(config_file, 'w') as f:
+            json.dump(config, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"[!] Error saving config file: {e}")
+        return False
 
 # Configuration defaults (only for optional settings)
 DEFAULT_CONFIG = {
@@ -127,6 +139,9 @@ if platform.system() == 'Windows':
 else:
     PID_FILE = '/tmp/usp_controller.pid'
 
+# Device online status timeout (seconds)
+DEVICE_TIMEOUT = 300  # 5 minutes - device considered offline if no message for this duration
+
 # Debug Levels (can be overridden by config or command line)
 DEBUG_LEVEL = 2  # Default: Full Details for better troubleshooting
 """
@@ -146,7 +161,7 @@ def set_debug_level(level):
 
 class Logger:
     """Centralized logging with debug levels and memory buffer for IPC"""
-    HISTORY_SIZE = 1000
+    HISTORY_SIZE = 5000
     history = []  # List of dict
     log_counter = 0
     lock = threading.Lock()
@@ -238,9 +253,7 @@ class Logger:
 DEBUG_MODE = False  # Legacy, kept for compatibility
 
 def check_and_kill_old_daemon(force=False):
-    """Check if old daemon is running and kill it"""
-    import signal
-    
+    """Check if old daemon is running and kill it (Windows-compatible)"""
     if not os.path.exists(PID_FILE):
         return True
     
@@ -248,33 +261,66 @@ def check_and_kill_old_daemon(force=False):
         with open(PID_FILE, 'r') as f:
             old_pid = int(f.read().strip())
         
-        # Check if process exists
-        try:
-            os.kill(old_pid, 0)  # Signal 0 checks if process exists
-            # Process exists
-            if force:
-                print(f"[*] Found old daemon (PID {old_pid}), terminating...")
-                os.kill(old_pid, signal.SIGTERM)
-                time.sleep(0.5)
-                # Check if still alive, force kill
-                try:
-                    os.kill(old_pid, 0)
-                    print(f"[*] Force killing old daemon...")
-                    os.kill(old_pid, signal.SIGKILL)
-                    time.sleep(0.3)
-                except ProcessLookupError:
-                    pass
-                print(f"[✓] Old daemon terminated")
-                return True
+        # Check if process exists (Windows-compatible method)
+        if platform.system() == 'Windows':
+            import subprocess
+            try:
+                # Use tasklist to check if PID exists
+                result = subprocess.run(['tasklist', '/FI', f'PID eq {old_pid}'], 
+                                       capture_output=True, text=True, timeout=2)
+                process_exists = str(old_pid) in result.stdout
+            except:
+                # Fallback: assume stale PID file
+                process_exists = False
+                
+            if process_exists:
+                if force:
+                    print(f"[*] Found old daemon (PID {old_pid}), terminating...")
+                    try:
+                        subprocess.run(['taskkill', '/F', '/PID', str(old_pid)], 
+                                      capture_output=True, timeout=5)
+                        time.sleep(0.5)
+                        print(f"[✓] Old daemon terminated")
+                    except Exception as e:
+                        print(f"[!] Failed to kill process: {e}")
+                        return False
+                    return True
+                else:
+                    print(f"[!] Daemon already running (PID {old_pid})")
+                    print(f"    Use --force to terminate old daemon and start new one")
+                    return False
             else:
-                print(f"[!] Daemon already running (PID {old_pid})")
-                print(f"    Use --force to terminate old daemon and start new one")
-                print(f"    Or manually kill it: kill {old_pid}")
-                return False
-        except ProcessLookupError:
-            # Process doesn't exist, remove stale PID file
-            os.remove(PID_FILE)
-            return True
+                # Process doesn't exist, remove stale PID file
+                os.remove(PID_FILE)
+                return True
+        else:
+            # Unix/Linux: use os.kill with signal 0
+            import signal
+            try:
+                os.kill(old_pid, 0)  # Signal 0 checks if process exists
+                # Process exists
+                if force:
+                    print(f"[*] Found old daemon (PID {old_pid}), terminating...")
+                    os.kill(old_pid, signal.SIGTERM)
+                    time.sleep(0.5)
+                    # Check if still alive, force kill
+                    try:
+                        os.kill(old_pid, 0)
+                        print(f"[*] Force killing old daemon...")
+                        os.kill(old_pid, signal.SIGKILL)
+                        time.sleep(0.3)
+                    except ProcessLookupError:
+                        pass
+                    print(f"[✓] Old daemon terminated")
+                    return True
+                else:
+                    print(f"[!] Daemon already running (PID {old_pid})")
+                    print(f"    Use --force to terminate old daemon and start new one")
+                    return False
+            except ProcessLookupError:
+                # Process doesn't exist, remove stale PID file
+                os.remove(PID_FILE)
+                return True
     except Exception as e:
         print(f"[!] Error checking old daemon: {e}")
         return False
@@ -307,6 +353,30 @@ class STOMPManager:
         self.msg_callbacks = []
         self.last_active_device = None
         self.lock = threading.Lock()
+    
+    def get_device_status(self, endpoint_id):
+        """Check if device is online based on last_seen timestamp"""
+        if endpoint_id not in self.devices:
+            return "unknown"
+        
+        device_info = self.devices[endpoint_id]
+        last_seen_str = device_info.get('last_seen')
+        
+        if not last_seen_str:
+            return "unknown"
+        
+        try:
+            from datetime import datetime
+            last_seen = datetime.fromisoformat(last_seen_str)
+            now = datetime.now()
+            elapsed = (now - last_seen).total_seconds()
+            
+            if elapsed < DEVICE_TIMEOUT:
+                return "online"
+            else:
+                return "offline"
+        except:
+            return "unknown"
         
     def load_devices(self):
         """Load known devices from file"""
@@ -706,6 +776,8 @@ class STOMPManager:
         resp = msg.body.response
         
         if resp.HasField('get_resp'):
+            total_params = 0
+            Logger.data(f"  === GET Response Start ===")
             for r in resp.get_resp.req_path_results:
                 status = '✓' if r.err_code == 0 else '✗'
                 Logger.data(f"  Path: {r.requested_path} ({status})")
@@ -713,6 +785,8 @@ class STOMPManager:
                     Logger.data(f"    {res.resolved_path}")
                     for p, v in res.result_params.items():
                         Logger.data(f"      {p} = {v}")
+                        total_params += 1
+            Logger.data(f"  === Total: {total_params} parameters ===")
                     
         elif resp.HasField('get_supported_dm_resp'):
             count = 0
@@ -900,11 +974,32 @@ class IPCServer(threading.Thread):
                 }
             
             elif cmd == "devices":
+                # Include online status for each device
+                devices_with_status = {}
+                for ep_id, info in self.stomp.devices.items():
+                    device_data = info.copy()
+                    device_data['status'] = self.stomp.get_device_status(ep_id)
+                    devices_with_status[ep_id] = device_data
+                
                 response = {
                     "status": "ok",
-                    "devices": self.stomp.devices
+                    "devices": devices_with_status
                 }
-                
+            
+            elif cmd == "remove_device":
+                # remove_device <endpoint_id>
+                if len(cmd_parts) >= 2:
+                    endpoint = cmd_parts[1]
+                    if endpoint in self.stomp.devices:
+                        del self.stomp.devices[endpoint]
+                        self.stomp.save_devices()
+                        Logger.info(f"Device removed: {endpoint}", level=0)
+                        response = {"status": "ok", "msg": f"Device '{endpoint}' removed"}
+                    else:
+                        response = {"status": "error", "msg": f"Device '{endpoint}' not found"}
+                else:
+                    response = {"status": "error", "msg": "usage: remove_device <endpoint_id>"}
+            
             elif cmd == "get":
                 # get <endpoint> <path>
                 if len(cmd_parts) >= 3:
@@ -971,16 +1066,116 @@ class IPCServer(threading.Thread):
                 else:
                     response = {"status": "error", "msg": "usage: operate <endpoint> <command> [key=value ...]"}
 
+            elif cmd == "get_config":
+                # Returns current configuration and debug level
+                response = {
+                    "status": "ok",
+                    "config": {
+                        "broker_host": BROKER_HOST,
+                        "broker_port": BROKER_PORT,
+                        "controller_id": CONTROLLER_ENDPOINT_ID,
+                        "receive_topic": RECEIVE_TOPIC,
+                        "debug_level": DEBUG_LEVEL,
+                        "username": USERNAME,
+                        "ipc_port": IPC_PORT
+                    }
+                }
+            
+            elif cmd == "update_config":
+                # update_config <field> <value>
+                # Supports: broker_host, broker_port, controller_id, receive_topic, username, password
+                if len(cmd_parts) >= 3:
+                    field = cmd_parts[1]
+                    value = " ".join(cmd_parts[2:])
+                    
+                    # Load current config
+                    config = load_config()
+                    if not config:
+                        response = {"status": "error", "msg": "Failed to load config.json"}
+                    else:
+                        try:
+                            # Update the appropriate field
+                            if field == "broker_host":
+                                config['usp_controller']['broker_host'] = value
+                            elif field == "broker_port":
+                                config['usp_controller']['broker_port'] = int(value)
+                            elif field == "controller_id":
+                                config['usp_controller']['controller_endpoint_id'] = value
+                                # Also update receive_topic if not custom
+                                if 'receive_topic' not in config['usp_controller'] or \
+                                   config['usp_controller']['receive_topic'].endswith(CONTROLLER_ENDPOINT_ID.split('::')[-1]):
+                                    config['usp_controller']['receive_topic'] = f'/queue/usp.controller.{value.split("::")[-1]}'
+                            elif field == "receive_topic":
+                                config['usp_controller']['receive_topic'] = value
+                            elif field == "username":
+                                config['usp_controller']['username'] = value
+                            elif field == "password":
+                                config['usp_controller']['password'] = value
+                            elif field == "ipc_port":
+                                if 'ipc' not in config:
+                                    config['ipc'] = {}
+                                config['ipc']['port'] = int(value)
+                            else:
+                                response = {"status": "error", "msg": f"Unknown field: {field}"}
+                                client.sendall(json.dumps(response).encode('utf-8'))
+                                client.close()
+                                return
+                            
+                            # Save updated config
+                            if save_config(config):
+                                response = {"status": "ok", "msg": f"Config updated. Restart daemon to apply changes."}
+                            else:
+                                response = {"status": "error", "msg": "Failed to save config.json"}
+                        except ValueError as e:
+                            response = {"status": "error", "msg": f"Invalid value: {str(e)}"}
+                        except Exception as e:
+                            response = {"status": "error", "msg": f"Error: {str(e)}"}
+                else:
+                    response = {"status": "error", "msg": "usage: update_config <field> <value>"}
+            
+            elif cmd == "set_debug":
+                # set_debug <level>
+                if len(cmd_parts) >= 2:
+                    try: 
+                        level = int(cmd_parts[1])
+                        if set_debug_level(level):
+                            response = {"status": "ok", "msg": f"Debug level set to {level}"}
+                        else:
+                            response = {"status": "error", "msg": "Invalid debug level (0-2)"}
+                    except ValueError:
+                        response = {"status": "error", "msg": "Level must be an integer"}
+                else:
+                    response = {"status": "error", "msg": "usage: set_debug <level>"}
+            
+            elif cmd == "reconnect":
+                # Attempt STOMP reconnection
+                try:
+                    if self.stomp.connected:
+                        self.stomp.sock.close()
+                        self.stomp.connected = False
+                        time.sleep(1) # Wait for close
+                    
+                    if self.stomp.connect():
+                        response = {"status": "ok", "msg": "Reconnected to STOMP Broker"}
+                    else:
+                        response = {"status": "error", "msg": "Reconnection failed (Check logs)"}
+                except Exception as e:
+                    response = {"status": "error", "msg": f"Reconnection error: {str(e)}"}
+
             elif cmd == "poll_logs":
                 # poll_logs [last_id]
                 last_id = -1
+
                 if len(cmd_parts) >= 2:
                     try: last_id = int(cmd_parts[1])
                     except: pass
                 
                 with Logger.lock:
-                    # Provide logs with id > last_id
+                    # Provide logs with id > last_id (limited to 200 per request)
                     new_logs = [log for log in Logger.history if log['id'] > last_id]
+                    # Limit to prevent UI freeze
+                    if len(new_logs) > 200:
+                        new_logs = new_logs[:200]
                     response = {
                         "status": "ok", 
                         "logs": new_logs, 
@@ -1453,7 +1648,11 @@ def main():
     # Init STOMP
     stomp_mgr = STOMPManager()
     if not stomp_mgr.connect():
-        sys.exit(1)
+        if args.daemon:
+            print("[!] Warning: STOMP connection failed. Starting daemon anyway to allow IPC access.")
+        else:
+            print("[!] Critical: STOMP connection failed. Exiting.")
+            sys.exit(1)
     
     # Start IPC Server only in daemon mode
     ipc_server = None
