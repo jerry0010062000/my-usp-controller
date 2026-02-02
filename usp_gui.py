@@ -222,11 +222,106 @@ class USPControllerGUI:
         # Text widget
         self.txt_log = scrolledtext.ScrolledText(log_frame, state='disabled', font=("Consolas", 9))
         self.txt_log.pack(fill="both", expand=True, side="bottom")
+        self._add_text_context_menu(self.txt_log)
 
 
         # Tab 2: Settings & Debug
         tab_settings = ttk.Frame(self.tabs, padding=20)
         self.tabs.add(tab_settings, text="Settings & Debug")
+        
+        # Tab 3: mDNS Debug
+        tab_mdns = ttk.Frame(self.tabs, padding=10)
+        self.tabs.add(tab_mdns, text="mDNS Debug")
+        
+        # mDNS Debug Tab Layout
+        tab_mdns.columnconfigure(0, weight=1)
+        tab_mdns.rowconfigure(2, weight=1)
+        
+        # Status and Controls
+        mdns_ctrl_frame = ttk.LabelFrame(tab_mdns, text="mDNS Discovery Control", padding=10)
+        mdns_ctrl_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        
+        self.lbl_mdns_status_debug = ttk.Label(mdns_ctrl_frame, text="Status: Checking...", font=("Segoe UI", 10, "bold"))
+        self.lbl_mdns_status_debug.pack(anchor="w", pady=(0, 10))
+        
+        mdns_debug_btn_frame = ttk.Frame(mdns_ctrl_frame)
+        mdns_debug_btn_frame.pack(fill="x")
+        
+        self.btn_mdns_start_debug = ttk.Button(mdns_debug_btn_frame, text="▶ Start Listener", command=self._mdns_start, width=15)
+        self.btn_mdns_start_debug.pack(side="left", padx=2)
+        
+        self.btn_mdns_stop_debug = ttk.Button(mdns_debug_btn_frame, text="■ Stop Listener", command=self._mdns_stop, width=15)
+        self.btn_mdns_stop_debug.pack(side="left", padx=2)
+        
+        self.btn_mdns_scan_debug = ttk.Button(mdns_debug_btn_frame, text="🔍 Scan Now", command=self._mdns_scan_debug, width=15)
+        self.btn_mdns_scan_debug.pack(side="left", padx=2)
+        
+        self.btn_mdns_refresh_debug = ttk.Button(mdns_debug_btn_frame, text="🔄 Refresh Status", command=self._mdns_refresh_debug, width=15)
+        self.btn_mdns_refresh_debug.pack(side="left", padx=2)
+        
+        ttk.Button(mdns_debug_btn_frame, text="🗑 Clear Logs", command=self._mdns_clear_logs, width=15).pack(side="left", padx=2)
+        
+        # Discovered Services Table
+        services_frame = ttk.LabelFrame(tab_mdns, text="Discovered Services", padding=5)
+        services_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        
+        # Treeview for services
+        services_tree_frame = ttk.Frame(services_frame)
+        services_tree_frame.pack(fill="both", expand=True)
+        
+        self.tree_mdns_services = ttk.Treeview(services_tree_frame, 
+                                                columns=("Address", "Port", "Path", "Status"), 
+                                                show="tree headings", height=6)
+        self.tree_mdns_services.column("#0", width=250)
+        self.tree_mdns_services.column("Address", width=120, anchor="center")
+        self.tree_mdns_services.column("Port", width=60, anchor="center")
+        self.tree_mdns_services.column("Path", width=80, anchor="center")
+        self.tree_mdns_services.column("Status", width=80, anchor="center")
+        
+        self.tree_mdns_services.heading("#0", text="Endpoint ID")
+        self.tree_mdns_services.heading("Address", text="Address")
+        self.tree_mdns_services.heading("Port", text="Port")
+        self.tree_mdns_services.heading("Path", text="Path")
+        self.tree_mdns_services.heading("Status", text="Status")
+        
+        services_scrollbar = ttk.Scrollbar(services_tree_frame, orient="vertical", command=self.tree_mdns_services.yview)
+        self.tree_mdns_services.configure(yscrollcommand=services_scrollbar.set)
+        
+        self.tree_mdns_services.pack(side="left", fill="both", expand=True)
+        services_scrollbar.pack(side="right", fill="y")
+        
+        # Bind selection to show details
+        self.tree_mdns_services.bind('<<TreeviewSelect>>', self._mdns_service_selected)
+        
+        # Discovery Logs
+        logs_frame = ttk.LabelFrame(tab_mdns, text="Discovery Logs & Events", padding=5)
+        logs_frame.grid(row=2, column=0, sticky="nsew")
+        
+        # Log controls
+        log_ctrl = ttk.Frame(logs_frame)
+        log_ctrl.pack(fill="x", pady=(0, 5))
+        
+        self.var_mdns_autoscroll = tk.BooleanVar(value=True)
+        ttk.Checkbutton(log_ctrl, text="Auto-scroll", variable=self.var_mdns_autoscroll).pack(side="left")
+        
+        ttk.Label(log_ctrl, text="Filter:").pack(side="left", padx=(20, 5))
+        self.cb_mdns_filter = ttk.Combobox(log_ctrl, values=["All", "Discovered", "Updated", "Removed", "Errors"], 
+                                           state="readonly", width=12)
+        self.cb_mdns_filter.current(0)
+        self.cb_mdns_filter.pack(side="left")
+        
+        # Log text widget
+        self.txt_mdns_log = scrolledtext.ScrolledText(logs_frame, state='disabled', font=("Consolas", 9), height=12)
+        self.txt_mdns_log.pack(fill="both", expand=True)
+        self._add_text_context_menu(self.txt_mdns_log)
+        
+        # Configure log tags
+        self.txt_mdns_log.tag_config('discovered', foreground='green')
+        self.txt_mdns_log.tag_config('updated', foreground='blue')
+        self.txt_mdns_log.tag_config('removed', foreground='red')
+        self.txt_mdns_log.tag_config('error', foreground='red', font=("Consolas", 9, "bold"))
+        self.txt_mdns_log.tag_config('info', foreground='black')
+        self.txt_mdns_log.tag_config('timestamp', foreground='gray')
         
         # Make tab_settings scrollable
         canvas = tk.Canvas(tab_settings)
@@ -339,9 +434,33 @@ class USPControllerGUI:
         
         ttk.Label(conn_frame, text="If broker connection is lost, you can attempt reconnection here:").pack(anchor="w")
         ttk.Button(conn_frame, text="Reconnect to STOMP Broker", command=self._reconnect_stomp).pack(anchor="w", pady=5)
+        
+        # mDNS Discovery Control
+        mdns_frame = ttk.LabelFrame(scrollable_frame, text="mDNS Agent Discovery", padding=10)
+        mdns_frame.pack(fill="x", pady=10)
+        
+        ttk.Label(mdns_frame, text="Automatically discover USP agents on the local network using mDNS/Zeroconf").pack(anchor="w", pady=(0, 5))
+        
+        self.lbl_mdns_status = ttk.Label(mdns_frame, text="Status: Checking...", font=("Segoe UI", 9))
+        self.lbl_mdns_status.pack(anchor="w", pady=2)
+        
+        mdns_btn_frame = ttk.Frame(mdns_frame)
+        mdns_btn_frame.pack(anchor="w", pady=5)
+        
+        ttk.Button(mdns_btn_frame, text="Start Discovery", command=self._mdns_start).pack(side="left", padx=(0, 5))
+        ttk.Button(mdns_btn_frame, text="Stop Discovery", command=self._mdns_stop).pack(side="left", padx=5)
+        ttk.Button(mdns_btn_frame, text="Scan Now", command=self._mdns_scan).pack(side="left", padx=5)
+        ttk.Button(mdns_btn_frame, text="Check Status", command=self._mdns_check_status).pack(side="left", padx=5)
+        
+        # Scan results display
+        ttk.Label(mdns_frame, text="Last scan results:", font=("Segoe UI", 8)).pack(anchor="w", pady=(10, 2))
+        self.txt_mdns_results = tk.Text(mdns_frame, height=4, state='disabled', font=("Consolas", 8), bg="#f0f0f0")
+        self.txt_mdns_results.pack(fill="x")
+        self._add_text_context_menu(self.txt_mdns_results)
 
         # Initial config load
         self.root.after(2000, self._refresh_config)
+        self.root.after(3000, self._mdns_check_status)
 
 
     def _get_tag_for_type(self, log_type):
@@ -699,7 +818,25 @@ class USPControllerGUI:
         
     def _set_debug_level(self):
         lvl = self.var_debug.get()
-        threading.Thread(target=lambda: self.ipc.send_command(f"set_debug {lvl}")).start()
+        threading.Thread(target=self._set_debug_level_thread, args=(lvl,), daemon=True).start()
+    
+    def _set_debug_level_thread(self, level):
+        """Background thread to set debug level"""
+        try:
+            resp = self.ipc.send_command(f"set_debug {level}")
+            if resp and resp.get("status") == "ok":
+                def show_success():
+                    messagebox.showinfo("Success", f"Debug level set to {level}")
+                self.root.after(0, show_success)
+            else:
+                msg = resp.get("msg", "Unknown error") if resp else "No response from daemon"
+                def show_error():
+                    messagebox.showerror("Error", f"Failed to set debug level: {msg}")
+                self.root.after(0, show_error)
+        except Exception as e:
+            def show_error():
+                messagebox.showerror("Error", f"Failed to set debug level: {str(e)}")
+            self.root.after(0, show_error)
 
     def _reconnect_stomp(self):
         if messagebox.askyesno("Confirm", "Attempt reconnection to Broker?"):
@@ -714,6 +851,280 @@ class USPControllerGUI:
             else:
                 self.root.after(0, lambda: messagebox.showerror("Error", msg))
 
+    def _mdns_check_status(self):
+        """Check mDNS discovery status"""
+        threading.Thread(target=self._mdns_check_status_thread).start()
+    
+    def _mdns_check_status_thread(self):
+        resp = self.ipc.send_command("mdns_status")
+        if resp and resp.get("status") == "ok":
+            available = resp.get("mdns_available", False)
+            running = resp.get("mdns_running", False)
+            enabled = resp.get("enabled", False)
+            
+            if not available:
+                status_text = "Status: ❌ Not Available (zeroconf not installed)"
+                color = "red"
+            elif running:
+                status_text = "Status: 🟢 Running (Listening for agents)"
+                color = "green"
+            elif enabled:
+                status_text = "Status: ⚪ Enabled but not started"
+                color = "orange"
+            else:
+                status_text = "Status: ⚪ Disabled in config"
+                color = "gray"
+            
+            self.root.after(0, lambda: self.lbl_mdns_status.config(text=status_text, foreground=color))
+        else:
+            self.root.after(0, lambda: self.lbl_mdns_status.config(text="Status: ❓ Unknown", foreground="gray"))
+    
+    def _mdns_start(self):
+        """Start mDNS discovery"""
+        threading.Thread(target=self._mdns_start_thread).start()
+    
+    def _mdns_start_thread(self):
+        resp = self.ipc.send_command("mdns_start")
+        if resp:
+            msg = resp.get("msg", "")
+            if resp.get("status") == "ok":
+                self.root.after(0, lambda: messagebox.showinfo("Success", msg))
+                self.root.after(500, self._mdns_check_status)
+            else:
+                self.root.after(0, lambda: messagebox.showerror("Error", msg))
+    
+    def _mdns_stop(self):
+        """Stop mDNS discovery"""
+        threading.Thread(target=self._mdns_stop_thread).start()
+    
+    def _mdns_stop_thread(self):
+        resp = self.ipc.send_command("mdns_stop")
+        if resp:
+            msg = resp.get("msg", "")
+            self.root.after(0, lambda: messagebox.showinfo("Info", msg))
+            self.root.after(500, self._mdns_check_status)
+    
+    def _mdns_scan(self):
+        """Perform active mDNS scan"""
+        # Update status
+        self.root.after(0, lambda: self.txt_mdns_results.config(state='normal'))
+        self.root.after(0, lambda: self.txt_mdns_results.delete(1.0, tk.END))
+        self.root.after(0, lambda: self.txt_mdns_results.insert(tk.END, "Scanning... (3 seconds)\n"))
+        self.root.after(0, lambda: self.txt_mdns_results.config(state='disabled'))
+        
+        threading.Thread(target=self._mdns_scan_thread).start()
+    
+    def _mdns_scan_thread(self):
+        resp = self.ipc.send_command("mdns_scan 3")
+        
+        if resp and resp.get("status") == "ok":
+            count = resp.get("count", 0)
+            agents = resp.get("agents", [])
+            
+            # Build result text
+            result_text = f"Found {count} agent(s):\n"
+            if agents:
+                for agent in agents:
+                    ep_id = agent.get('endpoint_id', 'unknown')
+                    addr = agent.get('address', 'N/A')
+                    result_text += f"  • {ep_id} @ {addr}\n"
+            else:
+                result_text += "  (No agents found)\n"
+            
+            # Update UI
+            def update_results():
+                self.txt_mdns_results.config(state='normal')
+                self.txt_mdns_results.delete(1.0, tk.END)
+                self.txt_mdns_results.insert(tk.END, result_text)
+                self.txt_mdns_results.config(state='disabled')
+            
+            self.root.after(0, update_results)
+            
+            if count > 0:
+                self.root.after(0, lambda: messagebox.showinfo("Scan Complete", f"Found {count} agent(s). Check device list."))
+        else:
+            msg = resp.get("msg", "Unknown error") if resp else "No response"
+            
+            def update_error():
+                self.txt_mdns_results.config(state='normal')
+                self.txt_mdns_results.delete(1.0, tk.END)
+                self.txt_mdns_results.insert(tk.END, f"Scan failed: {msg}\n")
+                self.txt_mdns_results.config(state='disabled')
+            
+            self.root.after(0, update_error)
+            self.root.after(0, lambda: messagebox.showerror("Scan Error", msg))
+    
+    def _mdns_log(self, log_type, message):
+        """Add message to mDNS debug log"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        def add_log():
+            self.txt_mdns_log.configure(state='normal')
+            self.txt_mdns_log.insert(tk.END, f"[{timestamp}] ", 'timestamp')
+            self.txt_mdns_log.insert(tk.END, f"{message}\n", log_type)
+            
+            if self.var_mdns_autoscroll.get():
+                self.txt_mdns_log.see(tk.END)
+            
+            self.txt_mdns_log.configure(state='disabled')
+        
+        self.root.after(0, add_log)
+    
+    def _add_text_context_menu(self, text_widget):
+        """Add right-click context menu with copy functionality to a text widget"""
+        context_menu = tk.Menu(text_widget, tearoff=0)
+        context_menu.add_command(label="Copy", command=lambda: self._copy_selection(text_widget))
+        context_menu.add_command(label="Select All", command=lambda: self._select_all(text_widget))
+        context_menu.add_separator()
+        context_menu.add_command(label="Clear", command=lambda: self._clear_text_widget(text_widget))
+        
+        def show_context_menu(event):
+            try:
+                context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                context_menu.grab_release()
+        
+        text_widget.bind("<Button-3>", show_context_menu)
+    
+    def _copy_selection(self, text_widget):
+        """Copy selected text to clipboard"""
+        try:
+            selected_text = text_widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(selected_text)
+        except tk.TclError:
+            # No selection, copy all
+            text = text_widget.get(1.0, tk.END)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+    
+    def _select_all(self, text_widget):
+        """Select all text in widget"""
+        text_widget.tag_add(tk.SEL, "1.0", tk.END)
+        text_widget.mark_set(tk.INSERT, "1.0")
+        text_widget.see(tk.INSERT)
+    
+    def _clear_text_widget(self, text_widget):
+        """Clear text widget content"""
+        text_widget.configure(state='normal')
+        text_widget.delete(1.0, tk.END)
+        text_widget.configure(state='disabled')
+    
+    def _mdns_service_selected(self, event):
+        """Show detailed info when a service is selected"""
+        selection = self.tree_mdns_services.selection()
+        if selection:
+            item = selection[0]
+            endpoint = self.tree_mdns_services.item(item, "text")
+            values = self.tree_mdns_services.item(item, "values")
+            
+            info = f"Service Details:\n"
+            info += f"  Endpoint: {endpoint}\n"
+            info += f"  Address: {values[0]}\n"
+            info += f"  Port: {values[1]}\n"
+            info += f"  Path: {values[2]}\n"
+            info += f"  Status: {values[3]}"
+            
+            self._mdns_log("info", f"Selected: {endpoint}")
+
+    def _mdns_scan_debug(self):
+        """Trigger mDNS scan from debug tab"""
+        self._mdns_log("info", "Initiating mDNS scan...")
+        self.btn_mdns_scan_debug.config(state='disabled')
+        threading.Thread(target=self._mdns_scan_debug_thread, daemon=True).start()
+    
+    def _mdns_scan_debug_thread(self):
+        """Background thread for mDNS scanning"""
+        try:
+            timeout = 5.0
+            resp = self.ipc.send_command(f"mdns_scan {timeout}")
+            
+            if resp and resp.get("status") == "ok":
+                count = resp.get("count", 0)
+                agents = resp.get("agents", [])
+                
+                self._mdns_log("info", f"Scan complete - found {count} agent(s)")
+                
+                # Clear and update services table
+                def clear_table():
+                    self.tree_mdns_services.delete(*self.tree_mdns_services.get_children())
+                self.root.after(0, clear_table)
+                
+                for agent in agents:
+                    endpoint = agent.get('endpoint_id', 'N/A')
+                    address = agent.get('host', 'N/A')
+                    port = agent.get('port', 'N/A')
+                    path = agent.get('path', '/usp')
+                    
+                    self._mdns_log("discovered", f"Found: {endpoint} at {address}:{port}")
+                    
+                    # Add to table
+                    def add_to_table(ep=endpoint, addr=address, p=port, pth=path):
+                        self.tree_mdns_services.insert("", "end", text=ep, values=(addr, p, pth, "Discovered"))
+                    self.root.after(0, add_to_table)
+                
+                if count == 0:
+                    self._mdns_log("info", "No agents found on the network")
+            else:
+                msg = resp.get("msg", "Unknown error") if resp else "No response from daemon"
+                self._mdns_log("error", f"Scan failed: {msg}")
+        except Exception as e:
+            self._mdns_log("error", f"Scan error: {str(e)}")
+        finally:
+            def enable_button():
+                self.btn_mdns_scan_debug.config(state='normal')
+            self.root.after(0, enable_button)
+    
+    def _mdns_refresh_debug(self):
+        """Refresh mDNS status in debug tab"""
+        self.btn_mdns_refresh_debug.config(state='disabled')
+        threading.Thread(target=self._mdns_refresh_debug_thread, daemon=True).start()
+    
+    def _mdns_refresh_debug_thread(self):
+        """Background thread for refreshing mDNS status"""
+        try:
+            resp = self.ipc.send_command("mdns_status")
+            if resp and resp.get("status") == "ok":
+                available = resp.get("mdns_available", False)
+                running = resp.get("mdns_running", False)
+                enabled = resp.get("enabled", False)
+                
+                if not available:
+                    status_text = "Status: ❌ Not Available (zeroconf not installed)"
+                    color = "red"
+                    self._mdns_log("error", "mDNS not available - install zeroconf package")
+                elif running:
+                    status_text = "Status: 🟢 Listener Active"
+                    color = "green"
+                    self._mdns_log("info", "mDNS listener is running")
+                elif enabled:
+                    status_text = "Status: ⚪ Enabled but not started"
+                    color = "orange"
+                else:
+                    status_text = "Status: ⚪ Disabled in configuration"
+                    color = "gray"
+                
+                def update_status():
+                    self.lbl_mdns_status_debug.config(text=status_text, foreground=color)
+                self.root.after(0, update_status)
+            else:
+                msg = resp.get("msg", "Unknown error") if resp else "No response from daemon"
+                self._mdns_log("error", f"Status check failed: {msg}")
+        except Exception as e:
+            self._mdns_log("error", f"Refresh error: {str(e)}")
+        finally:
+            def enable_button():
+                self.btn_mdns_refresh_debug.config(state='normal')
+            self.root.after(0, enable_button)
+    
+    def _mdns_clear_logs(self):
+        """Clear mDNS debug logs"""
+        def clear():
+            self.txt_mdns_log.configure(state='normal')
+            self.txt_mdns_log.delete(1.0, tk.END)
+            self.txt_mdns_log.configure(state='disabled')
+        self.root.after(0, clear)
+        self._mdns_log("info", "Logs cleared")
 
 
     def _load_history(self):

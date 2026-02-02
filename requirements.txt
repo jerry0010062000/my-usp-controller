@@ -11,3 +11,6 @@ pyreadline3>=3.4.1; sys_platform == 'win32'
 
 # Optional: For better binary data handling
 # hexdump>=3.3
+
+# mDNS Service Discovery - For automatic USP agent discovery
+zeroconf>=0.131.0

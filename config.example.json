@@ -6,7 +6,8 @@
     "password": "password",
     "controller_endpoint_id": "proto::controller-1",
     "receive_topic": "/topic/my_send_q",
-    "devices_file": "devices.json"
+    "devices_file": "devices.json",
+    "enable_mdns_discovery": true
   },
   "ipc": {
     "host": "127.0.0.1",

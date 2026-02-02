@@ -21,6 +21,17 @@ import argparse
 import platform
 import atexit
 
+# mDNS Service Discovery (optional)
+try:
+    from zeroconf import Zeroconf, ServiceBrowser, ServiceListener, ServiceInfo
+    MDNS_AVAILABLE = True
+except ImportError:
+    MDNS_AVAILABLE = False
+    # Create dummy classes to avoid NameError
+    ServiceListener = object
+    print("[*] zeroconf not installed - mDNS discovery disabled")
+    print("    Install with: pip install zeroconf")
+
 # Import USP protobuf definitions
 try:
     import usp_record_1_4_pb2 as record_pb2
@@ -131,6 +142,7 @@ IPC_PORT = ipc_config.get('port', DEFAULT_CONFIG['ipc_port'])
 
 # Advanced options
 AUTO_SUBSCRIBE_WILDCARD = usp_config.get('auto_subscribe_wildcard', DEFAULT_CONFIG['auto_subscribe_wildcard'])
+ENABLE_MDNS_DISCOVERY = usp_config.get('enable_mdns_discovery', True)  # Enable by default
 
 # System-specific configuration
 import platform
@@ -341,6 +353,74 @@ def remove_pid_file():
     except Exception as e:
         print(f"[!] Warning: Could not remove PID file: {e}")
 
+class USPAgentListener(ServiceListener):
+    """mDNS Service Listener for USP Agent discovery"""
+    
+    def __init__(self, stomp_manager):
+        self.stomp = stomp_manager
+    
+    def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        """Called when a new USP agent is discovered"""
+        info = zc.get_service_info(type_, name)
+        if info:
+            self._process_agent(info, "discovered")
+    
+    def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        """Called when an agent updates its information"""
+        info = zc.get_service_info(type_, name)
+        if info:
+            self._process_agent(info, "updated")
+    
+    def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        """Called when an agent disappears"""
+        Logger.info(f"mDNS: Agent removed - {name}", level=1)
+    
+    def _process_agent(self, info: ServiceInfo, action: str):
+        """Extract USP agent information from mDNS record"""
+        try:
+            # Parse TXT records
+            props = {}
+            for key, value in info.properties.items():
+                try:
+                    props[key.decode('utf-8')] = value.decode('utf-8')
+                except:
+                    props[key.decode('utf-8')] = value
+            
+            endpoint_id = props.get('endpoint', props.get('id', 'unknown'))
+            path = props.get('path', '/usp')
+            
+            # Get address
+            if info.addresses:
+                addr = '.'.join(str(b) for b in info.addresses[0])
+                port = info.port
+                
+                Logger.info(f"mDNS: Agent {action} - {endpoint_id}", level=0)
+                Logger.info(f"  Address: {addr}:{port}", level=1)
+                Logger.info(f"  Path: {path}", level=1)
+                Logger.info(f"  Service: {info.name}", level=1)
+                
+                # Build destination queue/topic based on protocol
+                # Typically: /queue/usp.agent.<endpoint_suffix>
+                if endpoint_id != 'unknown':
+                    suffix = endpoint_id.split('::')[-1] if '::' in endpoint_id else endpoint_id
+                    reply_to = f"/queue/usp.agent.{suffix}"
+                    
+                    # Auto-register device
+                    with self.stomp.lock:
+                        if endpoint_id not in self.stomp.devices:
+                            self.stomp.devices[endpoint_id] = {
+                                'reply_to': reply_to,
+                                'last_seen': datetime.now().isoformat(),
+                                'discovered_via': 'mdns',
+                                'address': f"{addr}:{port}",
+                                'path': path
+                            }
+                            self.stomp.save_devices()
+                            Logger.success(f"Auto-registered device via mDNS: {endpoint_id}", level=0)
+                
+        except Exception as e:
+            Logger.critical(f"mDNS: Error processing agent info - {e}")
+
 class STOMPManager:
     """Manages STOMP connection and state"""
     
@@ -353,6 +433,10 @@ class STOMPManager:
         self.msg_callbacks = []
         self.last_active_device = None
         self.lock = threading.Lock()
+        
+        # mDNS Service Discovery
+        self.mdns_zeroconf = None
+        self.mdns_browser = None
     
     def get_device_status(self, endpoint_id):
         """Check if device is online based on last_seen timestamp"""
@@ -397,6 +481,139 @@ class STOMPManager:
                 json.dump(self.devices, f, indent=2)
         except Exception as e:
             Logger.critical(f"Failed to save devices: {e}")
+    
+    def start_mdns_discovery(self):
+        """Start mDNS service discovery for USP agents"""
+        if not MDNS_AVAILABLE:
+            Logger.info("mDNS discovery not available (zeroconf not installed)", level=0)
+            return False
+        
+        if not ENABLE_MDNS_DISCOVERY:
+            Logger.info("mDNS discovery disabled in config", level=1)
+            return False
+        
+        try:
+            self.mdns_zeroconf = Zeroconf()
+            listener = USPAgentListener(self)
+            
+            # Browse for USP agents
+            # Standard service types: _usp-agent._tcp.local.
+            self.mdns_browser = ServiceBrowser(
+                self.mdns_zeroconf, 
+                "_usp-agent._tcp.local.",
+                listener
+            )
+            
+            Logger.success("mDNS discovery started - listening for USP agents", level=0)
+            return True
+            
+        except Exception as e:
+            Logger.critical(f"Failed to start mDNS discovery: {e}")
+            return False
+    
+    def stop_mdns_discovery(self):
+        """Stop mDNS service discovery"""
+        if self.mdns_zeroconf:
+            try:
+                self.mdns_zeroconf.close()
+                Logger.info("mDNS discovery stopped", level=1)
+            except:
+                pass
+    
+    def mdns_scan_now(self, timeout=3.0):
+        """Actively scan for USP agents on the network"""
+        if not MDNS_AVAILABLE:
+            Logger.critical("mDNS not available - install zeroconf")
+            return {"status": "error", "msg": "zeroconf not installed", "agents": []}
+        
+        Logger.info(f"Starting active mDNS scan (timeout: {timeout}s)...", level=0)
+        discovered = []
+        
+        try:
+            # Use a temporary Zeroconf instance for scanning
+            scan_zc = Zeroconf()
+            
+            # Create a collector listener
+            class ScanListener(ServiceListener):
+                def __init__(self):
+                    self.found = []
+                
+                def add_service(self, zc, type_, name):
+                    info = zc.get_service_info(type_, name)
+                    if info:
+                        self.found.append(info)
+                
+                def update_service(self, zc, type_, name):
+                    pass
+                
+                def remove_service(self, zc, type_, name):
+                    pass
+            
+            listener = ScanListener()
+            browser = ServiceBrowser(scan_zc, "_usp-agent._tcp.local.", listener)
+            
+            # Wait for discovery
+            time.sleep(timeout)
+            
+            # Process found services
+            for info in listener.found:
+                try:
+                    props = {}
+                    for key, value in info.properties.items():
+                        try:
+                            props[key.decode('utf-8')] = value.decode('utf-8')
+                        except:
+                            props[key.decode('utf-8')] = value
+                    
+                    endpoint_id = props.get('endpoint', props.get('id', 'unknown'))
+                    path = props.get('path', '/usp')
+                    
+                    if info.addresses:
+                        addr = '.'.join(str(b) for b in info.addresses[0])
+                        port = info.port
+                        
+                        agent_info = {
+                            'endpoint_id': endpoint_id,
+                            'address': f"{addr}:{port}",
+                            'host': addr,
+                            'port': port,
+                            'path': path,
+                            'service_name': info.name,
+                            'properties': props
+                        }
+                        discovered.append(agent_info)
+                        
+                        Logger.success(f"Found agent: {endpoint_id} at {addr}:{port}", level=0)
+                        
+                        # Auto-register if not already known
+                        if endpoint_id != 'unknown':
+                            suffix = endpoint_id.split('::')[-1] if '::' in endpoint_id else endpoint_id
+                            reply_to = f"/queue/usp.agent.{suffix}"
+                            
+                            with self.lock:
+                                if endpoint_id not in self.devices:
+                                    self.devices[endpoint_id] = {
+                                        'reply_to': reply_to,
+                                        'last_seen': datetime.now().isoformat(),
+                                        'discovered_via': 'mdns_scan',
+                                        'address': f"{addr}:{port}",
+                                        'path': path
+                                    }
+                                    self.save_devices()
+                                    Logger.success(f"Auto-registered: {endpoint_id}", level=0)
+                
+                except Exception as e:
+                    Logger.critical(f"Error processing scan result: {e}")
+            
+            # Cleanup
+            scan_zc.close()
+            
+            Logger.info(f"Scan complete - found {len(discovered)} agent(s)", level=0)
+            return {"status": "ok", "count": len(discovered), "agents": discovered}
+            
+        except Exception as e:
+            Logger.critical(f"mDNS scan failed: {e}")
+            return {"status": "error", "msg": str(e), "agents": []}
 
     def connect(self):
         try:
@@ -882,14 +1099,50 @@ class STOMPManager:
             req_type = "GET_INSTANCES"
         elif req.HasField('notify'):
             req_type = "NOTIFY"
-            # Notify is special - it doesn't expect a response
+            # Notify is special - it doesn't expect a response (unless send_resp is true)
             Logger.info(f"  Received NOTIFY from {sender}", level=0)
+            
             # Extract and display notify details
             if DEBUG_LEVEL >= 1:
-                for sub_id in req.notify.subscription_id:
-                    Logger.data(f"    Subscription: {sub_id}")
-                for send_obj in req.notify.send_objs:
-                    Logger.data(f"    Object: {send_obj.obj_path}")
+                Logger.data(f"    Subscription ID: {req.notify.subscription_id}")
+                Logger.data(f"    Send Response: {req.notify.send_resp}")
+                
+                # Check notification type
+                if req.notify.HasField('event'):
+                    Logger.data(f"    Type: Event")
+                    Logger.data(f"      Object Path: {req.notify.event.obj_path}")
+                    Logger.data(f"      Event Name: {req.notify.event.event_name}")
+                    if req.notify.event.params:
+                        for key, val in req.notify.event.params.items():
+                            Logger.data(f"      Param {key}: {val}")
+                elif req.notify.HasField('value_change'):
+                    Logger.data(f"    Type: ValueChange")
+                    Logger.data(f"      Param Path: {req.notify.value_change.param_path}")
+                    Logger.data(f"      Param Value: {req.notify.value_change.param_value}")
+                elif req.notify.HasField('obj_creation'):
+                    Logger.data(f"    Type: ObjectCreation")
+                    Logger.data(f"      Object Path: {req.notify.obj_creation.obj_path}")
+                elif req.notify.HasField('obj_deletion'):
+                    Logger.data(f"    Type: ObjectDeletion")
+                    Logger.data(f"      Object Path: {req.notify.obj_deletion.obj_path}")
+                elif req.notify.HasField('oper_complete'):
+                    Logger.data(f"    Type: OperationComplete")
+                    Logger.data(f"      Command Name: {req.notify.oper_complete.command_name}")
+                elif req.notify.HasField('on_board_req'):
+                    Logger.data(f"    Type: OnBoardRequest")
+            
+            # If agent requests a response, send NotifyResp
+            if req.notify.send_resp:
+                Logger.info(f"  Sending NotifyResp to {sender}", level=1)
+                resp_msg = msg_pb2.Msg()
+                resp_msg.header.msg_id = str(uuid.uuid4())
+                resp_msg.header.msg_type = msg_pb2.Header.MsgType.NOTIFY_RESP
+                
+                notify_resp = resp_msg.body.response.notify_resp
+                notify_resp.subscription_id = req.notify.subscription_id
+                
+                self._send_usp_msg(sender, resp_msg)
+            
             return  # Don't send error response for notify
         
         Logger.info(f"  Request type: {req_type} (not yet supported by controller)", level=1)
@@ -1161,6 +1414,39 @@ class IPCServer(threading.Thread):
                         response = {"status": "error", "msg": "Reconnection failed (Check logs)"}
                 except Exception as e:
                     response = {"status": "error", "msg": f"Reconnection error: {str(e)}"}
+            
+            elif cmd == "mdns_status":
+                # Get mDNS discovery status
+                if not MDNS_AVAILABLE:
+                    response = {"status": "ok", "mdns_available": False, "mdns_running": False, "msg": "zeroconf not installed"}
+                else:
+                    running = self.stomp.mdns_zeroconf is not None
+                    response = {"status": "ok", "mdns_available": True, "mdns_running": running, "enabled": ENABLE_MDNS_DISCOVERY}
+            
+            elif cmd == "mdns_start":
+                # Start mDNS discovery
+                if self.stomp.start_mdns_discovery():
+                    response = {"status": "ok", "msg": "mDNS discovery started"}
+                else:
+                    response = {"status": "error", "msg": "Failed to start mDNS discovery"}
+            
+            elif cmd == "mdns_stop":
+                # Stop mDNS discovery
+                self.stomp.stop_mdns_discovery()
+                response = {"status": "ok", "msg": "mDNS discovery stopped"}
+            
+            elif cmd == "mdns_scan":
+                # Active mDNS scan
+                # mdns_scan [timeout]
+                timeout = 3.0
+                if len(cmd_parts) >= 2:
+                    try:
+                        timeout = float(cmd_parts[1])
+                    except:
+                        pass
+                
+                result = self.stomp.mdns_scan_now(timeout)
+                response = result
 
             elif cmd == "poll_logs":
                 # poll_logs [last_id]
@@ -1654,6 +1940,10 @@ def main():
             print("[!] Critical: STOMP connection failed. Exiting.")
             sys.exit(1)
     
+    # Start mDNS discovery if enabled
+    if ENABLE_MDNS_DISCOVERY:
+        stomp_mgr.start_mdns_discovery()
+    
     # Start IPC Server only in daemon mode
     ipc_server = None
     if args.daemon:
@@ -1679,6 +1969,7 @@ def main():
         interactive_mode(stomp_mgr)
         
     stomp_mgr.running = False
+    stomp_mgr.stop_mdns_discovery()
     if ipc_server:
         ipc_server.running = False
     if stomp_mgr.sock: stomp_mgr.sock.close()
