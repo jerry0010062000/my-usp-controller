@@ -167,4 +167,39 @@ Agent 會主動註冊到 controller，無需手動配置 destination。
 ---
 
 **詳細文檔：** [ADVANCED.md](ADVANCED.md)  
-**版本：** 2.0.1 | **協定：** USP 1.4 / STOMP 1.2
+**版本：** 2.0.4 | **協定：** USP 1.4 / STOMP 1.2
+
+## v2.0.4 新功能
+
+### 測試腳本自動化
+```bash
+# CLI 執行
+python scripts/run_test.py --script test_dhcpv4_pool.txt --endpoint proto::agent-id
+
+# GUI 執行
+Test Scripts 標籤頁 → 選擇腳本 → 選擇設備 → Run Script
+```
+
+**腳本語法：**
+```
+# 註解說明
+get {ENDPOINT} Device.Path.Param                     # 變數替換
+get_instances {ENDPOINT} Device.Path.{INSTANCE}.     # 動態 instance
+set {ENDPOINT} Device.Path.Param value # expect: OK  # 斷言驗證
+```
+
+**特性：**
+- 變數：`{ENDPOINT}` 目標設備、`{INSTANCE}` 自動提取
+- 斷言：`# expect: value` 驗證回應內容
+- 同步等待：GET/GetInstances 等待實際回應（15秒 timeout）
+- 重複保護：等待期間防止重複發送相同請求
+
+### IPC 穩定性提升
+- 客戶端 timeout 20秒（適配長時間等待）
+- 伺服器錯誤處理增強（timeout/BrokenPipe/socket 錯誤）
+- 連線重試機制
+
+### 回應追蹤系統
+- GET 返回實際參數值（非 "GET sent"）
+- GetInstances 返回 instance 清單
+- 回應格式：`{"status": "ok", "msg": "...", "data": {...}, "instances": [...]}`
