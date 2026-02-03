@@ -41,100 +41,94 @@
 
 ## 安裝
 
-### Windows 用戶
+### Windows
 
-**使用啟動腳本（推薦）：**
-```powershell
-# PowerShell (功能豐富)
-.\start_controller.ps1
-
-# 或使用 CMD
-start_controller.bat
-```
-
-**或手動執行：**
-```powershell
-# 安裝依賴
-pip install -r requirements.txt
-
-# 運行測試
-**Windows:**
 ```powershell
 pip install -r requirements.txt
-python usp_controller.py
 ```
 
-**Linux / Raspberry Pi:**
+**快速啟動（推薦）：**
+```cmd
+run_ui.bat
+```
+自動啟動 daemon + GUI
+
+### Linux / Raspberry Pi
+
 ```bash
 pip install -r requirements.txt
-./usp_controller.py
+chmod +x usp_controller.py usp_client.py
 ```
-
-詳細安裝：[WINDOWS_INSTALL.md](WINDOWS_INSTALL.md)
 
 ## 使用方式
 
-### Windows GUI 圖形介面（推薦）
-
-**前提：** 先啟動 daemon 模式
+### Windows GUI（推薦）
 
 ```powershell
-# 1. 啟動 daemon（背景執行）
-python usp_controller.py --daemon
+# 方法 1: 使用啟動腳本
+run_ui.bat
 
-# 2. 啟動 GUI
+# 方法 2: 手動啟動
+python usp_controller.py --daemon
 python usp_gui.py
 ```
 
 **GUI 功能：**
-- 📊 **即時監控**：設備狀態、連線狀態、即時日誌
-- 🎮 **互動操作**：Get/Set 參數、命令執行、歷史記錄
-- ⚙️ **設定管理**：Broker 配置、Debug 級別、mDNS 控制
-- 🔍 **mDNS 發現**：自動掃描網路上的 USP Agent、服務監控
-- 📝 **日誌查看**：支援右鍵複製、自動捲動、多層級顯示
-- 🎯 **命令歷史**：儲存執行過的命令、快速重新執行
+- 📊 即時監控：設備狀態、連線狀態、即時日誌
+- 🎮 互動操作：GET/SET/ADD/DELETE/GetSupportedDM/GetInstances
+- 🧪 測試腳本：自動化測試執行、變數替換、斷言驗證
+- ⚙️ 設定管理：Broker 配置、Debug 級別、mDNS 控制
+- 🔍 mDNS 發現：自動掃描網路上的 USP Agent
+- 🎯 命令歷史：儲存/載入/重新執行命令
 
 ### 互動模式
 
 ```bash
-./usp_controller.py
+python usp_controller.py  # Windows
+./usp_controller.py       # Linux
 ```
 
-```
-usp-cli> list                              # 列出設備
-usp-cli> status                            # 連線狀態
-usp-cli> get <endpoint_id> <path>          # 讀取參數
-usp-cli> set <endpoint_id> <path> <value>  # 設定參數
-usp-cli> debug 0                           # 調整顯示層級 (0-2)
-```
+命令：
+- `list` - 列出設備
+- `status` - 連線狀態
+- `get <endpoint> <path>` - 讀取參數
+- `set <endpoint> <path> <value>` - 設定參數
+- `get_instances <endpoint> <path>` - 列出實例
+- `debug <0-2>` - 調整顯示層級
 
-### Daemon 模式 + IPC 客戶端
+### Daemon + IPC
 
 ```bash
 # 啟動 daemon
-./usp_controller.py --daemon &
+python usp_controller.py --daemon       # Windows 前景
+python usp_controller.py --daemon &     # Linux 背景
 
-# 使用 IPC 客戶端
-./usp_client.py status
-./usp_client.py get <endpoint_id> <path>
-./usp_client.py set <endpoint_id> <path> <value>
+# IPC 客戶端
+python usp_client.py status
+python usp_client.py get <endpoint> <path>
+python usp_client.py set <endpoint> <path> <value>
+
+# 測試腳本
+python scripts/run_test.py --script test.txt --endpoint proto::agent-id
 ```
 
 ## 配置
 
-編輯 `config.json`：
+`config.json`（參考 `config.example.json`）：
 
 ```json
 {
   "usp_controller": {
     "broker_host": "127.0.0.1",
     "broker_port": 61613,
-    "username": "guest",
-    "password": "guest",
+    "username": "admin",
+    "password": "password",
     "controller_endpoint_id": "proto::controller-1",
-    "receive_topic": "/queue/usp/controller/controller-1",
+    "receive_topic": "/topic/my_send_q",
     "devices_file": "devices.json",
-    "enable_mdns_discovery": true
+    "enable_mdns_discovery": true,
+    "heartbeat_check_enabled": true,
+    "heartbeat_check_interval": 60
   },
   "ipc": {
     "host": "127.0.0.1",
@@ -143,63 +137,56 @@ usp-cli> debug 0                           # 調整顯示層級 (0-2)
 }
 ```
 
-Agent 會主動註冊到 controller，無需手動配置 destination。
+Agent 自動註冊，無需手動配置 destination。
 
 ## 功能特色
 
+### 🧪 測試腳本自動化（v2.0.4）
+- 變數替換：`{ENDPOINT}` `{INSTANCE}`
+- 斷言驗證：`# expect: value`
+- 同步等待：GET/GetInstances 等待實際回應（15秒）
+- 重複保護：防止等待期間重複發送
+
 ### 🔍 mDNS 自動發現
 - 自動掃描區網 USP Agent（`_usp-agent._tcp.local.`）
-- 被動監聽 + 主動掃描雙模式
-- 發現後自動註冊到 devices.json
-- 詳細文檔：[MDNS_DISCOVERY.md](MDNS_DISCOVERY.md)
+- 被動監聽 + 主動掃描
+- 自動註冊到 devices.json
 
 ### 🖥️ Windows GUI
-- Tkinter 原生介面，無需額外安裝
-- 三大功能分頁：監控、設定、mDNS Debug
-- 即時日誌、命令歷史、右鍵複製
-- 完整 IPC 整合
+- Tkinter 原生介面
+- 四大分頁：Operations / Settings / mDNS Debug / Test Scripts
+- 命令歷史、右鍵複製、即時日誌
 
 ### 🔧 多模式運行
-- **互動 Shell**：人工操作測試
-- **Daemon + IPC**：自動化腳本
-- **GUI 介面**：視覺化管理
+- 互動 Shell：人工測試
+- Daemon + IPC：自動化腳本
+- GUI：視覺化管理
 
 ---
 
-**詳細文檔：** [ADVANCED.md](ADVANCED.md)  
 **版本：** 2.0.4 | **協定：** USP 1.4 / STOMP 1.2
 
-## v2.0.4 新功能
+## v2.0.4 更新
 
-### 測試腳本自動化
+### 測試腳本
 ```bash
-# CLI 執行
+# CLI
 python scripts/run_test.py --script test_dhcpv4_pool.txt --endpoint proto::agent-id
 
-# GUI 執行
-Test Scripts 標籤頁 → 選擇腳本 → 選擇設備 → Run Script
+# GUI Test Scripts 標籤頁
+選擇腳本 → 選擇設備 → Run Script
 ```
 
-**腳本語法：**
+**語法：**
 ```
-# 註解說明
-get {ENDPOINT} Device.Path.Param                     # 變數替換
-get_instances {ENDPOINT} Device.Path.{INSTANCE}.     # 動態 instance
-set {ENDPOINT} Device.Path.Param value # expect: OK  # 斷言驗證
+# 註解
+get {ENDPOINT} Device.Path.Param
+get_instances {ENDPOINT} Device.Path.{INSTANCE}.
+set {ENDPOINT} Device.Path.Param value # expect: OK
 ```
 
-**特性：**
-- 變數：`{ENDPOINT}` 目標設備、`{INSTANCE}` 自動提取
-- 斷言：`# expect: value` 驗證回應內容
-- 同步等待：GET/GetInstances 等待實際回應（15秒 timeout）
-- 重複保護：等待期間防止重複發送相同請求
-
-### IPC 穩定性提升
-- 客戶端 timeout 20秒（適配長時間等待）
-- 伺服器錯誤處理增強（timeout/BrokenPipe/socket 錯誤）
-- 連線重試機制
-
-### 回應追蹤系統
-- GET 返回實際參數值（非 "GET sent"）
-- GetInstances 返回 instance 清單
+### 改進
+- GET/GetInstances 同步等待實際回應（15秒 timeout）
+- 重複請求保護
+- IPC timeout 延長至 20秒
 - 回應格式：`{"status": "ok", "msg": "...", "data": {...}, "instances": [...]}`
