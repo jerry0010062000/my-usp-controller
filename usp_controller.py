@@ -6,7 +6,7 @@ Mode 1: Interactive Shell (User)
 Mode 2: Background Daemon with IPC (Automation)
 """
 
-__version__ = "2.0.2"
+__version__ = "2.0.3"
 __author__ = "Jerry Bai"
 
 import sys
@@ -1174,6 +1174,23 @@ class STOMPManager:
                         count += 1
             Logger.data(f"  Total: {count} items")
             
+        elif resp.HasField('get_instances_resp'):
+            total_instances = 0
+            Logger.data(f"  === GET_INSTANCES Response Start ===")
+            for r in resp.get_instances_resp.req_path_results:
+                status = '✓' if r.err_code == 0 else '✗'
+                Logger.data(f"  Path: {r.requested_path} ({status})")
+                if r.err_code != 0:
+                    Logger.data(f"    Error: {r.err_msg}")
+                else:
+                    for inst in r.curr_insts:
+                        Logger.data(f"    Instance: {inst.instantiated_obj_path}")
+                        if inst.unique_keys:
+                            for key, value in inst.unique_keys.items():
+                                Logger.data(f"      {key} = {value}")
+                        total_instances += 1
+            Logger.data(f"  === Total: {total_instances} instances ===")
+            
         elif resp.HasField('set_resp'):
             for r in resp.set_resp.updated_obj_results:
                 if r.oper_status.HasField('oper_success'):
@@ -1443,6 +1460,16 @@ class IPCServer(threading.Thread):
                 else:
                     response = {"status": "error", "msg": "usage: get_supported <endpoint> [obj_path]"}
             
+            elif cmd == "get_instances" or cmd == "getinstances":
+                # get_instances <endpoint> <obj_path>
+                if len(cmd_parts) >= 3:
+                    endpoint = cmd_parts[1]
+                    obj_path = cmd_parts[2]
+                    success = self._send_usp_get_instances(endpoint, obj_path)
+                    response = {"status": "ok" if success else "failed", "msg": f"GetInstances sent to {endpoint}"}
+                else:
+                    response = {"status": "error", "msg": "usage: get_instances <endpoint> <obj_path>"}
+            
             elif cmd == "operate":
                 # operate <endpoint> <command_path> [key=value ...]
                 if len(cmd_parts) >= 3:
@@ -1686,6 +1713,18 @@ class IPCServer(threading.Thread):
         usp_msg.body.request.get_supported_dm.return_commands = True
         usp_msg.body.request.get_supported_dm.return_events = True
         usp_msg.body.request.get_supported_dm.return_params = True
+        
+        return self._send_usp_message(endpoint, usp_msg)
+    
+    def _send_usp_get_instances(self, endpoint, obj_path):
+        """Helper to construct USP GetInstances"""
+        msg_id = str(uuid.uuid4())
+        usp_msg = msg_pb2.Msg()
+        usp_msg.header.msg_id = msg_id
+        usp_msg.header.msg_type = msg_pb2.Header.MsgType.GET_INSTANCES
+        
+        usp_msg.body.request.get_instances.obj_paths.append(obj_path)
+        usp_msg.body.request.get_instances.first_level_only = False
         
         return self._send_usp_message(endpoint, usp_msg)
     

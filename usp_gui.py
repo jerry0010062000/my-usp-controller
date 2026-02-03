@@ -160,7 +160,7 @@ class USPControllerGUI:
         
         # Row 2: Operation
         ttk.Label(cmd_frame, text="Action:").grid(row=1, column=0, sticky="w")
-        self.cb_action = ttk.Combobox(cmd_frame, values=["GET", "SET", "ADD", "DELETE", "OPERATE", "DISCOVER"], state="readonly", width=10)
+        self.cb_action = ttk.Combobox(cmd_frame, values=["GET", "SET", "ADD", "DELETE", "OPERATE", "GetSupportedDM", "GetInstances"], state="readonly", width=15)
         self.cb_action.current(0)
         self.cb_action.grid(row=1, column=1, sticky="w", pady=2)
         self.cb_action.bind("<<ComboboxSelected>>", self._on_action_change)
@@ -529,7 +529,7 @@ class USPControllerGUI:
 
     def _on_action_change(self, event):
         action = self.cb_action.get()
-        if action in ["GET", "ADD", "DELETE", "DISCOVER"]:
+        if action in ["GET", "ADD", "DELETE", "GetSupportedDM", "GetInstances"]:
             self.ent_value.configure(state='disabled')
         else:
             self.ent_value.configure(state='normal')
@@ -754,19 +754,28 @@ class USPControllerGUI:
         cmd_str = ""
         if action == "get":
             cmd_str = f"get {ep} {path}"
+            history_action = "GET"
         elif action == "set":
             cmd_str = f"set {ep} {path} {val}"
+            history_action = "SET"
         elif action == "add":
             cmd_str = f"add {ep} {path}"
+            history_action = "ADD"
         elif action == "delete":
             cmd_str = f"delete {ep} {path}"
+            history_action = "DELETE"
         elif action == "operate":
             cmd_str = f"operate {ep} {path} {val}"
-        elif action == "discover":
+            history_action = "OPERATE"
+        elif action == "getsupporteddm":
             cmd_str = f"get_supported {ep} {path}"
+            history_action = "GetSupportedDM"
+        elif action == "getinstances":
+            cmd_str = f"get_instances {ep} {path}"
+            history_action = "GetInstances"
         
         # Add to history
-        self._add_to_history(action.upper(), ep, path, val)
+        self._add_to_history(history_action, ep, path, val)
             
         # Send in a separate thread to avoid freezing UI
         threading.Thread(target=self._send_command_thread, args=(cmd_str,)).start()
@@ -1274,7 +1283,7 @@ class USPControllerGUI:
         entry = self.command_history[idx]
         
         # Set action
-        action_map = {"GET": 0, "SET": 1, "ADD": 2, "DELETE": 3, "OPERATE": 4, "DISCOVER": 5}
+        action_map = {"GET": 0, "SET": 1, "ADD": 2, "DELETE": 3, "OPERATE": 4, "GetSupportedDM": 5, "GetInstances": 6}
         action_idx = action_map.get(entry['action'], 0)
         self.cb_action.current(action_idx)
         

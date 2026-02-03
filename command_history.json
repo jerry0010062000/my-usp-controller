@@ -24,14 +24,6 @@
     "status": "success"
   },
   {
-    "timestamp": "2026-02-02T11:20:20.995443",
-    "action": "DISCOVER",
-    "endpoint": "proto::agent-id",
-    "path": "Device.LocalAgent.",
-    "value": "test",
-    "status": "pending"
-  },
-  {
     "timestamp": "2026-01-29T17:52:44.970478",
     "action": "GET",
     "endpoint": "proto::agent-id",
@@ -40,24 +32,24 @@
     "status": "success"
   },
   {
-    "timestamp": "2026-01-29T17:53:38.664374",
+    "timestamp": "2026-02-03T10:32:37.619732",
     "action": "GET",
     "endpoint": "proto::agent-id",
     "path": "Device.LocalAgent.MTP.1.",
     "value": "",
-    "status": "success"
+    "status": "pending"
   },
   {
-    "timestamp": "2026-02-02T11:39:11.638984",
-    "action": "GET",
+    "timestamp": "2026-02-03T10:31:33.101439",
+    "action": "GetInstances",
     "endpoint": "proto::agent-id",
     "path": "Device.LocalAgent.",
-    "value": "test",
+    "value": "",
     "status": "success"
   },
   {
-    "timestamp": "2026-02-03T10:16:28.901395",
-    "action": "DISCOVER",
+    "timestamp": "2026-02-03T10:32:08.795887",
+    "action": "GetSupportedDM",
     "endpoint": "proto::agent-id",
     "path": "Device.LocalAgent.",
     "value": "",
