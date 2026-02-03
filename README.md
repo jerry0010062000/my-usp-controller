@@ -1,8 +1,12 @@
 # USP STOMP Controller
 
 雙模式 USP 控制器：人工互動 + AI 自動化
+支援：Linux / Raspberry Pi / Windows
 
-支援：Linux / Raspberry Pi / Windows / macOS
+### 此工具類似miniACS，可以用來作為tr369測試server
+### 除了基礎Get/Set/Add/Delete以外還能執行scripts
+### 備有Windows GUI介面 操作更直觀
+
 
 ## 系統架構
 
