@@ -650,14 +650,14 @@ class STOMPManager:
             self.sock.connect((BROKER_HOST, BROKER_PORT))
             
             # heart-beat: send,receive (milliseconds)
-            # 30000,30000 = send every 30s, expect from broker every 30s
+            # 0,0 = disable heartbeat (heartbeat thread is disabled)
             connect_frame = (
                 f"CONNECT\n"
                 f"accept-version:1.2\n"
                 f"host:/\n"
                 f"login:{USERNAME}\n"
                 f"passcode:{PASSWORD}\n"
-                f"heart-beat:30000,30000\n"
+                f"heart-beat:0,0\n"
                 f"\n\0"
             )
             
