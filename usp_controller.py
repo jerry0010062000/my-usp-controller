@@ -676,9 +676,10 @@ class STOMPManager:
                 self.recv_thread = threading.Thread(target=self._receiver_loop, daemon=True)
                 self.recv_thread.start()
                 
-                # Start heartbeat thread
-                self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-                self.heartbeat_thread.start()
+                # Start heartbeat thread (DISABLED to test if it causes timing issues)
+                # self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+                # self.heartbeat_thread.start()
+                Logger.info("Heartbeat thread disabled for testing", level=1)
                 
                 # Controller 只訂閱自己的接收佇列
                 self.subscribe(RECEIVE_TOPIC)
