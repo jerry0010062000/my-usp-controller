@@ -6,7 +6,7 @@ Mode 1: Interactive Shell (User)
 Mode 2: Background Daemon with IPC (Automation)
 """
 
-__version__ = "2.0.3"
+__version__ = "2.0.4"
 __author__ = "Jerry Bai"
 
 import sys
@@ -455,6 +455,8 @@ class STOMPManager:
         self.heartbeat_interval = 30  # seconds
         self.heartbeat_check_thread = None
         self.pending_heartbeat_checks = {}  # {msg_id: {endpoint, timestamp}}
+        self.pending_ipc_requests = {}  # {msg_id: {endpoint, command, result_queue, timestamp}}
+        self.pending_requests = {}  # {(endpoint, command, path): msg_id} - track duplicate requests
         
         # mDNS Service Discovery
         self.mdns_zeroconf = None
@@ -1130,8 +1132,14 @@ class STOMPManager:
             if DEBUG_LEVEL < 2:
                 return  # Skip verbose output for heartbeat checks at lower debug levels
         
+        # Check if this is an IPC request waiting for response
+        ipc_req = None
+        if msg_id in self.pending_ipc_requests:
+            ipc_req = self.pending_ipc_requests.pop(msg_id)
+        
         if resp.HasField('get_resp'):
             total_params = 0
+            result_data = {}
             Logger.data(f"  === GET Response Start ===")
             for r in resp.get_resp.req_path_results:
                 status = '✓' if r.err_code == 0 else '✗'
@@ -1140,8 +1148,18 @@ class STOMPManager:
                     Logger.data(f"    {res.resolved_path}")
                     for p, v in res.result_params.items():
                         Logger.data(f"      {p} = {v}")
+                        result_data[p] = v
                         total_params += 1
             Logger.data(f"  === Total: {total_params} parameters ===")
+            
+            # Return result to IPC caller if waiting
+            if ipc_req and 'result_queue' in ipc_req:
+                if result_data:
+                    # Format result as readable text
+                    result_text = "\n".join([f"{k}={v}" for k, v in result_data.items()])
+                    ipc_req['result_queue'].put({"status": "ok", "msg": result_text, "data": result_data})
+                else:
+                    ipc_req['result_queue'].put({"status": "error", "msg": "No parameters returned"})
                     
         elif resp.HasField('get_supported_dm_resp'):
             count = 0
@@ -1176,6 +1194,7 @@ class STOMPManager:
             
         elif resp.HasField('get_instances_resp'):
             total_instances = 0
+            instance_paths = []
             Logger.data(f"  === GET_INSTANCES Response Start ===")
             for r in resp.get_instances_resp.req_path_results:
                 status = '✓' if r.err_code == 0 else '✗'
@@ -1185,11 +1204,34 @@ class STOMPManager:
                 else:
                     for inst in r.curr_insts:
                         Logger.data(f"    Instance: {inst.instantiated_obj_path}")
+                        instance_paths.append(inst.instantiated_obj_path)
                         if inst.unique_keys:
                             for key, value in inst.unique_keys.items():
                                 Logger.data(f"      {key} = {value}")
                         total_instances += 1
             Logger.data(f"  === Total: {total_instances} instances ===")
+            
+            # Return result to IPC caller if waiting
+            if ipc_req and 'result_queue' in ipc_req:
+                if instance_paths:
+                    # Extract instance numbers from paths
+                    import re
+                    instance_numbers = []
+                    for path in instance_paths:
+                        # Extract number from path like "Device.DHCPv4.Server.Pool.2."
+                        match = re.search(r'\.(\d+)\.$', path)
+                        if match:
+                            instance_numbers.append(match.group(1))
+                    
+                    result_text = "\n".join(instance_paths)
+                    ipc_req['result_queue'].put({
+                        "status": "ok", 
+                        "msg": result_text,
+                        "instances": instance_numbers,
+                        "paths": instance_paths
+                    })
+                else:
+                    ipc_req['result_queue'].put({"status": "ok", "msg": "No instances found", "instances": []})
             
         elif resp.HasField('set_resp'):
             for r in resp.set_resp.updated_obj_results:
@@ -1344,12 +1386,17 @@ class IPCServer(threading.Thread):
         try:
             self.server_sock.bind((IPC_HOST, IPC_PORT))
             self.server_sock.listen(5)
+            self.server_sock.settimeout(1.0)  # Allow periodic checks for shutdown
             self.started = True
             print(f"[*] IPC Server listening on {IPC_HOST}:{IPC_PORT}")
             
             while self.running:
-                client, addr = self.server_sock.accept()
-                self._handle_client(client)
+                try:
+                    client, addr = self.server_sock.accept()
+                    self._handle_client(client)
+                except socket.timeout:
+                    # Normal timeout, continue checking self.running
+                    continue
         except OSError as e:
             if e.errno == 98:  # Address already in use
                 self.error = f"Port {IPC_PORT} already in use"
@@ -1414,8 +1461,12 @@ class IPCServer(threading.Thread):
                 if len(cmd_parts) >= 3:
                     endpoint = cmd_parts[1]
                     path = cmd_parts[2]
-                    success = self._send_usp_get(endpoint, path)
-                    response = {"status": "ok" if success else "failed", "msg": f"GET sent to {endpoint}"}
+                    # Wait for actual response
+                    result = self._send_usp_get(endpoint, path, wait_response=True, timeout=15.0)
+                    if result and isinstance(result, dict):
+                        response = result
+                    else:
+                        response = {"status": "failed", "msg": "GET request failed"}
                 else:
                     response = {"status": "error", "msg": "usage: get <endpoint> <path>"}
             
@@ -1465,8 +1516,12 @@ class IPCServer(threading.Thread):
                 if len(cmd_parts) >= 3:
                     endpoint = cmd_parts[1]
                     obj_path = cmd_parts[2]
-                    success = self._send_usp_get_instances(endpoint, obj_path)
-                    response = {"status": "ok" if success else "failed", "msg": f"GetInstances sent to {endpoint}"}
+                    # Wait for actual response
+                    result = self._send_usp_get_instances(endpoint, obj_path, wait_response=True, timeout=15.0)
+                    if result and isinstance(result, dict):
+                        response = result
+                    else:
+                        response = {"status": "failed", "msg": "GetInstances request failed"}
                 else:
                     response = {"status": "error", "msg": "usage: get_instances <endpoint> <obj_path>"}
             
@@ -1637,20 +1692,80 @@ class IPCServer(threading.Thread):
             client.sendall(json.dumps(response).encode('utf-8'))
             client.close()
             
-        except Exception as e:
-            print(f"[!] IPC Client error: {e}")
+        except socket.timeout:
+            print(f"[!] IPC Client timeout")
             try: client.close()
             except: pass
+        except BrokenPipeError:
+            print(f"[!] IPC Client disconnected unexpectedly")
+            try: client.close()
+            except: pass
+        except Exception as e:
+            print(f"[!] IPC Client error: {e}")
+            try: 
+                error_response = {"status": "error", "msg": f"Server error: {str(e)}"}
+                client.sendall(json.dumps(error_response).encode('utf-8'))
+                client.close()
+            except: 
+                pass
 
-    def _send_usp_get(self, endpoint, path):
+    def _send_usp_get(self, endpoint, path, wait_response=False, timeout=15.0):
         """Helper to construct USP Get"""
+        import queue
+        from datetime import datetime
+        
+        # Check for duplicate request
+        request_key = (endpoint, 'get', path)
+        if wait_response and request_key in self.stomp.pending_requests:
+            existing_msg_id = self.stomp.pending_requests[request_key]
+            if existing_msg_id in self.stomp.pending_ipc_requests:
+                return {"status": "error", "msg": "Duplicate request already pending"}
+        
         msg_id = str(uuid.uuid4())
         usp_msg = msg_pb2.Msg()
         usp_msg.header.msg_id = msg_id
         usp_msg.header.msg_type = msg_pb2.Header.MsgType.GET
         usp_msg.body.request.get.param_paths.append(path)
         
-        return self._send_usp_message(endpoint, usp_msg)
+        # If wait_response, register for response tracking
+        result_queue = None
+        if wait_response:
+            result_queue = queue.Queue()
+            self.stomp.pending_ipc_requests[msg_id] = {
+                'endpoint': endpoint,
+                'command': 'get',
+                'path': path,
+                'result_queue': result_queue,
+                'timestamp': datetime.now()
+            }
+            self.stomp.pending_requests[request_key] = msg_id
+        
+        success = self._send_usp_message(endpoint, usp_msg)
+        
+        if not success:
+            if wait_response and msg_id in self.stomp.pending_ipc_requests:
+                del self.stomp.pending_ipc_requests[msg_id]
+                if request_key in self.stomp.pending_requests:
+                    del self.stomp.pending_requests[request_key]
+            return None if wait_response else False
+        
+        # Wait for response if requested
+        if wait_response:
+            try:
+                result = result_queue.get(timeout=timeout)
+                # Clean up tracking
+                if request_key in self.stomp.pending_requests:
+                    del self.stomp.pending_requests[request_key]
+                return result
+            except queue.Empty:
+                # Timeout - clean up
+                if msg_id in self.stomp.pending_ipc_requests:
+                    del self.stomp.pending_ipc_requests[msg_id]
+                if request_key in self.stomp.pending_requests:
+                    del self.stomp.pending_requests[request_key]
+                return {"status": "timeout", "msg": f"No response after {timeout}s"}
+        
+        return True
     
     def _send_usp_set(self, endpoint, path, value):
         """Helper to construct USP Set"""
@@ -1716,8 +1831,18 @@ class IPCServer(threading.Thread):
         
         return self._send_usp_message(endpoint, usp_msg)
     
-    def _send_usp_get_instances(self, endpoint, obj_path):
+    def _send_usp_get_instances(self, endpoint, obj_path, wait_response=False, timeout=15.0):
         """Helper to construct USP GetInstances"""
+        import queue
+        from datetime import datetime
+        
+        # Check for duplicate request
+        request_key = (endpoint, 'get_instances', obj_path)
+        if wait_response and request_key in self.stomp.pending_requests:
+            existing_msg_id = self.stomp.pending_requests[request_key]
+            if existing_msg_id in self.stomp.pending_ipc_requests:
+                return {"status": "error", "msg": "Duplicate request already pending"}
+        
         msg_id = str(uuid.uuid4())
         usp_msg = msg_pb2.Msg()
         usp_msg.header.msg_id = msg_id
@@ -1726,7 +1851,45 @@ class IPCServer(threading.Thread):
         usp_msg.body.request.get_instances.obj_paths.append(obj_path)
         usp_msg.body.request.get_instances.first_level_only = False
         
-        return self._send_usp_message(endpoint, usp_msg)
+        # If wait_response, register for response tracking
+        result_queue = None
+        if wait_response:
+            result_queue = queue.Queue()
+            self.stomp.pending_ipc_requests[msg_id] = {
+                'endpoint': endpoint,
+                'command': 'get_instances',
+                'path': obj_path,
+                'result_queue': result_queue,
+                'timestamp': datetime.now()
+            }
+            self.stomp.pending_requests[request_key] = msg_id
+        
+        success = self._send_usp_message(endpoint, usp_msg)
+        
+        if not success:
+            if wait_response and msg_id in self.stomp.pending_ipc_requests:
+                del self.stomp.pending_ipc_requests[msg_id]
+                if request_key in self.stomp.pending_requests:
+                    del self.stomp.pending_requests[request_key]
+            return None if wait_response else False
+        
+        # Wait for response if requested
+        if wait_response:
+            try:
+                result = result_queue.get(timeout=timeout)
+                # Clean up tracking
+                if request_key in self.stomp.pending_requests:
+                    del self.stomp.pending_requests[request_key]
+                return result
+            except queue.Empty:
+                # Timeout - clean up
+                if msg_id in self.stomp.pending_ipc_requests:
+                    del self.stomp.pending_ipc_requests[msg_id]
+                if request_key in self.stomp.pending_requests:
+                    del self.stomp.pending_requests[request_key]
+                return {"status": "timeout", "msg": f"No response after {timeout}s"}
+        
+        return True
     
     def _send_usp_operate(self, endpoint, command_path, **kwargs):
         """Helper to construct USP Operate"""

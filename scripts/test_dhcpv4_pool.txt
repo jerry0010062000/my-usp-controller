@@ -1,0 +1,87 @@
+# USP Controller Test Script
+# Test Sequence: DHCPv4 Address Assignment based on Hardware
+# Converted from ba-cli format to USP controller commands
+# Usage: Run each command in interactive mode or via IPC
+#
+# Format: <command> <endpoint> <path> [value]
+# Commands: get, set, add, delete, get_supported, get_instances
+# Note: {ENDPOINT} will be replaced with actual endpoint ID at runtime
+
+# ===================================================================
+# 1. Initialize: Reduce default Pool 1 range
+# ===================================================================
+
+# Set MinAddress for Pool 1
+set {ENDPOINT} Device.DHCPv4.Server.Pool.1.MinAddress 192.168.1.5
+
+# Set MaxAddress for Pool 1
+set {ENDPOINT} Device.DHCPv4.Server.Pool.1.MaxAddress 192.168.1.7
+
+# Verify configuration
+get {ENDPOINT} Device.DHCPv4.Server.Pool.1.MinAddress # expect: 192.168.1.5
+get {ENDPOINT} Device.DHCPv4.Server.Pool.1.MaxAddress # expect: 192.168.1.7
+
+
+# ===================================================================
+# 2. Add Test Pool: MAC address exact match binding
+# ===================================================================
+
+# Add new Pool instance
+add {ENDPOINT} Device.DHCPv4.Server.Pool.
+
+# Note: After add, use get_instances to find the new instance number
+get_instances {ENDPOINT} Device.DHCPv4.Server.Pool.
+
+# Set parameters for the new pool (replace X with actual instance number)
+# Example: Device.DHCPv4.Server.Pool.2.
+set {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.Enable true
+set {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.Interface Device.IP.Interface.3.
+set {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.MinAddress 192.168.1.10
+set {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.MaxAddress 192.168.1.12
+set {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.SubnetMask 255.255.255.0
+set {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.Chaddr b0:75:0c:e1:69:9b
+set {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.ChaddrExclude false
+set {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.ChaddrMask FF:FF:FF:FF:FF:FF
+
+# Verify configuration
+get {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.
+
+
+# ===================================================================
+# 4. Modify Pool: Test ChaddrExclude (exclude mode)
+# ===================================================================
+
+# Enable exclude mode
+set {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.ChaddrExclude true
+
+# Verify setting
+get {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.ChaddrExclude # expect: true
+
+
+# ===================================================================
+# 5. Modify Pool: Test ChaddrMask (OUI range matching)
+# ===================================================================
+
+# Disable exclude mode and change mask to OUI only
+set {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.ChaddrExclude false
+set {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.ChaddrMask FF:FF:FF:00:00:00
+
+# Verify settings
+get {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.ChaddrExclude # expect: false
+get {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.ChaddrMask # expect: FF:FF:FF:00:00:00
+
+
+# ===================================================================
+# 6. Cleanup Environment
+# ===================================================================
+
+# Delete the test pool instance
+delete {ENDPOINT} Device.DHCPv4.Server.Pool.{INSTANCE}.
+
+# Restore Pool 1 default values
+set {ENDPOINT} Device.DHCPv4.Server.Pool.1.MinAddress 192.168.1.2
+set {ENDPOINT} Device.DHCPv4.Server.Pool.1.MaxAddress 192.168.1.254
+
+# Verify restoration
+get {ENDPOINT} Device.DHCPv4.Server.Pool.1.MinAddress # expect: 192.168.1.2
+get {ENDPOINT} Device.DHCPv4.Server.Pool.1.MaxAddress # expect: 192.168.1.254

@@ -34,7 +34,7 @@ class IPCClient:
         """Send command string and return JSON response. Blocking call."""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(5.0)  # Increased timeout for large responses
+                s.settimeout(20.0)  # Extended timeout for GET/GetInstances (15s) + buffer
                 s.connect((self.host, self.port))
                 s.sendall(cmd.encode('utf-8'))
                 
@@ -54,8 +54,14 @@ class IPCClient:
                     
                 data = b''.join(data_chunks).decode('utf-8')
                 return json.loads(data)
+        except socket.timeout:
+            return {"status": "error", "msg": "Connection timeout (20s) - daemon may be busy"}
         except ConnectionRefusedError:
             return None
+        except ConnectionResetError:
+            return {"status": "error", "msg": "Connection reset by daemon"}
+        except json.JSONDecodeError as e:
+            return {"status": "error", "msg": f"Invalid response from daemon: {e}"}
         except Exception as e:
             return {"status": "error", "msg": str(e)}
 
@@ -155,8 +161,11 @@ class USPControllerGUI:
         
         # Row 1: Endpoint
         ttk.Label(cmd_frame, text="Target Endpoint:").grid(row=0, column=0, sticky="w")
-        self.ent_target = ttk.Entry(cmd_frame, width=40)
-        self.ent_target.grid(row=0, column=1, columnspan=2, sticky="ew", pady=2)
+        ep_row = ttk.Frame(cmd_frame)
+        ep_row.grid(row=0, column=1, columnspan=2, sticky="ew", pady=2)
+        self.cb_endpoint = ttk.Combobox(ep_row, width=37, state="readonly")
+        self.cb_endpoint.pack(side="left", fill="x", expand=True)
+        ttk.Button(ep_row, text="↻", width=3, command=self._refresh_devices).pack(side="left", padx=(2, 0))
         
         # Row 2: Operation
         ttk.Label(cmd_frame, text="Action:").grid(row=1, column=0, sticky="w")
@@ -238,6 +247,77 @@ class USPControllerGUI:
         # Tab 3: mDNS Debug
         tab_mdns = ttk.Frame(self.tabs, padding=10)
         self.tabs.add(tab_mdns, text="mDNS Debug")
+        
+        # Tab 4: Test Scripts
+        tab_scripts = ttk.Frame(self.tabs, padding=10)
+        self.tabs.add(tab_scripts, text="Test Scripts")
+        
+        # Test Scripts Tab Layout
+        tab_scripts.columnconfigure(0, weight=1)
+        tab_scripts.rowconfigure(1, weight=1)
+        
+        # Script Controls
+        script_ctrl_frame = ttk.LabelFrame(tab_scripts, text="Test Script Runner", padding=10)
+        script_ctrl_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        
+        # Script selection
+        script_select_frame = ttk.Frame(script_ctrl_frame)
+        script_select_frame.pack(fill="x", pady=(0, 5))
+        
+        ttk.Label(script_select_frame, text="Select Script:").pack(side="left", padx=(0, 5))
+        self.cb_script = ttk.Combobox(script_select_frame, state="readonly", width=40)
+        self.cb_script.pack(side="left", padx=(0, 5))
+        ttk.Button(script_select_frame, text="🔄 Refresh", command=self._refresh_script_list).pack(side="left")
+        
+        # Target endpoint selection
+        endpoint_select_frame = ttk.Frame(script_ctrl_frame)
+        endpoint_select_frame.pack(fill="x", pady=(0, 10))
+        
+        ttk.Label(endpoint_select_frame, text="Target Device:").pack(side="left", padx=(0, 5))
+        self.cb_script_endpoint = ttk.Combobox(endpoint_select_frame, state="readonly", width=40)
+        self.cb_script_endpoint.pack(side="left", padx=(0, 5))
+        ttk.Button(endpoint_select_frame, text="🔄 Refresh", command=self._refresh_devices).pack(side="left")
+        
+        # Script controls
+        script_btn_frame = ttk.Frame(script_ctrl_frame)
+        script_btn_frame.pack(fill="x", pady=(0, 10))
+        
+        self.btn_run_script = ttk.Button(script_btn_frame, text="▶ Run Script", command=self._run_script, width=15)
+        self.btn_run_script.pack(side="left", padx=2)
+        
+        self.btn_stop_script = ttk.Button(script_btn_frame, text="■ Stop", command=self._stop_script, width=15, state='disabled')
+        self.btn_stop_script.pack(side="left", padx=2)
+        
+        ttk.Button(script_btn_frame, text="📂 Open Folder", command=self._open_script_folder, width=15).pack(side="left", padx=2)
+        ttk.Button(script_btn_frame, text="🗑 Clear Log", command=self._clear_script_log, width=15).pack(side="left", padx=2)
+        
+        # Progress bar
+        self.script_progress = ttk.Progressbar(script_ctrl_frame, mode='indeterminate')
+        self.script_progress.pack(fill="x", pady=(0, 5))
+        
+        # Status label
+        self.lbl_script_status = ttk.Label(script_ctrl_frame, text="Ready", font=("Segoe UI", 9))
+        self.lbl_script_status.pack(anchor="w")
+        
+        # Script output log
+        log_frame = ttk.LabelFrame(tab_scripts, text="Script Output", padding=5)
+        log_frame.grid(row=1, column=0, sticky="nsew")
+        
+        self.txt_script_log = scrolledtext.ScrolledText(log_frame, state='disabled', font=("Consolas", 9), height=20)
+        self.txt_script_log.pack(fill="both", expand=True)
+        self._add_text_context_menu(self.txt_script_log)
+        
+        # Configure log tags
+        self.txt_script_log.tag_config('success', foreground='green')
+        self.txt_script_log.tag_config('error', foreground='red', font=("Consolas", 9, "bold"))
+        self.txt_script_log.tag_config('command', foreground='blue')
+        self.txt_script_log.tag_config('comment', foreground='gray')
+        self.txt_script_log.tag_config('info', foreground='black')
+        
+        # Script runner state
+        self.script_running = False
+        self.script_thread = None
+        self.script_variables = {}  # Store variables for substitution
         
         # mDNS Debug Tab Layout
         tab_mdns.columnconfigure(0, weight=1)
@@ -480,7 +560,309 @@ class USPControllerGUI:
         # Initial config load
         self.root.after(2000, self._refresh_config)
         self.root.after(3000, self._mdns_check_status)
+        self.root.after(1000, self._refresh_script_list)
+        self.root.after(500, self._refresh_devices)
+        self.root.after(600, self._sync_script_endpoint)
 
+    def _refresh_devices(self):
+        """Refresh list of available devices from devices.json"""
+        devices_file = os.path.join(os.path.dirname(__file__), 'devices.json')
+        if not os.path.exists(devices_file):
+            self.cb_endpoint['values'] = []
+            if hasattr(self, 'cb_script_endpoint'):
+                self.cb_script_endpoint['values'] = []
+            return
+        
+        try:
+            with open(devices_file, 'r', encoding='utf-8') as f:
+                devices = json.load(f)
+            
+            device_list = list(devices.keys())
+            self.cb_endpoint['values'] = device_list
+            if hasattr(self, 'cb_script_endpoint'):
+                self.cb_script_endpoint['values'] = device_list
+            
+            # Auto-select first device if nothing is selected
+            if device_list and not self.cb_endpoint.get():
+                self.cb_endpoint.current(0)
+            if hasattr(self, 'cb_script_endpoint') and device_list and not self.cb_script_endpoint.get():
+                self.cb_script_endpoint.current(0)
+        except Exception as e:
+            self.cb_endpoint['values'] = []
+            if hasattr(self, 'cb_script_endpoint'):
+                self.cb_script_endpoint['values'] = []
+    
+    def _sync_script_endpoint(self):
+        """Sync script endpoint with main endpoint selector"""
+        if hasattr(self, 'cb_script_endpoint') and self.cb_endpoint.get() and not self.cb_script_endpoint.get():
+            endpoint = self.cb_endpoint.get()
+            if endpoint in self.cb_script_endpoint['values']:
+                self.cb_script_endpoint.set(endpoint)
+    
+    def _refresh_script_list(self):
+        """Refresh list of available test scripts"""
+        import os
+        script_dir = os.path.join(os.path.dirname(__file__), 'scripts')
+        if not os.path.exists(script_dir):
+            return
+        
+        try:
+            scripts = [f for f in os.listdir(script_dir) if f.endswith('.txt')]
+            self.cb_script['values'] = scripts
+            if scripts and not self.cb_script.get():
+                self.cb_script.current(0)
+        except Exception as e:
+            pass
+    
+    def _open_script_folder(self):
+        """Open scripts folder in file explorer"""
+        import os
+        import subprocess
+        script_dir = os.path.join(os.path.dirname(__file__), 'scripts')
+        if os.path.exists(script_dir):
+            if sys.platform == 'win32':
+                os.startfile(script_dir)
+            else:
+                subprocess.run(['xdg-open', script_dir])
+    
+    def _clear_script_log(self):
+        """Clear script output log"""
+        self.txt_script_log.configure(state='normal')
+        self.txt_script_log.delete(1.0, tk.END)
+        self.txt_script_log.configure(state='disabled')
+    
+    def _run_script(self):
+        """Run selected test script"""
+        script_name = self.cb_script.get()
+        if not script_name:
+            messagebox.showwarning("No Script", "Please select a script to run")
+            return
+        
+        endpoint = self.cb_script_endpoint.get()
+        if not endpoint:
+            messagebox.showwarning("No Device", "Please select a target device")
+            return
+        
+        if self.script_running:
+            messagebox.showinfo("Script Running", "A script is already running")
+            return
+        
+        self.script_running = True
+        self.btn_run_script.configure(state='disabled')
+        self.btn_stop_script.configure(state='normal')
+        self.script_progress.start(10)
+        
+        self._clear_script_log()
+        self._script_log(f"Starting script: {script_name}\n", 'info')
+        self._script_log(f"Target device: {endpoint}\n\n", 'info')
+        
+        # Reset script variables
+        self.script_variables = {}
+        
+        self.script_thread = threading.Thread(target=self._run_script_thread, args=(script_name, endpoint), daemon=True)
+        self.script_thread.start()
+    
+    def _stop_script(self):
+        """Stop running script"""
+        self.script_running = False
+        self._script_log("\n[STOPPED] Script execution stopped by user\n", 'error')
+    
+    def _run_script_thread(self, script_name, endpoint):
+        """Execute script in background thread"""
+        import os
+        script_path = os.path.join(os.path.dirname(__file__), 'scripts', script_name)
+        
+        try:
+            with open(script_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            executed = 0
+            failed = 0
+            
+            for i, line in enumerate(lines, 1):
+                if not self.script_running:
+                    break
+                
+                line = line.strip()
+                
+                # Print comments
+                if line.startswith('#'):
+                    self._script_log(f"{line}\n", 'comment')
+                    continue
+                
+                # Skip empty lines
+                if not line:
+                    continue
+                
+                # Replace endpoint variable
+                line = line.replace('{ENDPOINT}', endpoint)
+                
+                # Replace other variables
+                for var_name, var_value in self.script_variables.items():
+                    line = line.replace(f'{{{var_name}}}', str(var_value))
+                
+                # Parse and execute command
+                result = self._parse_script_line(line)
+                if not result:
+                    continue
+                
+                # Unpack command and expected value
+                if isinstance(result, tuple):
+                    cmd, expected_value = result
+                else:
+                    cmd = result
+                    expected_value = None
+                
+                self._script_log(f"[{i}] {cmd}\n", 'command')
+                if expected_value:
+                    self._script_log(f"    Expected: {expected_value}\n", 'info')
+                self.lbl_script_status.config(text=f"Executing command {i}...")
+                
+                try:
+                    resp = self.ipc.send_command(cmd)
+                    
+                    # Handle connection errors
+                    if resp is None:
+                        self._script_log(f"    ✗ CONNECTION ERROR: Cannot connect to daemon\n", 'error')
+                        failed += 1
+                        # Give daemon a moment to recover
+                        time.sleep(1.0)
+                        continue
+                    
+                    # Handle duplicate request errors (skip to next command)
+                    if resp.get('status') == 'error' and 'Duplicate request' in resp.get('msg', ''):
+                        self._script_log(f"    ⚠ SKIPPED: {resp.get('msg')}\n", 'error')
+                        time.sleep(0.5)
+                        continue
+                    
+                    if resp and resp.get('status') == 'ok':
+                        actual_value = resp.get('msg', 'OK')
+                        self._script_log(f"    ✓ SUCCESS: {actual_value}\n", 'success')
+                        
+                        # Try to extract instance number for ADD or GetInstances commands
+                        if 'add' in cmd.lower() or 'get_instances' in cmd.lower():
+                            # Try to extract from response dict first
+                            instance_num = self._extract_instance_number(resp, cmd)
+                            if instance_num:
+                                self.script_variables['INSTANCE'] = instance_num
+                                self._script_log(f"    → Saved INSTANCE={instance_num}\n", 'info')
+                        
+                        # Check expected value if specified
+                        if expected_value:
+                            actual_str = str(actual_value).strip()
+                            expected_str = expected_value.strip()
+                            
+                            if expected_str.lower() in actual_str.lower():
+                                self._script_log(f"    ✓ ASSERTION PASSED\n", 'success')
+                                executed += 1
+                            else:
+                                self._script_log(f"    ✗ ASSERTION FAILED\n", 'error')
+                                self._script_log(f"      Expected: {expected_str}\n", 'error')
+                                self._script_log(f"      Got: {actual_str}\n", 'error')
+                                failed += 1
+                        else:
+                            executed += 1
+                    else:
+                        error_msg = resp.get('msg', 'Unknown error') if resp else 'No response'
+                        self._script_log(f"    ✗ FAILED: {error_msg}\n", 'error')
+                        failed += 1
+                except Exception as e:
+                    self._script_log(f"    ✗ ERROR: {e}\n", 'error')
+                    failed += 1
+                
+                time.sleep(0.5)  # Delay between commands
+            
+            # Summary
+            self._script_log(f"\n{'='*60}\n", 'info')
+            self._script_log(f"[SUMMARY]\n", 'info')
+            self._script_log(f"  Executed: {executed}\n", 'success')
+            self._script_log(f"  Failed:   {failed}\n", 'error' if failed > 0 else 'info')
+            self._script_log(f"{'='*60}\n", 'info')
+            
+            self.lbl_script_status.config(text=f"Completed: {executed} success, {failed} failed")
+            
+        except Exception as e:
+            self._script_log(f"\n[ERROR] Failed to run script: {e}\n", 'error')
+            self.lbl_script_status.config(text="Error occurred")
+        finally:
+            self.script_running = False
+            self.btn_run_script.configure(state='normal')
+            self.btn_stop_script.configure(state='disabled')
+            self.script_progress.stop()
+    
+    def _extract_instance_number(self, response, cmd):
+        """Extract instance number from add/get_instances response"""
+        import re
+        
+        # For response dict with 'instances' key (from GetInstances)
+        if isinstance(response, dict) and 'instances' in response:
+            instances = response.get('instances', [])
+            if instances:
+                # Return the last instance (usually the most recently created)
+                return instances[-1]
+        
+        # For response text
+        response_msg = response.get('msg', '') if isinstance(response, dict) else str(response)
+        
+        # For ADD responses, look for "created instance X"
+        if 'instance' in response_msg.lower():
+            match = re.search(r'instance[:\s]+(\d+)', response_msg, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        
+        # Extract path from command to look for instance numbers
+        cmd_parts = cmd.split()
+        if len(cmd_parts) >= 3:
+            path = cmd_parts[2]
+            # For GetInstances, try to find instance number in response
+            # Look for pattern like "Pool.2." in the response
+            if path.endswith('.'):
+                base_obj = path.rstrip('.')
+                pattern = re.escape(base_obj) + r'\.(\d+)\.'
+                match = re.search(pattern, response_msg)
+                if match:
+                    return match.group(1)
+        
+        return None
+    
+    def _parse_script_line(self, line):
+        """Parse script line into IPC command"""
+        # Check for expected value assertion
+        expected_value = None
+        if '# expect:' in line or '# EXPECT:' in line:
+            parts_split = line.split('#')
+            line = parts_split[0].strip()
+            expect_part = parts_split[1].strip()
+            if expect_part.lower().startswith('expect:'):
+                expected_value = expect_part[7:].strip()
+        
+        parts = line.split(maxsplit=3)
+        if len(parts) < 3:
+            return None
+        
+        cmd = parts[0].lower()
+        endpoint = parts[1]
+        path = parts[2]
+        value = parts[3] if len(parts) > 3 else ""
+        
+        if cmd in ['get', 'get_supported', 'get_instances', 'add', 'delete']:
+            return (f"{cmd} {endpoint} {path}", expected_value)
+        elif cmd == 'set':
+            # SET command requires a value
+            if len(parts) < 4 or not value.strip():
+                self._script_log(f"    [WARNING] SET command missing value\n", 'error')
+                return None
+            return (f"{cmd} {endpoint} {path} {value}", expected_value)
+        else:
+            self._script_log(f"    [WARNING] Unknown command: {cmd}\n", 'error')
+            return None
+    
+    def _script_log(self, text, tag='info'):
+        """Append text to script log with tag"""
+        self.txt_script_log.configure(state='normal')
+        self.txt_script_log.insert(tk.END, text, tag)
+        self.txt_script_log.see(tk.END)
+        self.txt_script_log.configure(state='disabled')
 
     def _get_tag_for_type(self, log_type):
         """Return color tag for log type"""
@@ -540,8 +922,14 @@ class USPControllerGUI:
             item_id = selection[0]
             # Get the endpoint ID from the item
             ep_id = self.tree_devices.item(item_id, "text")
-            self.ent_target.delete(0, tk.END)
-            self.ent_target.insert(0, ep_id)
+            # Set endpoint from device list
+            if ep_id in self.cb_endpoint['values']:
+                self.cb_endpoint.set(ep_id)
+            else:
+                # If not in list, refresh and try again
+                self._refresh_devices()
+                if ep_id in self.cb_endpoint['values']:
+                    self.cb_endpoint.set(ep_id)
 
     def _poll_status_loop(self):
         # Legacy: handled by background thread now
@@ -687,10 +1075,6 @@ class USPControllerGUI:
         # Legacy method kept for compatibility bound to buttons
         pass
 
-    def _refresh_devices(self):
-        # Legacy method
-        pass
-    
     def _refresh_subscriptions(self):
         """Manually refresh subscription status"""
         threading.Thread(target=self._refresh_subscriptions_thread, daemon=True).start()
@@ -742,7 +1126,7 @@ class USPControllerGUI:
             self.log_queue.put({"logs": [{"id": -1, "time": datetime.now().strftime("%H:%M:%S"), "type": "error", "msg": f"Delete error: {e}"}], "last_id": -1})
 
     def _send_command(self):
-        ep = self.ent_target.get().strip()
+        ep = self.cb_endpoint.get().strip()
         path = self.ent_path.get().strip()
         action = self.cb_action.get().lower()
         val = self.ent_value.get().strip()
@@ -1288,8 +1672,15 @@ class USPControllerGUI:
         self.cb_action.current(action_idx)
         
         # Set endpoint
-        self.ent_target.delete(0, tk.END)
-        self.ent_target.insert(0, entry['endpoint'])
+        # Set endpoint from history
+        endpoint = entry['endpoint']
+        if endpoint in self.cb_endpoint['values']:
+            self.cb_endpoint.set(endpoint)
+        else:
+            # If not in list, refresh devices first
+            self._refresh_devices()
+            if endpoint in self.cb_endpoint['values']:
+                self.cb_endpoint.set(endpoint)
         
         # Set path
         self.ent_path.delete(0, tk.END)
