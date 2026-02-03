@@ -12,7 +12,13 @@ import threading
 import time
 import queue
 import os
+import sys
 from datetime import datetime
+
+# Hide console window on Windows
+if sys.platform == 'win32':
+    import ctypes
+    ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 IPC_HOST = '127.0.0.1'
 IPC_PORT = 6001
@@ -343,6 +349,19 @@ class USPControllerGUI:
         conf_frame = ttk.LabelFrame(scrollable_frame, text="Configuration Editor", padding=10)
         conf_frame.pack(fill="x", pady=10)
         
+        # Subscription Status (Read-only, above config editor)
+        sub_frame = ttk.LabelFrame(scrollable_frame, text="Active STOMP Subscriptions", padding=10)
+        sub_frame.pack(fill="x", pady=(0, 10))
+        
+        sub_info = ttk.Frame(sub_frame)
+        sub_info.pack(fill="x")
+        
+        ttk.Label(sub_info, text="Subscribed Queues:", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        self.lbl_subscriptions = ttk.Label(sub_info, text="Loading...", font=("Consolas", 9), foreground="blue")
+        self.lbl_subscriptions.pack(anchor="w", pady=(5, 0))
+        
+        ttk.Button(sub_info, text="🔄 Refresh Subscriptions", command=self._refresh_subscriptions).pack(anchor="w", pady=(5, 0))
+        
         # Inner frame for grid layout
         conf_grid = ttk.Frame(conf_frame)
         conf_grid.pack(fill="x", expand=True)
@@ -607,6 +626,14 @@ class USPControllerGUI:
             status_text = f"Connected to Daemon | Broker: {'UP' if connected else 'DOWN'} | Devices: {cnt}"
             self.lbl_status.config(text=status_text, foreground="green")
             
+            # Update subscriptions display
+            subscriptions = resp.get("subscriptions", [])
+            if subscriptions:
+                subs_text = "\n".join(f"  • {sub}" for sub in subscriptions)
+                self.lbl_subscriptions.config(text=subs_text)
+            else:
+                self.lbl_subscriptions.config(text="  (No active subscriptions)", foreground="gray")
+            
             # Update broker status labels
             broker_status = "🟢 Connected" if connected else "🔴 Disconnected"
             self.lbl_broker_conn.config(text=f"Connection: {broker_status}", 
@@ -627,16 +654,15 @@ class USPControllerGUI:
             # Update or add devices
             for ep_id, info in devices.items():
                 status = info.get('status', 'unknown')
-                status_icon = "🟢" if status == "online" else "🔴" if status == "offline" else "⚪"
                 status_text = status.upper()
                 
                 if ep_id in current_items:
                     # Update existing item
                     item_id = current_items[ep_id]
-                    self.tree_devices.item(item_id, values=(status_icon,))
+                    self.tree_devices.item(item_id, values=(status_text,))
                 else:
                     # Add new item
-                    self.tree_devices.insert("", "end", text=ep_id, values=(status_icon,))
+                    self.tree_devices.insert("", "end", text=ep_id, values=(status_text,))
             
             # Remove devices that no longer exist
             for ep_id, item_id in current_items.items():
@@ -664,6 +690,28 @@ class USPControllerGUI:
     def _refresh_devices(self):
         # Legacy method
         pass
+    
+    def _refresh_subscriptions(self):
+        """Manually refresh subscription status"""
+        threading.Thread(target=self._refresh_subscriptions_thread, daemon=True).start()
+    
+    def _refresh_subscriptions_thread(self):
+        """Thread to refresh subscription status via IPC"""
+        try:
+            resp = self.ipc.send_command("status")
+            if resp and resp.get("status") == "ok":
+                subscriptions = resp.get("subscriptions", [])
+                if subscriptions:
+                    subs_text = "\n".join(f"  • {sub}" for sub in subscriptions)
+                    self.lbl_subscriptions.config(text=subs_text, foreground="blue")
+                else:
+                    self.lbl_subscriptions.config(text="  (No active subscriptions)", foreground="gray")
+                self._append_log(datetime.now().strftime('%H:%M:%S'), 'info', 
+                                f"Subscriptions refreshed: {len(subscriptions)} active")
+            else:
+                self.lbl_subscriptions.config(text="  (Failed to retrieve)", foreground="red")
+        except Exception as e:
+            self.lbl_subscriptions.config(text=f"  Error: {e}", foreground="red")
     
     def _delete_device(self):
         """Delete selected device from list"""

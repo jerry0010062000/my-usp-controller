@@ -1,6 +1,6 @@
 [
   {
-    "timestamp": "2026-02-02T10:11:17.048565",
+    "timestamp": "2026-02-03T10:13:19.948369",
     "action": "GET",
     "endpoint": "proto::agent-id",
     "path": "Device.WiFi.",
@@ -24,12 +24,12 @@
     "status": "success"
   },
   {
-    "timestamp": "2026-01-29T17:47:10.091729",
+    "timestamp": "2026-02-02T11:20:20.995443",
     "action": "DISCOVER",
     "endpoint": "proto::agent-id",
     "path": "Device.LocalAgent.",
     "value": "test",
-    "status": "success"
+    "status": "pending"
   },
   {
     "timestamp": "2026-01-29T17:52:44.970478",
@@ -48,11 +48,19 @@
     "status": "success"
   },
   {
-    "timestamp": "2026-01-30T15:14:30.581323",
+    "timestamp": "2026-02-02T11:39:11.638984",
+    "action": "GET",
+    "endpoint": "proto::agent-id",
+    "path": "Device.LocalAgent.",
+    "value": "test",
+    "status": "success"
+  },
+  {
+    "timestamp": "2026-02-03T10:16:28.901395",
     "action": "DISCOVER",
     "endpoint": "proto::agent-id",
     "path": "Device.LocalAgent.",
     "value": "",
-    "status": "error"
+    "status": "success"
   }
 ]

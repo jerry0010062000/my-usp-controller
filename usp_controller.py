@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Dual-Mode USP/STOMP Controller
 Mode 1: Interactive Shell (User)
 Mode 2: Background Daemon with IPC (Automation)
 """
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 __author__ = "Jerry Bai"
+
+import sys
+import io
+
+# Set UTF-8 encoding for stdout/stderr on Windows
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
 
 import socket
 import threading
@@ -143,6 +152,8 @@ IPC_PORT = ipc_config.get('port', DEFAULT_CONFIG['ipc_port'])
 # Advanced options
 AUTO_SUBSCRIBE_WILDCARD = usp_config.get('auto_subscribe_wildcard', DEFAULT_CONFIG['auto_subscribe_wildcard'])
 ENABLE_MDNS_DISCOVERY = usp_config.get('enable_mdns_discovery', True)  # Enable by default
+HEARTBEAT_CHECK_ENABLED_CONFIG = usp_config.get('heartbeat_check_enabled', True)
+HEARTBEAT_CHECK_INTERVAL_CONFIG = usp_config.get('heartbeat_check_interval', 60)
 
 # System-specific configuration
 import platform
@@ -153,6 +164,11 @@ else:
 
 # Device online status timeout (seconds)
 DEVICE_TIMEOUT = 300  # 5 minutes - device considered offline if no message for this duration
+
+# Active heartbeat check settings - loaded from config
+HEARTBEAT_CHECK_ENABLED = HEARTBEAT_CHECK_ENABLED_CONFIG
+HEARTBEAT_CHECK_INTERVAL = HEARTBEAT_CHECK_INTERVAL_CONFIG
+HEARTBEAT_CHECK_PATH = "Device.DeviceInfo.UpTime"  # Lightweight parameter to check
 
 # Debug Levels (can be overridden by config or command line)
 DEBUG_LEVEL = 2  # Default: Full Details for better troubleshooting
@@ -433,6 +449,12 @@ class STOMPManager:
         self.msg_callbacks = []
         self.last_active_device = None
         self.lock = threading.Lock()
+        self.recv_thread = None
+        self.heartbeat_thread = None
+        self.last_heartbeat_sent = None
+        self.heartbeat_interval = 30  # seconds
+        self.heartbeat_check_thread = None
+        self.pending_heartbeat_checks = {}  # {msg_id: {endpoint, timestamp}}
         
         # mDNS Service Discovery
         self.mdns_zeroconf = None
@@ -465,11 +487,15 @@ class STOMPManager:
     def load_devices(self):
         """Load known devices from file"""
         try:
+            devices_path = os.path.abspath(DEVICES_FILE)
+            Logger.info(f"Loading devices from: {devices_path}", level=1)
             if os.path.exists(DEVICES_FILE):
-                with open(DEVICES_FILE, 'r') as f:
+                with open(DEVICES_FILE, 'r', encoding='utf-8') as f:
                     self.devices = json.load(f)
-                Logger.info(f"Loaded {len(self.devices)} devices from {DEVICES_FILE}", level=1)
+                Logger.info(f"Loaded {len(self.devices)} devices: {list(self.devices.keys())}", level=0)
                 return True
+            else:
+                Logger.info(f"Devices file not found: {devices_path}", level=1)
         except Exception as e:
             Logger.critical(f"Failed to load devices: {e}")
         return False
@@ -621,13 +647,15 @@ class STOMPManager:
             self.sock.settimeout(10)
             self.sock.connect((BROKER_HOST, BROKER_PORT))
             
+            # heart-beat: send,receive (milliseconds)
+            # 30000,30000 = send every 30s, expect from broker every 30s
             connect_frame = (
                 f"CONNECT\n"
                 f"accept-version:1.2\n"
                 f"host:/\n"
                 f"login:{USERNAME}\n"
                 f"passcode:{PASSWORD}\n"
-                f"heart-beat:0,0\n"
+                f"heart-beat:30000,30000\n"
                 f"\n\0"
             )
             
@@ -645,6 +673,10 @@ class STOMPManager:
                 # Start receiver thread
                 self.recv_thread = threading.Thread(target=self._receiver_loop, daemon=True)
                 self.recv_thread.start()
+                
+                # Start heartbeat thread
+                self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+                self.heartbeat_thread.start()
                 
                 # Controller 只訂閱自己的接收佇列
                 self.subscribe(RECEIVE_TOPIC)
@@ -782,8 +814,103 @@ class STOMPManager:
                             
             except Exception as e:
                 if self.running:
-                    print(f"[!] Receiver error: {e}")
+                    Logger.critical(f"Receiver error: {e}")
                 break
+
+    def _heartbeat_loop(self):
+        """Send STOMP heartbeat frames periodically"""
+        from datetime import datetime
+        import time
+        
+        Logger.info(f"Heartbeat thread started (interval: {self.heartbeat_interval}s)", level=1)
+        
+        while self.running and self.connected:
+            try:
+                time.sleep(self.heartbeat_interval)
+                
+                if not self.connected:
+                    break
+                
+                # Send heartbeat (single newline)
+                self.sock.sendall(b"\\n")
+                self.last_heartbeat_sent = datetime.now()
+                Logger.info(f"♥ Heartbeat sent to broker", level=2)
+                
+            except Exception as e:
+                Logger.critical(f"Heartbeat error: {e}")
+                if not self.connected:
+                    break
+        
+        Logger.info("Heartbeat thread stopped", level=1)
+
+    def _heartbeat_check_loop(self):
+        """Periodically send Get requests to agents to verify they're alive"""
+        import time
+        
+        Logger.info(f"Active heartbeat check started (interval: {HEARTBEAT_CHECK_INTERVAL}s)", level=1)
+        
+        while self.running and self.connected:
+            try:
+                # Check each known device
+                devices_to_check = list(self.devices.keys())
+                Logger.info(f"♥ Checking {len(devices_to_check)} device(s) for heartbeat", level=1)
+                for endpoint_id in devices_to_check:
+                    self._send_heartbeat_check(endpoint_id)
+                
+                time.sleep(HEARTBEAT_CHECK_INTERVAL)
+                
+                if not self.connected:
+                    break
+                
+            except Exception as e:
+                Logger.critical(f"Heartbeat check error: {e}")
+                if not self.connected:
+                    break
+        
+        Logger.info("Heartbeat check thread stopped", level=1)
+    
+    def _send_heartbeat_check(self, endpoint_id):
+        """Send a lightweight Get request to check if agent is alive"""
+        try:
+            import uuid
+            from datetime import datetime
+            
+            device_info = self.devices.get(endpoint_id)
+            if not device_info:
+                return
+            
+            reply_to = device_info.get('reply_to')
+            if not reply_to:
+                return
+            
+            # Create Get request for UpTime (lightweight parameter)
+            msg = msg_pb2.Msg()
+            msg.header.msg_id = str(uuid.uuid4())
+            msg.header.msg_type = msg_pb2.Header.MsgType.GET
+            
+            get_req = msg.body.request.get
+            get_req.param_paths.append(HEARTBEAT_CHECK_PATH)
+            
+            # Track this heartbeat check
+            self.pending_heartbeat_checks[msg.header.msg_id] = {
+                'endpoint': endpoint_id,
+                'timestamp': datetime.now(),
+                'path': HEARTBEAT_CHECK_PATH
+            }
+            
+            # Wrap in USP Record
+            usp_rec = record_pb2.Record()
+            usp_rec.version = "1.4"
+            usp_rec.to_id = endpoint_id
+            usp_rec.from_id = CONTROLLER_ENDPOINT_ID
+            usp_rec.payload_security = record_pb2.Record.PayloadSecurity.PLAINTEXT
+            usp_rec.no_session_context.payload = msg.SerializeToString()
+            
+            Logger.info(f"♥ Sending heartbeat check to {endpoint_id}", level=1)
+            self.send(reply_to, usp_rec.SerializeToString(), reply_to=REPLY_TO_QUEUE)
+            
+        except Exception as e:
+            Logger.critical(f"Failed to send heartbeat check to {endpoint_id}: {e}")
 
     def _process_frame(self, frame_bytes):
         try:
@@ -991,6 +1118,17 @@ class STOMPManager:
     def _handle_usp_response(self, sender, msg):
         """Handle and display USP response messages"""
         resp = msg.body.response
+        
+        # Check if this is a heartbeat check response
+        msg_id = msg.header.msg_id
+        if msg_id in self.pending_heartbeat_checks:
+            check_info = self.pending_heartbeat_checks.pop(msg_id)
+            from datetime import datetime
+            elapsed = (datetime.now() - check_info['timestamp']).total_seconds()
+            Logger.success(f"♥ Heartbeat response from {check_info['endpoint']} (RTT: {elapsed:.2f}s)", level=2)
+            # Continue to process response normally (but don't display verbose output)
+            if DEBUG_LEVEL < 2:
+                return  # Skip verbose output for heartbeat checks at lower debug levels
         
         if resp.HasField('get_resp'):
             total_params = 0
@@ -1223,7 +1361,8 @@ class IPCServer(threading.Thread):
                     "status": "ok",
                     "connected": self.stomp.connected,
                     "devices_count": len(self.stomp.devices),
-                    "last_active": self.stomp.last_active_device
+                    "last_active": self.stomp.last_active_device,
+                    "subscriptions": list(self.stomp.subscription_ids.keys())
                 }
             
             elif cmd == "devices":
@@ -1927,9 +2066,11 @@ def main():
             sys.exit(1)
     
     # 顯示配置資訊
+    sys.stdout.flush()  # Ensure previous output is visible
     print(f"[*] Controller: {CONTROLLER_ENDPOINT_ID}")
     print(f"[*] Broker: {BROKER_HOST}:{BROKER_PORT}")
     print(f"[*] Receive Topic: {RECEIVE_TOPIC}")
+    sys.stdout.flush()
     
     # Init STOMP
     stomp_mgr = STOMPManager()
@@ -1953,10 +2094,23 @@ def main():
         
         ipc_server = IPCServer(stomp_mgr)
         ipc_server.start()
-        time.sleep(0.2)  # Give IPC server time to start
+        sys.stdout.flush()  # Ensure previous output is visible
+        print("="*60)
+        print(f"[OK] USP Controller Daemon Started")
+        print(f"[OK] PID: {os.getpid()}")
+        print(f"[OK] IPC Server: {IPC_HOST}:{IPC_PORT}")
+        print(f"[OK] STOMP Broker: {BROKER_HOST}:{BROKER_PORT}")
+        print("="*60)
+        print("[WARNING] This is a background daemon process")
+        print("[WARNING] DO NOT close this window - GUI depends on it")
+        print("[INFO] You can minimize this window safely")
+        print("[INFO] Logs are being written to usp_controller.log")
+        print("="*60)
+        print("")
+        sys.stdout.flush()  # Force output to displayNFO] Logs are being written to usp_controller.log")
+        print("="*60)
+        print("")
         
-        print(f"[✓] Daemon Started (PID: {os.getpid()})")
-        print(f"[✓] IPC listening on {IPC_HOST}:{IPC_PORT}")
         try:
             while True:
                 time.sleep(1)

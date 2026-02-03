@@ -7,7 +7,9 @@
     "controller_endpoint_id": "proto::controller-1",
     "receive_topic": "/topic/my_send_q",
     "devices_file": "devices.json",
-    "enable_mdns_discovery": true
+    "enable_mdns_discovery": true,
+    "heartbeat_check_enabled": true,
+    "heartbeat_check_interval": 60
   },
   "ipc": {
     "host": "127.0.0.1",
