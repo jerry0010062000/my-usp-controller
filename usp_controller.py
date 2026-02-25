@@ -230,6 +230,13 @@ class Logger:
             Logger._add_history("success", msg)
     
     @staticmethod
+    def error(msg, level=0):
+        """Show error messages based on debug level"""
+        if DEBUG_LEVEL >= level:
+            print(f"[✗] {msg}")
+            Logger._add_history("error", msg)
+    
+    @staticmethod
     def data(msg, level=0):
         """Show response data (level 0+)"""
         if DEBUG_LEVEL >= level:
@@ -458,9 +465,38 @@ class STOMPManager:
         self.pending_ipc_requests = {}  # {msg_id: {endpoint, command, result_queue, timestamp}}
         self.pending_requests = {}  # {(endpoint, command, path): msg_id} - track duplicate requests
         
+        # Test data cache for SET testing (Test 1.4)
+        self.writable_params_cache = {}  # {endpoint: {param_path: access_info}}
+        self.param_values_cache = {}     # {endpoint: {param_path: value}}
+        
         # mDNS Service Discovery
         self.mdns_zeroconf = None
         self.mdns_browser = None
+    
+    def _match_param_to_template(self, instance_path, template_paths):
+        """Match instance path to template path with {i} placeholders
+        
+        Args:
+            instance_path: Actual path like 'Device.IP.Interface.1.Enable'
+            template_paths: Dict of template paths like 'Device.IP.Interface.{i}.Enable'
+        
+        Returns:
+            Matching template path or None
+        """
+        import re
+        
+        for template_path in template_paths:
+            # Convert template to regex pattern
+            # Replace {i} with \d+ to match instance numbers
+            pattern = re.escape(template_path)
+            pattern = pattern.replace(r'\{i\}', r'\d+')
+            pattern = pattern.replace(r'\{instance\}', r'\d+')
+            pattern = '^' + pattern + '$'
+            
+            if re.match(pattern, instance_path, re.IGNORECASE):
+                return template_path
+        
+        return None
     
     def get_device_status(self, endpoint_id):
         """Check if device is online based on last_seen timestamp"""
@@ -1149,9 +1185,18 @@ class STOMPManager:
                     Logger.data(f"    {res.resolved_path}")
                     for p, v in res.result_params.items():
                         Logger.data(f"      {p} = {v}")
-                        result_data[p] = v
+                        # Build full parameter path
+                        full_param_path = res.resolved_path + p
+                        result_data[full_param_path] = v
                         total_params += 1
             Logger.data(f"  === Total: {total_params} parameters ===")
+            
+            # Cache parameter values for SET testing
+            if sender and result_data:
+                if sender not in self.param_values_cache:
+                    self.param_values_cache[sender] = {}
+                self.param_values_cache[sender].update(result_data)
+                Logger.info(f"[Cache] Stored {len(result_data)} parameter values for {sender}", level=1)
             
             # Return result to IPC caller if waiting
             if ipc_req and 'result_queue' in ipc_req:
@@ -1164,6 +1209,8 @@ class STOMPManager:
                     
         elif resp.HasField('get_supported_dm_resp'):
             count = 0
+            writable_params = {}  # Cache writable parameters
+            
             for r in resp.get_supported_dm_resp.req_obj_results:
                 for obj in r.supported_objs:
                     # Object info
@@ -1179,6 +1226,14 @@ class STOMPManager:
                         access_short = "RW" if access == "PARAM_READ_WRITE" else "R"
                         Logger.data(f"      {p.param_name} [{access_short}]")
                         count += 1
+                        
+                        # Cache writable parameters (READ_WRITE or WRITE_ONLY)
+                        if access in ["PARAM_READ_WRITE", "PARAM_WRITE_ONLY"]:
+                            full_param_path = obj.supported_obj_path + p.param_name
+                            writable_params[full_param_path] = {
+                                'access': access,
+                                'type': msg_pb2.GetSupportedDMResp.ParamValueType.Name(p.value_type) if p.value_type else 'unknown'
+                            }
                     
                     # Commands with type
                     for c in obj.supported_commands:
@@ -1191,7 +1246,13 @@ class STOMPManager:
                     for e in obj.supported_events:
                         Logger.data(f"      {e.event_name}! [event]")
                         count += 1
+            
             Logger.data(f"  Total: {count} items")
+            
+            # Cache writable parameters for SET testing
+            if sender and writable_params:
+                self.writable_params_cache[sender] = writable_params
+                Logger.info(f"[Cache] Stored {len(writable_params)} writable parameters for {sender}", level=1)
             
         elif resp.HasField('get_instances_resp'):
             total_instances = 0
@@ -1458,12 +1519,23 @@ class IPCServer(threading.Thread):
                     response = {"status": "error", "msg": "usage: remove_device <endpoint_id>"}
             
             elif cmd == "get":
-                # get <endpoint> <path>
+                # get <endpoint> <path> [--timeout seconds]
                 if len(cmd_parts) >= 3:
                     endpoint = cmd_parts[1]
                     path = cmd_parts[2]
+                    
+                    # Parse optional timeout
+                    timeout = 30.0
+                    if "--timeout" in cmd_parts:
+                        try:
+                            timeout_idx = cmd_parts.index("--timeout")
+                            if timeout_idx + 1 < len(cmd_parts):
+                                timeout = float(cmd_parts[timeout_idx + 1])
+                        except (ValueError, IndexError):
+                            pass
+                    
                     # Wait for actual response
-                    result = self._send_usp_get(endpoint, path, wait_response=True, timeout=15.0)
+                    result = self._send_usp_get(endpoint, path, wait_response=True, timeout=timeout)
                     if result and isinstance(result, dict):
                         response = result
                     else:
@@ -1503,14 +1575,31 @@ class IPCServer(threading.Thread):
                     response = {"status": "error", "msg": "usage: delete <endpoint> <obj_path>"}
             
             elif cmd == "get_supported" or cmd == "getsupporteddm":
-                # get_supported <endpoint> [obj_path]
+                # get_supported <endpoint> [obj_path] [first_level_only] [return_commands] [return_events] [return_params]
                 if len(cmd_parts) >= 2:
                     endpoint = cmd_parts[1]
                     obj_path = cmd_parts[2] if len(cmd_parts) >= 3 else "Device."
-                    success = self._send_usp_get_supported_dm(endpoint, obj_path)
+                    
+                    # Parse optional boolean arguments (default: first_level_only=False, others=True)
+                    first_level_only = False
+                    return_commands = True
+                    return_events = True
+                    return_params = True
+                    
+                    if len(cmd_parts) >= 4:
+                        first_level_only = cmd_parts[3].lower() in ['true', '1', 'yes']
+                    if len(cmd_parts) >= 5:
+                        return_commands = cmd_parts[4].lower() in ['true', '1', 'yes']
+                    if len(cmd_parts) >= 6:
+                        return_events = cmd_parts[5].lower() in ['true', '1', 'yes']
+                    if len(cmd_parts) >= 7:
+                        return_params = cmd_parts[6].lower() in ['true', '1', 'yes']
+                    
+                    success = self._send_usp_get_supported_dm(endpoint, obj_path, first_level_only, 
+                                                             return_commands, return_events, return_params)
                     response = {"status": "ok" if success else "failed", "msg": f"GetSupportedDM sent to {endpoint}"}
                 else:
-                    response = {"status": "error", "msg": "usage: get_supported <endpoint> [obj_path]"}
+                    response = {"status": "error", "msg": "usage: get_supported <endpoint> [obj_path] [first_level_only] [return_commands] [return_events] [return_params]"}
             
             elif cmd == "get_instances" or cmd == "getinstances":
                 # get_instances <endpoint> <obj_path>
@@ -1518,7 +1607,7 @@ class IPCServer(threading.Thread):
                     endpoint = cmd_parts[1]
                     obj_path = cmd_parts[2]
                     # Wait for actual response
-                    result = self._send_usp_get_instances(endpoint, obj_path, wait_response=True, timeout=15.0)
+                    result = self._send_usp_get_instances(endpoint, obj_path, wait_response=True, timeout=30.0)
                     if result and isinstance(result, dict):
                         response = result
                     else:
@@ -1657,6 +1746,649 @@ class IPCServer(threading.Thread):
                 self.stomp.stop_mdns_discovery()
                 response = {"status": "ok", "msg": "mDNS discovery stopped"}
             
+            elif cmd == "list_writable":
+                # list_writable [endpoint] [--simple]
+                # List cached writable parameters for an endpoint
+                if len(cmd_parts) >= 2:
+                    endpoint = cmd_parts[1]
+                    simple_mode = "--simple" in cmd_parts or "--fast" in cmd_parts
+                    
+                    if endpoint in self.stomp.writable_params_cache:
+                        writable = self.stomp.writable_params_cache[endpoint]
+                        writable_count = len(writable)
+                        values_count = len(self.stomp.param_values_cache.get(endpoint, {}))
+                        
+                        if simple_mode:
+                            # Fast mode: only return counts, no detailed matching
+                            response = {
+                                "status": "ok",
+                                "endpoint": endpoint,
+                                "mode": "simple",
+                                "total_writable_templates": writable_count,
+                                "total_cached_values": values_count,
+                                "msg": f"Found {writable_count} writable templates and {values_count} cached values. Use without --simple for detailed analysis."
+                            }
+                        else:
+                            # Detailed mode: perform matching (may be slow for large datasets)
+                            Logger.info(f"[ListWritable] Analyzing {writable_count} templates against {values_count} values...", level=0)
+                            
+                            params_with_values = []
+                            params_no_values = []
+                            
+                            for idx, (template_path, access_info) in enumerate(writable.items(), 1):
+                                # Progress logging for large datasets
+                                if idx % 100 == 0:
+                                    Logger.info(f"[ListWritable] Progress: {idx}/{writable_count}", level=1)
+                                
+                                # Check for exact match first
+                                has_value = (endpoint in self.stomp.param_values_cache and 
+                                           template_path in self.stomp.param_values_cache[endpoint])
+                                
+                                if not has_value and endpoint in self.stomp.param_values_cache:
+                                    # Try to find matching instance paths (limit check for performance)
+                                    matching_count = 0
+                                    example_instance = None
+                                    for instance_path in self.stomp.param_values_cache[endpoint].keys():
+                                        matched = self.stomp._match_param_to_template(instance_path, [template_path])
+                                        if matched:
+                                            matching_count += 1
+                                            if not example_instance:
+                                                example_instance = instance_path
+                                    
+                                    if matching_count > 0:
+                                        params_with_values.append({
+                                            'path': template_path,
+                                            'access': access_info['access'],
+                                            'type': access_info['type'],
+                                            'instances': matching_count,
+                                            'example': example_instance
+                                        })
+                                    else:
+                                        params_no_values.append({
+                                            'path': template_path,
+                                            'access': access_info['access'],
+                                            'type': access_info['type']
+                                        })
+                                elif has_value:
+                                    value = self.stomp.param_values_cache[endpoint][template_path]
+                                    params_with_values.append({
+                                        'path': template_path,
+                                        'access': access_info['access'],
+                                        'type': access_info['type'],
+                                        'value': value,
+                                        'instances': 1
+                                    })
+                                else:
+                                    params_no_values.append({
+                                        'path': template_path,
+                                        'access': access_info['access'],
+                                        'type': access_info['type']
+                                    })
+                            
+                            # Count total instances that can be tested
+                            total_testable = sum(p.get('instances', 1) for p in params_with_values)
+                            
+                            Logger.info(f"[ListWritable] Analysis complete: {total_testable} testable parameters", level=0)
+                            
+                            response = {
+                                "status": "ok",
+                                "endpoint": endpoint,
+                                "mode": "detailed",
+                                "total_templates": writable_count,
+                                "templates_with_values": len(params_with_values),
+                                "templates_without_values": len(params_no_values),
+                                "total_testable_params": total_testable,
+                                "params_ready": params_with_values,
+                                "params_need_get": params_no_values
+                            }
+                    else:
+                        response = {
+                            "status": "error",
+                            "msg": f"No cached writable parameters for {endpoint}. Run 'get_supported {endpoint} Device.' first."
+                        }
+                else:
+                    # List all endpoints with cached data
+                    endpoints_info = {}
+                    for ep in self.stomp.writable_params_cache.keys():
+                        writable_count = len(self.stomp.writable_params_cache[ep])
+                        values_count = len(self.stomp.param_values_cache.get(ep, {}))
+                        endpoints_info[ep] = {
+                            'writable_params': writable_count,
+                            'cached_values': values_count
+                        }
+                    
+                    response = {
+                        "status": "ok",
+                        "endpoints": endpoints_info
+                    }
+            
+            elif cmd == "test_set":
+                # test_set <endpoint> <param_path>
+                # Test setting a specific writable parameter to its cached value
+                if len(cmd_parts) >= 3:
+                    endpoint = cmd_parts[1]
+                    param_path = " ".join(cmd_parts[2:])  # Allow spaces in path
+                    
+                    # Check if parameter is in writable cache
+                    if endpoint not in self.stomp.writable_params_cache:
+                        response = {
+                            "status": "error",
+                            "msg": f"No cached writable parameters for {endpoint}. Run 'get_supported {endpoint} Device.' first."
+                        }
+                    elif endpoint not in self.stomp.param_values_cache or param_path not in self.stomp.param_values_cache[endpoint]:
+                        response = {
+                            "status": "error",
+                            "msg": f"No cached value for {param_path}. Run 'get {endpoint} <path>' first."
+                        }
+                    else:
+                        # Check if parameter is writable (exact or fuzzy match)
+                        is_writable = param_path in self.stomp.writable_params_cache[endpoint]
+                        if not is_writable:
+                            # Try fuzzy match
+                            matched_template = self.stomp._match_param_to_template(
+                                param_path, 
+                                self.stomp.writable_params_cache[endpoint].keys()
+                            )
+                            is_writable = matched_template is not None
+                        
+                        if not is_writable:
+                            response = {
+                                "status": "error",
+                                "msg": f"Parameter {param_path} not found in writable cache. It may not be writable."
+                            }
+                        else:
+                            # Get cached value and attempt SET
+                            value = self.stomp.param_values_cache[endpoint][param_path]
+                            success = self._send_usp_set(endpoint, param_path, value)
+                            response = {
+                                "status": "ok" if success else "failed",
+                                "msg": f"SET {param_path} = '{value}' {'sent successfully' if success else 'failed'}",
+                                "param": param_path,
+                                "value": value
+                            }
+                else:
+                    response = {"status": "error", "msg": "usage: test_set <endpoint> <param_path>"}
+            
+            elif cmd == "test_set_all":
+                # test_set_all <endpoint> [--delay seconds] [--batch-size N] [--batch-delay seconds] [--stop-on-fail]
+                # Test setting all writable parameters with cached values
+                delay = 0.5  # Default delay between SETs (increased for Agent protection)
+                batch_size = 100  # Progress report every N parameters
+                batch_delay = 2.0  # Additional delay between batches (Agent recovery time)
+                stop_on_fail = False  # Stop test immediately on first failure
+                
+                if len(cmd_parts) >= 2:
+                    endpoint = cmd_parts[1]
+                    
+                    # Parse optional --delay parameter
+                    if "--delay" in cmd_parts:
+                        try:
+                            delay_idx = cmd_parts.index("--delay")
+                            if delay_idx + 1 < len(cmd_parts):
+                                delay = float(cmd_parts[delay_idx + 1])
+                        except (ValueError, IndexError):
+                            pass
+                    
+                    # Parse optional --batch-size parameter
+                    if "--batch-size" in cmd_parts:
+                        try:
+                            batch_idx = cmd_parts.index("--batch-size")
+                            if batch_idx + 1 < len(cmd_parts):
+                                batch_size = int(cmd_parts[batch_idx + 1])
+                        except (ValueError, IndexError):
+                            pass
+                    
+                    # Parse optional --batch-delay parameter
+                    if "--batch-delay" in cmd_parts:
+                        try:
+                            batch_delay_idx = cmd_parts.index("--batch-delay")
+                            if batch_delay_idx + 1 < len(cmd_parts):
+                                batch_delay = float(cmd_parts[batch_delay_idx + 1])
+                        except (ValueError, IndexError):
+                            pass
+                    
+                    # Parse optional --stop-on-fail flag
+                    if "--stop-on-fail" in cmd_parts:
+                        stop_on_fail = True
+                    
+                    # Check if we have cached data
+                    if endpoint not in self.stomp.writable_params_cache:
+                        response = {
+                            "status": "error",
+                            "msg": f"No cached writable parameters for {endpoint}. Run 'get_supported {endpoint} Device.' first."
+                        }
+                    elif endpoint not in self.stomp.param_values_cache:
+                        response = {
+                            "status": "error",
+                            "msg": f"No cached values for {endpoint}. Run 'get {endpoint} Device.' first."
+                        }
+                    else:
+                        # Build test parameter list with optimized matching
+                        Logger.info(f"[TestSetAll] Analyzing writable parameters for {endpoint}...", level=0)
+                        
+                        writable = self.stomp.writable_params_cache[endpoint]
+                        values = self.stomp.param_values_cache[endpoint]
+                        
+                        # Optimize: separate exact matches from fuzzy matches
+                        test_params = []
+                        
+                        # First pass: exact matches (very fast)
+                        Logger.info(f"[TestSetAll] Finding exact matches...", level=0)
+                        exact_matches = 0
+                        for param_path in values.keys():
+                            if param_path in writable:
+                                test_params.append((param_path, values[param_path]))
+                                exact_matches += 1
+                        
+                        Logger.info(f"[TestSetAll] Found {exact_matches} exact matches", level=0)
+                        
+                        # Second pass: fuzzy matches only if needed (slower)
+                        if exact_matches < len(writable):
+                            Logger.info(f"[TestSetAll] Finding fuzzy matches (templates with {{i}})...", level=0)
+                            
+                            # Build regex pattern cache for efficiency
+                            import re
+                            template_patterns = {}
+                            fuzzy_templates = []
+                            
+                            for template_path in writable.keys():
+                                if '{i}' in template_path or '{instance}' in template_path:
+                                    fuzzy_templates.append(template_path)
+                                    # Pre-compile regex pattern
+                                    pattern = re.escape(template_path)
+                                    pattern = pattern.replace(r'\{i\}', r'\d+')
+                                    pattern = pattern.replace(r'\{instance\}', r'\d+')
+                                    pattern = '^' + pattern + '$'
+                                    template_patterns[template_path] = re.compile(pattern, re.IGNORECASE)
+                            
+                            Logger.info(f"[TestSetAll] Checking {len(fuzzy_templates)} templates against {len(values)} values...", level=0)
+                            
+                            # Match values against fuzzy templates
+                            fuzzy_matches = 0
+                            checked = 0
+                            for value_path, value in values.items():
+                                if value_path in writable:  # Skip already matched
+                                    continue
+                                
+                                checked += 1
+                                if checked % 1000 == 0:
+                                    Logger.info(f"[TestSetAll] Checked {checked}/{len(values)} values...", level=1)
+                                
+                                for template_path, pattern in template_patterns.items():
+                                    if pattern.match(value_path):
+                                        test_params.append((value_path, value))
+                                        fuzzy_matches += 1
+                                        break  # Found match, no need to check other templates
+                            
+                            Logger.info(f"[TestSetAll] Found {fuzzy_matches} fuzzy matches", level=0)
+                        
+                        if not test_params:
+                            response = {
+                                "status": "error",
+                                "msg": f"No writable parameters found. Mismatch between get_supported and get results."
+                            }
+                        else:
+                            Logger.info(f"[TestSetAll] Total testable parameters: {len(test_params)}", level=0)
+                            
+                            # Schedule batch test (non-blocking)
+                            import threading
+                            def run_batch_test():
+                                total = len(test_params)
+                                start_time = datetime.now()
+                                Logger.info(f"[Test] Starting batch SET test for {endpoint}: {total} parameters", level=0)
+                                Logger.info(f"[Test] Strategy: Wait for each SET response, adaptive delay based on Agent status", level=0)
+                                if stop_on_fail:
+                                    Logger.info(f"[Test] Mode: STOP-ON-FAIL enabled (test will abort on first failure)", level=0)
+                                
+                                success_count = 0
+                                fail_count = 0
+                                timeout_count = 0
+                                test_aborted = False
+                                
+                                # Adaptive delay parameters
+                                current_delay = max(0.1, delay)  # Start with specified delay, min 0.1s
+                                consecutive_success = 0
+                                consecutive_fails = 0
+                                
+                                Logger.info(f"[Test] Initial delay={current_delay}s, batch_delay={batch_delay}s between batches", level=0)
+                                
+                                for idx, (param_path, value) in enumerate(test_params, 1):
+                                    # First SET may take longer (Agent warm-up), use extended timeout
+                                    set_timeout = 60.0 if idx == 1 else 30.0
+                                    
+                                    if idx == 1:
+                                        Logger.info(f"[Test] First SET using extended timeout ({set_timeout}s) for Agent warm-up", level=0)
+                                    
+                                    # Send SET and wait for response
+                                    resp = self._send_usp_set(endpoint, param_path, value, wait_response=True, timeout=set_timeout)
+                                    
+                                    if resp and resp.get('status') == 'ok':
+                                        success_count += 1
+                                        consecutive_success += 1
+                                        consecutive_fails = 0
+                                        
+                                        if DEBUG_LEVEL >= 1:
+                                            Logger.info(f"  ✓ [{idx}/{total}] {param_path} = '{value}'", level=1)
+                                        
+                                        # Gradually reduce delay if many consecutive successes
+                                        if consecutive_success >= 20 and current_delay > 0.1:
+                                            current_delay = max(0.1, current_delay * 0.9)
+                                            Logger.info(f"[Adaptive] Reducing delay to {current_delay:.2f}s (consecutive success: {consecutive_success})", level=0)
+                                            consecutive_success = 0
+                                    
+                                    elif resp and resp.get('status') == 'timeout':
+                                        timeout_count += 1
+                                        fail_count += 1
+                                        consecutive_fails += 1
+                                        consecutive_success = 0
+                                        
+                                        Logger.error(f"  ⏱ [{idx}/{total}] {param_path} = '{value}' TIMEOUT (waited {set_timeout}s)", level=0)
+                                        
+                                        # Stop on fail if requested
+                                        if stop_on_fail:
+                                            Logger.error(f"[Test] ABORTED: Timeout on parameter '{param_path}' (stop-on-fail enabled)", level=0)
+                                            Logger.error(f"[Test] Failed parameter: {param_path} = '{value}'", level=0)
+                                            test_aborted = True
+                                            break
+                                        
+                                        # Increase delay significantly on timeout (Agent overloaded)
+                                        if consecutive_fails >= 3:
+                                            current_delay = min(5.0, current_delay * 2.0)
+                                            Logger.info(f"[Adaptive] Increasing delay to {current_delay:.2f}s (consecutive timeouts: {consecutive_fails})", level=0)
+                                            consecutive_fails = 0
+                                    
+                                    else:
+                                        fail_count += 1
+                                        consecutive_fails += 1
+                                        consecutive_success = 0
+                                        
+                                        error_msg = resp.get('msg', 'Unknown error') if resp else 'No response'
+                                        Logger.error(f"  ✗ [{idx}/{total}] {param_path} = '{value}' - {error_msg}", level=1)
+                                        
+                                        # Stop on fail if requested
+                                        if stop_on_fail:
+                                            Logger.error(f"[Test] ABORTED: Failed to set parameter '{param_path}' (stop-on-fail enabled)", level=0)
+                                            Logger.error(f"[Test] Failed parameter: {param_path} = '{value}' - {error_msg}", level=0)
+                                            test_aborted = True
+                                            break
+                                        
+                                        # Moderate delay increase on errors
+                                        if consecutive_fails >= 5:
+                                            current_delay = min(3.0, current_delay * 1.5)
+                                            Logger.info(f"[Adaptive] Increasing delay to {current_delay:.2f}s (consecutive failures: {consecutive_fails})", level=0)
+                                            consecutive_fails = 0
+                                    
+                                    # Progress report every batch_size parameters
+                                    if idx % batch_size == 0:
+                                        elapsed = (datetime.now() - start_time).total_seconds()
+                                        rate = idx / elapsed if elapsed > 0 else 0
+                                        remaining = (total - idx) / rate if rate > 0 else 0
+                                        Logger.info(f"[Progress] {idx}/{total} ({idx*100/total:.1f}%) - "
+                                                  f"Success: {success_count}, Failed: {fail_count}, Timeout: {timeout_count}, "
+                                                  f"Rate: {rate:.1f} params/s, Delay: {current_delay:.2f}s, ETA: {remaining:.0f}s", level=0)
+                                        
+                                        # Additional delay between batches to let Agent recover
+                                        if idx < total and batch_delay > 0:
+                                            Logger.info(f"[Progress] Pausing {batch_delay}s for Agent recovery...", level=0)
+                                            time.sleep(batch_delay)
+                                    elif idx == total:
+                                        # Final progress report
+                                        elapsed = (datetime.now() - start_time).total_seconds()
+                                        rate = idx / elapsed if elapsed > 0 else 0
+                                        Logger.info(f"[Progress] {idx}/{total} (100.0%) - "
+                                                  f"Success: {success_count}, Failed: {fail_count}, Timeout: {timeout_count}, "
+                                                  f"Rate: {rate:.1f} params/s", level=0)
+                                    
+                                    # Adaptive delay between SETs
+                                    if current_delay > 0:
+                                        time.sleep(current_delay)
+                                
+                                elapsed = (datetime.now() - start_time).total_seconds()
+                                if test_aborted:
+                                    Logger.error(f"[Test] Batch SET test ABORTED after {elapsed:.1f}s ({elapsed/60:.1f} min)", level=0)
+                                else:
+                                    Logger.info(f"[Test] Batch SET test completed in {elapsed:.1f}s ({elapsed/60:.1f} min)", level=0)
+                                Logger.info(f"[Test] Results: {success_count} succeeded, {fail_count} failed ({timeout_count} timeouts), Success rate: {success_count*100/total:.1f}%", level=0)
+                                
+                                if test_aborted:
+                                    Logger.error(f"[Test] ⚠ Test did not complete - stopped at {idx}/{total} ({idx*100/total:.1f}%)", level=0)
+                            
+                            thread = threading.Thread(target=run_batch_test, daemon=True)
+                            thread.start()
+                            
+                            # Calculate estimated time (including batch delays)
+                            num_batches = (len(test_params) + batch_size - 1) // batch_size
+                            estimated_time = len(test_params) * delay
+                            if batch_delay > 0 and num_batches > 1:
+                                estimated_time += (num_batches - 1) * batch_delay
+                            
+                            response = {
+                                "status": "ok",
+                                "msg": f"Batch SET test started for {len(test_params)} parameters (delay: {delay}s, batch_size: {batch_size}, batch_delay: {batch_delay}s, stop_on_fail: {stop_on_fail})",
+                                "async": True,  # Mark as background operation
+                                "total_params": len(test_params),
+                                "delay": delay,
+                                "batch_size": batch_size,
+                                "batch_delay": batch_delay,
+                                "stop_on_fail": stop_on_fail,
+                                "rate_limit": f"{1/delay:.1f} SET/s" if delay > 0 else "unlimited",
+                                "estimated_seconds": estimated_time,
+                                "estimated_minutes": estimated_time / 60 if estimated_time > 0 else 0
+                            }
+                else:
+                    response = {"status": "error", "msg": "usage: test_set_all <endpoint> [--delay seconds] [--batch-size N] [--batch-delay seconds] [--stop-on-fail]"}
+            
+            elif cmd == "export_cache":
+                # export_cache <endpoint> [output_prefix]
+                # Export cached data to JSON files for inspection (async)
+                if len(cmd_parts) >= 2:
+                    endpoint = cmd_parts[1]
+                    output_prefix = cmd_parts[2] if len(cmd_parts) >= 3 else "test_data"
+                    
+                    # Check if we have cache data
+                    if endpoint not in self.stomp.writable_params_cache and endpoint not in self.stomp.param_values_cache:
+                        response = {
+                            "status": "error",
+                            "msg": f"No cache data found for {endpoint}. Run get_supported and get first."
+                        }
+                    else:
+                        # Run export in background thread to avoid IPC timeout
+                        import threading
+                        import os
+                        
+                        def export_async():
+                            try:
+                                # Create temp directory if not exists
+                                temp_dir = "temp"
+                                if not os.path.exists(temp_dir):
+                                    os.makedirs(temp_dir)
+                                    Logger.info(f"[Export] Created {temp_dir}/ directory", level=0)
+                                
+                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                exported_files = []
+                                
+                                Logger.info(f"[Export] Starting cache export for {endpoint} to {temp_dir}/...", level=0)
+                                
+                                # Export writable parameters (from get_supported)
+                                if endpoint in self.stomp.writable_params_cache:
+                                    writable_file = os.path.join(temp_dir, f"{output_prefix}_writable_{timestamp}.json")
+                                    Logger.info(f"[Export] Writing {writable_file}...", level=0)
+                                    with open(writable_file, 'w', encoding='utf-8') as f:
+                                        data = {
+                                            "endpoint": endpoint,
+                                            "timestamp": timestamp,
+                                            "source": "get_supported",
+                                            "total_writable": len(self.stomp.writable_params_cache[endpoint]),
+                                            "parameters": self.stomp.writable_params_cache[endpoint]
+                                        }
+                                        json.dump(data, f, indent=2, ensure_ascii=False)
+                                    exported_files.append(writable_file)
+                                    Logger.info(f"[Export] ✓ Exported {len(self.stomp.writable_params_cache[endpoint])} writable parameters", level=0)
+                                
+                                # Export parameter values (from get)
+                                if endpoint in self.stomp.param_values_cache:
+                                    values_file = os.path.join(temp_dir, f"{output_prefix}_values_{timestamp}.json")
+                                    Logger.info(f"[Export] Writing {values_file} (this may take a while for large datasets)...", level=0)
+                                    with open(values_file, 'w', encoding='utf-8') as f:
+                                        data = {
+                                            "endpoint": endpoint,
+                                            "timestamp": timestamp,
+                                            "source": "get",
+                                            "total_values": len(self.stomp.param_values_cache[endpoint]),
+                                            "parameters": self.stomp.param_values_cache[endpoint]
+                                        }
+                                        json.dump(data, f, indent=2, ensure_ascii=False)
+                                    exported_files.append(values_file)
+                                    Logger.info(f"[Export] ✓ Exported {len(self.stomp.param_values_cache[endpoint])} parameter values", level=0)
+                                
+                                # Create matching report
+                                if endpoint in self.stomp.writable_params_cache and endpoint in self.stomp.param_values_cache:
+                                    match_file = os.path.join(temp_dir, f"{output_prefix}_matched_{timestamp}.json")
+                                    Logger.info(f"[Export] Analyzing matches and writing {match_file}...", level=0)
+                                    
+                                    writable = self.stomp.writable_params_cache[endpoint]
+                                    values = self.stomp.param_values_cache[endpoint]
+                                    
+                                    matched_params = []
+                                    unmatched_templates = []
+                                    
+                                    for template_path, access_info in writable.items():
+                                        # Try exact match
+                                        if template_path in values:
+                                            matched_params.append({
+                                                "template": template_path,
+                                                "instance": template_path,
+                                                "value": values[template_path],
+                                                "access": access_info['access'],
+                                                "type": access_info['type'],
+                                                "match_type": "exact"
+                                            })
+                                        else:
+                                            # Try fuzzy match
+                                            matching_instances = []
+                                            for instance_path in values.keys():
+                                                if self.stomp._match_param_to_template(instance_path, [template_path]):
+                                                    matching_instances.append({
+                                                        "instance": instance_path,
+                                                        "value": values[instance_path]
+                                                    })
+                                            
+                                            if matching_instances:
+                                                for match in matching_instances:
+                                                    matched_params.append({
+                                                        "template": template_path,
+                                                        "instance": match["instance"],
+                                                        "value": match["value"],
+                                                        "access": access_info['access'],
+                                                        "type": access_info['type'],
+                                                        "match_type": "fuzzy"
+                                                    })
+                                            else:
+                                                unmatched_templates.append({
+                                                    "template": template_path,
+                                                    "access": access_info['access'],
+                                                    "type": access_info['type'],
+                                                    "reason": "No matching instances found in get results"
+                                                })
+                                    
+                                    with open(match_file, 'w', encoding='utf-8') as f:
+                                        data = {
+                                            "endpoint": endpoint,
+                                            "timestamp": timestamp,
+                                            "source": "matching_analysis",
+                                            "total_writable_templates": len(writable),
+                                            "total_value_instances": len(values),
+                                            "matched_count": len(matched_params),
+                                            "unmatched_count": len(unmatched_templates),
+                                            "matched_parameters": matched_params,
+                                            "unmatched_templates": unmatched_templates
+                                        }
+                                        json.dump(data, f, indent=2, ensure_ascii=False)
+                                    exported_files.append(match_file)
+                                    Logger.info(f"[Export] ✓ Matched {len(matched_params)} parameters, {len(unmatched_templates)} unmatched", level=0)
+                                
+                                # Final summary
+                                Logger.info(f"[Export] ✓ Export complete! Created {len(exported_files)} file(s):", level=0)
+                                for f in exported_files:
+                                    Logger.info(f"[Export]   • {f}", level=0)
+                                    
+                            except Exception as e:
+                                Logger.error(f"[Export] Failed: {e}", level=0)
+                        
+                        # Start export in background
+                        thread = threading.Thread(target=export_async, daemon=True)
+                        thread.start()
+                        
+                        # Immediate response
+                        writable_count = len(self.stomp.writable_params_cache.get(endpoint, {}))
+                        values_count = len(self.stomp.param_values_cache.get(endpoint, {}))
+                        
+                        response = {
+                            "status": "ok",
+                            "msg": f"Export started in background for {endpoint} ({writable_count} writable templates, {values_count} values). Check logs for progress.",
+                            "async": True,
+                            "writable_count": writable_count,
+                            "values_count": values_count
+                        }
+                else:
+                    response = {"status": "error", "msg": "Usage: export_cache <endpoint> [output_prefix]"}
+            
+            elif cmd == "clear_temp":
+                # clear_temp
+                # Clear temporary files from temp/ directory
+                import os
+                import shutil
+                
+                temp_dir = "temp"
+                if os.path.exists(temp_dir):
+                    try:
+                        file_count = len([f for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))])
+                        shutil.rmtree(temp_dir)
+                        Logger.info(f"[Cleanup] Removed {temp_dir}/ directory with {file_count} file(s)", level=0)
+                        response = {
+                            "status": "ok",
+                            "msg": f"Cleared {file_count} temporary file(s)"
+                        }
+                    except Exception as e:
+                        response = {
+                            "status": "error",
+                            "msg": f"Failed to clear temp directory: {e}"
+                        }
+                else:
+                    response = {
+                        "status": "ok",
+                        "msg": "No temp directory found (nothing to clear)"
+                    }
+            
+            elif cmd == "clear_cache":
+                # clear_cache [endpoint]
+                # Clear cached writable parameters and values
+                if len(cmd_parts) >= 2:
+                    endpoint = cmd_parts[1]
+                    cleared = 0
+                    if endpoint in self.stomp.writable_params_cache:
+                        del self.stomp.writable_params_cache[endpoint]
+                        cleared += 1
+                    if endpoint in self.stomp.param_values_cache:
+                        del self.stomp.param_values_cache[endpoint]
+                        cleared += 1
+                    
+                    response = {
+                        "status": "ok",
+                        "msg": f"Cleared cache for {endpoint}" if cleared > 0 else f"No cache found for {endpoint}"
+                    }
+                else:
+                    # Clear all caches
+                    writable_count = len(self.stomp.writable_params_cache)
+                    values_count = len(self.stomp.param_values_cache)
+                    self.stomp.writable_params_cache.clear()
+                    self.stomp.param_values_cache.clear()
+                    
+                    response = {
+                        "status": "ok",
+                        "msg": f"Cleared all caches ({writable_count} endpoints with writable params, {values_count} with values)"
+                    }
+            
             elif cmd == "mdns_scan":
                 # Active mDNS scan
                 # mdns_scan [timeout]
@@ -1710,7 +2442,7 @@ class IPCServer(threading.Thread):
             except: 
                 pass
 
-    def _send_usp_get(self, endpoint, path, wait_response=False, timeout=15.0):
+    def _send_usp_get(self, endpoint, path, wait_response=False, timeout=30.0):
         """Helper to construct USP Get"""
         import queue
         from datetime import datetime
@@ -1768,8 +2500,30 @@ class IPCServer(threading.Thread):
         
         return True
     
-    def _send_usp_set(self, endpoint, path, value):
-        """Helper to construct USP Set"""
+    def _send_usp_set(self, endpoint, path, value, wait_response=False, timeout=30.0):
+        """Helper to construct USP Set
+        
+        Args:
+            endpoint: Target device endpoint ID
+            path: Parameter path to set
+            value: Value to set
+            wait_response: If True, wait for and return the response
+            timeout: Timeout in seconds when wait_response=True
+            
+        Returns:
+            If wait_response=True: response dict with status/msg, or timeout dict
+            If wait_response=False: True/False for send success
+        """
+        import queue
+        from datetime import datetime
+        
+        # Check for duplicate request
+        request_key = (endpoint, 'set', path)
+        if wait_response and request_key in self.stomp.pending_requests:
+            existing_msg_id = self.stomp.pending_requests[request_key]
+            if existing_msg_id in self.stomp.pending_ipc_requests:
+                return {"status": "error", "msg": "Duplicate request already pending"}
+        
         msg_id = str(uuid.uuid4())
         usp_msg = msg_pb2.Msg()
         usp_msg.header.msg_id = msg_id
@@ -1791,7 +2545,45 @@ class IPCServer(threading.Thread):
             param_setting.value = value
             param_setting.required = True
         
-        return self._send_usp_message(endpoint, usp_msg)
+        # If wait_response, register for response tracking
+        result_queue = None
+        if wait_response:
+            result_queue = queue.Queue()
+            self.stomp.pending_ipc_requests[msg_id] = {
+                'endpoint': endpoint,
+                'command': 'set',
+                'path': path,
+                'result_queue': result_queue,
+                'timestamp': datetime.now()
+            }
+            self.stomp.pending_requests[request_key] = msg_id
+        
+        success = self._send_usp_message(endpoint, usp_msg)
+        
+        if not success:
+            if wait_response and msg_id in self.stomp.pending_ipc_requests:
+                del self.stomp.pending_ipc_requests[msg_id]
+                if request_key in self.stomp.pending_requests:
+                    del self.stomp.pending_requests[request_key]
+            return None if wait_response else False
+        
+        # Wait for response if requested
+        if wait_response:
+            try:
+                result = result_queue.get(timeout=timeout)
+                # Clean up tracking
+                if request_key in self.stomp.pending_requests:
+                    del self.stomp.pending_requests[request_key]
+                return result
+            except queue.Empty:
+                # Timeout - clean up
+                if msg_id in self.stomp.pending_ipc_requests:
+                    del self.stomp.pending_ipc_requests[msg_id]
+                if request_key in self.stomp.pending_requests:
+                    del self.stomp.pending_requests[request_key]
+                return {"status": "timeout", "msg": f"No response after {timeout}s"}
+        
+        return True
     
     def _send_usp_add(self, endpoint, obj_path):
         """Helper to construct USP Add"""
@@ -1817,22 +2609,33 @@ class IPCServer(threading.Thread):
         
         return self._send_usp_message(endpoint, usp_msg)
     
-    def _send_usp_get_supported_dm(self, endpoint, obj_path="Device."):
-        """Helper to construct USP GetSupportedDM"""
+    def _send_usp_get_supported_dm(self, endpoint, obj_path="Device.", 
+                                   first_level_only=False, return_commands=True, 
+                                   return_events=True, return_params=True):
+        """Helper to construct USP GetSupportedDM
+        
+        Args:
+            endpoint: Target device endpoint ID
+            obj_path: Data model path to query (default: "Device.")
+            first_level_only: Only return first level children (default: False)
+            return_commands: Include commands in response (default: True)
+            return_events: Include events in response (default: True)
+            return_params: Include parameters in response (default: True)
+        """
         msg_id = str(uuid.uuid4())
         usp_msg = msg_pb2.Msg()
         usp_msg.header.msg_id = msg_id
         usp_msg.header.msg_type = msg_pb2.Header.MsgType.GET_SUPPORTED_DM
         
         usp_msg.body.request.get_supported_dm.obj_paths.append(obj_path)
-        usp_msg.body.request.get_supported_dm.first_level_only = False
-        usp_msg.body.request.get_supported_dm.return_commands = True
-        usp_msg.body.request.get_supported_dm.return_events = True
-        usp_msg.body.request.get_supported_dm.return_params = True
+        usp_msg.body.request.get_supported_dm.first_level_only = first_level_only
+        usp_msg.body.request.get_supported_dm.return_commands = return_commands
+        usp_msg.body.request.get_supported_dm.return_events = return_events
+        usp_msg.body.request.get_supported_dm.return_params = return_params
         
         return self._send_usp_message(endpoint, usp_msg)
     
-    def _send_usp_get_instances(self, endpoint, obj_path, wait_response=False, timeout=15.0):
+    def _send_usp_get_instances(self, endpoint, obj_path, wait_response=False, timeout=30.0):
         """Helper to construct USP GetInstances"""
         import queue
         from datetime import datetime

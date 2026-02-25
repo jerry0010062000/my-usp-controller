@@ -1,0 +1,22 @@
+# ===================================================================
+# prplOS 1.1.6 - Verify Port PacketsSent statistics
+# ===================================================================
+# Auto-discovery version: Works across any environment
+# ===================================================================
+
+# ===================================================================
+# Step 1: Auto-discover Bridge and Port instances
+# ===================================================================
+discover_bridge_port lan lan
+
+# ===================================================================
+# Step 2: Get Port parameters from the data model
+# ===================================================================
+get {ENDPOINT} Device.Bridging.Bridge.{BRIDGE_INST}.Port.{PORT_INST}.
+
+# ===================================================================
+# Step 3: Get Port PacketsSent statistics
+# ===================================================================
+get {ENDPOINT} Device.Bridging.Bridge.{BRIDGE_INST}.Port.{PORT_INST}.Stats.PacketsSent
+
+# Note: Verify manually that PacketsSent value is reasonable

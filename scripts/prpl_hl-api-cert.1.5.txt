@@ -1,0 +1,33 @@
+# USP Controller Test Script
+# Test Sequence: prpl Profile Add and Delete verification
+# Converted from ba-cli format to USP controller commands
+# Usage: Run each command in interactive mode or via IPC
+#
+# Format: <command> <endpoint> <path> [value]
+# Commands: get, set, add, delete, get_supported, get_instances
+# Note: {ENDPOINT} will be replaced with actual endpoint ID at runtime
+
+# ===================================================================
+# 1. Verify prpl Profile using Add and Delete on creatable objects
+# ===================================================================
+
+# First, initiate a Get on the top level object to discover existing instances
+get {ENDPOINT} Device.
+
+# The test procedure involves:
+# 1. Finding all objects that can be created per profile definition.
+# 2. For each, attempt to create a new instance using Add.
+#
+# Representative command (example for adding a new bridge):
+# add {ENDPOINT} Device.Bridging.Bridge.
+# get_instances {ENDPOINT} Device.Bridging.Bridge.
+#
+# 3. Verify sub-parameters of the new instance.
+# get {ENDPOINT} Device.Bridging.Bridge.{INSTANCE}.
+#
+# 4. Delete the newly created object instance.
+# delete {ENDPOINT} Device.Bridging.Bridge.{INSTANCE}.
+
+# Note: The DUT must allow all Adds and Deletes. Any failure results 
+# in test failure. In a scripted environment, this would loop over 
+# all creatable paths defined in the profile.

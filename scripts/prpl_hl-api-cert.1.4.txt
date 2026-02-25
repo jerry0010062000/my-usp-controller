@@ -1,0 +1,104 @@
+# USP Controller Test Script
+# Test Sequence: prpl Profile verification using SET
+# Converted from ba-cli format to USP controller commands
+# Usage: Run each command in interactive mode or via IPC
+#
+# Format: <command> <endpoint> <path> [value]
+# Commands: get, set, add, delete, get_supported, get_instances
+# Note: {ENDPOINT} will be replaced with actual endpoint ID at runtime
+#
+# AUTOMATED TEST METHODS:
+#
+# Method 1: Fully automated batch test
+#   python scripts/test_set_writable.py <endpoint_id> --param-file test_set_params.txt
+#
+# Method 2: Interactive step-by-step testing (NEW - Recommended for detailed verification)
+#   This method caches parameters and allows testing one by one:
+#
+#   Step 1: Cache writable parameters
+#     get_supported {ENDPOINT} Device. false false false true
+#
+#   Step 2: Cache current values  
+#     get {ENDPOINT} Device.
+#
+#   Step 3: List writable parameters with cached values
+#     list_writable {ENDPOINT}
+#
+#   Step 4: Test individual parameters one by one
+#     test_set {ENDPOINT} Device.DeviceInfo.ProvisioningCode
+#     test_set {ENDPOINT} Device.DeviceInfo.Description
+#     ... (test each parameter individually)
+#
+#   Step 5: Or test all at once with delay
+#     test_set_all {ENDPOINT} --delay 0.5
+#
+#   Step 6: Clear cache when done
+#     clear_cache {ENDPOINT}
+#
+#   See scripts/test_set_params_example.txt for parameter file format
+
+# ===================================================================
+# 1. Verify prpl Profile using SET
+# ===================================================================
+
+# Step 1: Get supported data model to identify writable parameters
+# This returns parameter access attributes and caches writable parameters automatically
+# Arguments: obj_path, first_level_only=false, return_commands=false, return_events=false, return_params=true
+get_supported {ENDPOINT} Device. false false false true
+
+# Step 2: Get all current parameter values (use extended timeout for large devices)
+# This retrieves the current state and caches values automatically
+get {ENDPOINT} Device. --timeout 120
+
+# Step 3: Export cached data to JSON files for verification (stored in temp/)
+# This will create 3 files in temp/ directory: writable params, values, and matching analysis
+# Export runs in BACKGROUND to avoid timeout on large datasets (17K+ params)
+# Files: temp/test_data_writable_TIMESTAMP.json, temp/test_data_values_TIMESTAMP.json, temp/test_data_matched_TIMESTAMP.json
+# Note: Check daemon logs for export completion status
+# These temporary files will be automatically deleted when script completes or is terminated
+export_cache {ENDPOINT} test_data
+
+# Step 4: List writable parameters with their cached values (FAST mode)
+# Using --simple for instant response, avoiding timeout on large datasets
+# This shows summary statistics only
+list_writable {ENDPOINT} --simple
+
+# Step 5: Execute batch SET test for all writable parameters
+# This will test setting each writable parameter back to its current value
+# Using 0.3s delay between SETs and 2s pause between batches for Agent protection
+# Rate limited to ~3 SET/s to prevent Agent overload
+# Progress reports every 50 parameters
+# 
+# Add --stop-on-fail flag to abort test immediately on first failure (recommended for certification)
+test_set_all {ENDPOINT} --delay 0.3 --batch-size 50 --batch-delay 2 --stop-on-fail
+
+# Alternative Step 5: Test individual parameters (uncomment if needed)
+# Uncomment specific lines below to test parameters one by one:
+#
+# test_set {ENDPOINT} Device.DeviceInfo.ProvisioningCode
+# test_set {ENDPOINT} Device.DeviceInfo.Description
+# test_set {ENDPOINT} Device.ManagementServer.PeriodicInformInterval
+# test_set {ENDPOINT} Device.ManagementServer.ConnectionRequestUsername
+# test_set {ENDPOINT} Device.ManagementServer.ConnectionRequestPassword
+# test_set {ENDPOINT} Device.Time.NTPServer1
+
+# Step 6: Clear cache when testing is complete (optional)
+clear_cache {ENDPOINT}
+
+# Note 1: The DUT must allow all Sets. Any failed Sets will result 
+# in failing the test case. All parameters marked as writable in the 
+# profile must successfully accept their current value via SET.
+# Using --stop-on-fail will abort the test immediately on first failure.
+#
+# Note 2: Temporary files (export_cache outputs) are stored in temp/ directory
+# and will be automatically deleted when script completes or is terminated.
+# To manually clear temp files, use: clear_temp
+#
+# Expected behavior:
+# - export_cache creates JSON files in temp/ for manual inspection
+# - test_set_all will automatically test ALL writable parameters
+# - With --stop-on-fail, test aborts immediately on any failure
+# - Progress will be displayed every 50 parameters
+# - Time estimation and ETA will be shown
+# - Final success rate will be reported
+# - Temp files automatically cleaned up on completion/termination

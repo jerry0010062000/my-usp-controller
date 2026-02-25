@@ -24,15 +24,7 @@
     "status": "success"
   },
   {
-    "timestamp": "2026-01-29T17:52:44.970478",
-    "action": "GET",
-    "endpoint": "proto::agent-id",
-    "path": "Device.LocalAgent.1.",
-    "value": "",
-    "status": "success"
-  },
-  {
-    "timestamp": "2026-02-03T10:32:37.619732",
+    "timestamp": "2026-02-03T15:37:21.074669",
     "action": "GET",
     "endpoint": "proto::agent-id",
     "path": "Device.LocalAgent.MTP.1.",
@@ -54,5 +46,45 @@
     "path": "Device.LocalAgent.",
     "value": "",
     "status": "success"
+  },
+  {
+    "timestamp": "2026-02-11T14:25:30.806651",
+    "action": "GetSupportedDM",
+    "endpoint": "proto::agent-id",
+    "path": "Device.LocalAgent.",
+    "value": "192.168.1.5",
+    "status": "pending"
+  },
+  {
+    "timestamp": "2026-02-03T17:48:37.168057",
+    "action": "GET",
+    "endpoint": "proto::agent-id",
+    "path": "Device.WiFi.",
+    "value": "192.168.1.5",
+    "status": "pending"
+  },
+  {
+    "timestamp": "2026-02-12T11:02:37.369867",
+    "action": "GET",
+    "endpoint": "proto::agent-opl",
+    "path": "Device.LocalAgent.MTP.1.",
+    "value": "192.168.1.5",
+    "status": "success"
+  },
+  {
+    "timestamp": "2026-02-25T16:39:15.599591",
+    "action": "GET",
+    "endpoint": "proto::agent-opl",
+    "path": "Device.WiFi.",
+    "value": "192.168.1.5",
+    "status": "pending"
+  },
+  {
+    "timestamp": "2026-02-13T11:34:57.701633",
+    "action": "GET",
+    "endpoint": "proto::agent-opl",
+    "path": "Device.",
+    "value": "192.168.1.5",
+    "status": "error"
   }
 ]

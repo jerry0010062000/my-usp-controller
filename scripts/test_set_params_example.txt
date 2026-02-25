@@ -1,0 +1,29 @@
+# Example writable parameters for SET testing
+# Format: <parameter_path> <value>
+# Lines starting with # are comments
+#
+# This file contains common writable parameters in the prpl profile.
+# Adjust values according to your device's current state.
+
+# Device Information
+Device.DeviceInfo.ProvisioningCode test-provision-code
+Device.DeviceInfo.Description Test Device Description
+
+# Management Server settings (if applicable)
+# Device.ManagementServer.PeriodicInformInterval 3600
+# Device.ManagementServer.ConnectionRequestUsername admin
+# Device.ManagementServer.ConnectionRequestPassword secret123
+
+# Time settings
+# Device.Time.NTPServer1 pool.ntp.org
+# Device.Time.Enable true
+
+# Interface settings (replace {i} with actual instance number)
+# Device.IP.Interface.1.Enable true
+# Device.DHCPv4.Client.1.Enable true
+
+# Bridging settings (replace {i} with actual instance number)
+# Device.Bridging.Bridge.1.Enable true
+
+# Note: Uncomment and modify the parameters you want to test
+# Make sure the values match the current state of your device

@@ -34,7 +34,7 @@ class IPCClient:
         """Send command string and return JSON response. Blocking call."""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(20.0)  # Extended timeout for GET/GetInstances (15s) + buffer
+                s.settimeout(30.0)  # Extended timeout for GET/GetInstances (30s)
                 s.connect((self.host, self.port))
                 s.sendall(cmd.encode('utf-8'))
                 
@@ -55,7 +55,7 @@ class IPCClient:
                 data = b''.join(data_chunks).decode('utf-8')
                 return json.loads(data)
         except socket.timeout:
-            return {"status": "error", "msg": "Connection timeout (20s) - daemon may be busy"}
+            return {"status": "error", "msg": "Connection timeout (30s) - daemon may be busy"}
         except ConnectionRefusedError:
             return None
         except ConnectionResetError:
@@ -694,6 +694,25 @@ class USPControllerGUI:
                 if not line:
                     continue
                 
+                # Check for discover_bridge_port command (before variable replacement)
+                if line.strip().startswith('discover_bridge_port'):
+                    parts = line.strip().split()
+                    if len(parts) >= 3:
+                        bridge_alias = parts[1]
+                        port_alias = parts[2]
+                        self._script_log(f"[{i}] Special Command: discover_bridge_port {bridge_alias} {port_alias}\n", 'command')
+                        success = self._discover_bridge_port_inline(endpoint, bridge_alias, port_alias)
+                        if success:
+                            executed += 1
+                        else:
+                            failed += 1
+                    else:
+                        self._script_log(f"[{i}] [ERROR] Invalid discover_bridge_port syntax\n", 'error')
+                        self._script_log("    Usage: discover_bridge_port <bridge_alias> <port_alias>\n", 'info')
+                        failed += 1
+                    time.sleep(0.5)
+                    continue
+                
                 # Replace endpoint variable
                 line = line.replace('{ENDPOINT}', endpoint)
                 
@@ -737,7 +756,38 @@ class USPControllerGUI:
                     
                     if resp and resp.get('status') == 'ok':
                         actual_value = resp.get('msg', 'OK')
-                        self._script_log(f"    ✓ SUCCESS: {actual_value}\n", 'success')
+                        
+                        # Special handling for export_cache command (async)
+                        if 'export_cache' in cmd.lower():
+                            self._script_log(f"    ✓ SUCCESS: {actual_value}\n", 'success')
+                            if resp.get('async'):
+                                self._script_log(f"       ⏳ Export running in background - check logs for completion\n", 'info')
+                                self._script_log(f"       📊 {resp.get('writable_count', 0)} writable templates, {resp.get('values_count', 0)} values\n", 'data')
+                            else:
+                                files = resp.get('files', [])
+                                if files:
+                                    self._script_log(f"\n    📁 Exported Files:\n", 'info')
+                                    for f in files:
+                                        self._script_log(f"       • {f}\n", 'data')
+                                    self._script_log(f"\n", 'info')
+                        
+                        # Special handling for test_set_all command (async with progress)
+                        elif 'test_set_all' in cmd.lower():
+                            self._script_log(f"    ✓ SUCCESS: {actual_value}\n", 'success')
+                            if resp.get('async'):
+                                # Show test info
+                                total_params = resp.get('total_params', 0)
+                                rate_limit = resp.get('rate_limit', 'N/A')
+                                est_minutes = resp.get('estimated_minutes', 0)
+                                
+                                self._script_log(f"       ⏳ Batch SET test running in background\n", 'info')
+                                self._script_log(f"       📊 Total: {total_params} parameters, Rate: {rate_limit}, ETA: {est_minutes:.1f} min\n", 'data')
+                                self._script_log(f"       🔄 Polling for progress (this may take a while)...\n\n", 'info')
+                                
+                                # Poll logs for progress
+                                self._poll_test_progress()
+                        else:
+                            self._script_log(f"    ✓ SUCCESS: {actual_value}\n", 'success')
                         
                         # Try to extract instance number for ADD or GetInstances commands
                         if 'add' in cmd.lower() or 'get_instances' in cmd.lower():
@@ -785,6 +835,17 @@ class USPControllerGUI:
             self._script_log(f"\n[ERROR] Failed to run script: {e}\n", 'error')
             self.lbl_script_status.config(text="Error occurred")
         finally:
+            # Clean up temporary files
+            try:
+                self._script_log(f"\n[Cleanup] Clearing temporary files...\n", 'info')
+                cleanup_resp = self.ipc.send_command("clear_temp")
+                if cleanup_resp and cleanup_resp.get('status') == 'ok':
+                    self._script_log(f"    ✓ {cleanup_resp.get('msg', 'Temp files cleared')}\n", 'success')
+                else:
+                    self._script_log(f"    ⚠ {cleanup_resp.get('msg', 'Failed to clear temp files')}\n", 'error')
+            except Exception as cleanup_error:
+                self._script_log(f"    ⚠ Cleanup error: {cleanup_error}\n", 'error')
+            
             self.script_running = False
             self.btn_run_script.configure(state='normal')
             self.btn_stop_script.configure(state='disabled')
@@ -825,6 +886,97 @@ class USPControllerGUI:
         
         return None
     
+    def _discover_bridge_port_inline(self, endpoint, bridge_alias, port_alias):
+        """Discover Bridge/Port and save to script variables"""
+        import re
+        
+        self._script_log(f"    [DISCOVER] Finding Bridge (Alias='{bridge_alias}') and Port (Alias='{port_alias}')...\n", 'info')
+        
+        # Find Bridge
+        bridge_inst = self._find_bridge_inst(endpoint, bridge_alias)
+        if not bridge_inst:
+            self._script_log(f"    [FAILED] Could not find Bridge with Alias='{bridge_alias}'\n", 'error')
+            return False
+        
+        # Find Port
+        port_inst = self._find_port_inst(endpoint, bridge_inst, port_alias)
+        if not port_inst:
+            self._script_log(f"    [FAILED] Could not find Port with Alias='{port_alias}'\n", 'error')
+            return False
+        
+        # Save to variables
+        self.script_variables['BRIDGE_INST'] = bridge_inst
+        self.script_variables['PORT_INST'] = port_inst
+        
+        self._script_log(f"    [SUCCESS] Discovery completed:\n", 'success')
+        self._script_log(f"      BRIDGE_INST = {bridge_inst}\n", 'info')
+        self._script_log(f"      PORT_INST = {port_inst}\n", 'info')
+        self._script_log(f"      Full path: Device.Bridging.Bridge.{bridge_inst}.Port.{port_inst}.\n", 'info')
+        
+        return True
+    
+    def _find_bridge_inst(self, endpoint, target_alias):
+        """Find Bridge instance by Alias"""
+        import re
+        
+        # Try Search Path
+        cmd = f'get {endpoint} Device.Bridging.Bridge.[Alias="{target_alias}"].'
+        resp = self.ipc.send_command(cmd)
+        if resp and resp.get('status') == 'ok' and resp.get('msg'):
+            msg = resp.get('msg', '')
+            match = re.search(r'Device\.Bridging\.Bridge\.(\d+)\.', msg)
+            if match:
+                return match.group(1)
+        
+        # Fallback: Get all instances
+        cmd = f'get_instances {endpoint} Device.Bridging.Bridge.'
+        resp = self.ipc.send_command(cmd)
+        if not resp or resp.get('status') != 'ok':
+            return None
+        
+        instances = re.findall(r'Device\.Bridging\.Bridge\.(\d+)\.', resp.get('msg', ''))
+        
+        for inst in instances:
+            cmd = f'get {endpoint} Device.Bridging.Bridge.{inst}.Alias'
+            resp = self.ipc.send_command(cmd)
+            if resp and resp.get('status') == 'ok':
+                msg = resp.get('msg', '')
+                if f'={target_alias}' in msg or f'= {target_alias}' in msg:
+                    return inst
+        
+        return None
+    
+    def _find_port_inst(self, endpoint, bridge_inst, target_alias):
+        """Find Port instance by Alias"""
+        import re
+        
+        # Try Search Path
+        cmd = f'get {endpoint} Device.Bridging.Bridge.{bridge_inst}.Port.[Alias="{target_alias}"].'
+        resp = self.ipc.send_command(cmd)
+        if resp and resp.get('status') == 'ok' and resp.get('msg'):
+            msg = resp.get('msg', '')
+            match = re.search(r'\.Port\.(\d+)\.', msg)
+            if match:
+                return match.group(1)
+        
+        # Fallback: Get all instances
+        cmd = f'get_instances {endpoint} Device.Bridging.Bridge.{bridge_inst}.Port.'
+        resp = self.ipc.send_command(cmd)
+        if not resp or resp.get('status') != 'ok':
+            return None
+        
+        instances = re.findall(r'\.Port\.(\d+)\.', resp.get('msg', ''))
+        
+        for inst in instances:
+            cmd = f'get {endpoint} Device.Bridging.Bridge.{bridge_inst}.Port.{inst}.Alias'
+            resp = self.ipc.send_command(cmd)
+            if resp and resp.get('status') == 'ok':
+                msg = resp.get('msg', '')
+                if f'={target_alias}' in msg or f'= {target_alias}' in msg:
+                    return inst
+        
+        return None
+    
     def _parse_script_line(self, line):
         """Parse script line into IPC command"""
         # Check for expected value assertion
@@ -836,6 +988,24 @@ class USPControllerGUI:
             if expect_part.lower().startswith('expect:'):
                 expected_value = expect_part[7:].strip()
         
+        # Check for new cache-based test commands and special parameters
+        parts = line.split(maxsplit=1)
+        if len(parts) >= 1:
+            cmd = parts[0].lower()
+            
+            # Commands that work directly with the full line
+            if cmd in ['list_writable', 'clear_cache', 'test_set', 'test_set_all', 'export_cache']:
+                # These commands are passed directly to IPC
+                return (line, expected_value)
+            
+            # Commands with special parameters
+            if cmd in ['get', 'get_instances'] and '--timeout' in line:
+                return (line, expected_value)
+            
+            if cmd == 'get_supported' and ('false' in line.lower() or 'true' in line.lower()):
+                return (line, expected_value)
+        
+        # Parse standard command format
         parts = line.split(maxsplit=3)
         if len(parts) < 3:
             return None
@@ -863,6 +1033,79 @@ class USPControllerGUI:
         self.txt_script_log.insert(tk.END, text, tag)
         self.txt_script_log.see(tk.END)
         self.txt_script_log.configure(state='disabled')
+
+    def _poll_test_progress(self):
+        """Poll daemon logs for test_set_all progress and display in script log"""
+        import time
+        
+        completed = False
+        last_id = self.last_log_id
+        poll_count = 0
+        max_polls = 7200  # Max 1 hour (7200 * 0.5s = 3600s)
+        
+        while not completed and poll_count < max_polls and self.script_running:
+            poll_count += 1
+            
+            try:
+                # Poll logs from daemon
+                resp = self.ipc.send_command(f"poll_logs {last_id}")
+                
+                if resp and resp.get("status") == "ok":
+                    logs = resp.get("logs", [])
+                    new_last_id = resp.get("last_id", last_id)
+                    
+                    # Process each log entry
+                    for log in logs:
+                        msg = log.get('msg', '')
+                        log_id = log.get('id', 0)
+                        
+                        # Check for test-related messages
+                        is_test_msg = (
+                            '[Test]' in msg or 
+                            '[Progress]' in msg or 
+                            '[TestSetAll]' in msg or
+                            (msg.strip().startswith('✓') and '[' in msg and '/' in msg) or
+                            (msg.strip().startswith('✗') and '[' in msg and '/' in msg)
+                        )
+                        
+                        if is_test_msg:
+                            # Display in script log
+                            if '[Test]' in msg and 'completed' in msg:
+                                self._script_log(f"       {msg}\n", 'success')
+                                completed = True
+                            elif '[Test]' in msg and 'Results:' in msg:
+                                self._script_log(f"       {msg}\n", 'data')
+                            elif '[Progress]' in msg:
+                                self._script_log(f"       {msg}\n", 'info')
+                            elif msg.strip().startswith('✓'):
+                                self._script_log(f"       {msg}\n", 'success')
+                            elif msg.strip().startswith('✗'):
+                                self._script_log(f"       {msg}\n", 'error')
+                            else:
+                                self._script_log(f"       {msg}\n", 'info')
+                        
+                        # Update last processed log id
+                        if log_id > last_id:
+                            last_id = log_id
+                    
+                    # Update global last_log_id
+                    if new_last_id > self.last_log_id:
+                        self.last_log_id = new_last_id
+                
+            except Exception as e:
+                # Continue polling even on error
+                pass
+            
+            # Sleep before next poll
+            time.sleep(0.5)
+        
+        # Final check if we timed out
+        if not completed and poll_count >= max_polls:
+            self._script_log(f"       ⚠ Timeout waiting for test completion (1 hour limit)\n", 'error')
+        elif not completed and not self.script_running:
+            self._script_log(f"       ⚠ Test interrupted by user\n", 'error')
+        else:
+            self._script_log(f"\n", 'info')
 
     def _get_tag_for_type(self, log_type):
         """Return color tag for log type"""

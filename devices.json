@@ -1,6 +1,10 @@
 {
   "proto::agent-id": {
     "reply_to": "/queue/usp.agent.atnt-prpl",
-    "last_seen": "2026-02-03T10:32:58.745800"
+    "last_seen": "2026-02-12T09:38:47.008660"
+  },
+  "proto::agent-opl": {
+    "reply_to": "/queue/usp.agent.opl",
+    "last_seen": "2026-02-13T13:27:43.338827"
   }
 }

@@ -1,0 +1,31 @@
+# USP Controller Test Script
+# Test Sequence: prpl Profile GetSupportedDM from top level
+# Converted from ba-cli format to USP controller commands
+# Usage: Run each command in interactive mode or via IPC
+#
+# Format: <command> <endpoint> <path> [value]
+# Commands: get, set, add, delete, get_supported, get_instances
+# Note: {ENDPOINT} will be replaced with actual endpoint ID at runtime
+
+# ===================================================================
+# 1. Verify prpl Profile GetSupportedDM from top level
+# ===================================================================
+
+# Initiate a GetSupportedDM on the top level object for the profile
+# This command verifies all objects, parameters, events, and commands 
+# in the supported data model starting from 'Device.'
+# 
+# Command syntax:
+#   get_supported <endpoint> <obj_path> [first_level_only] [return_commands] [return_events] [return_params]
+# 
+# Arguments used:
+#   obj_path: Device.
+#   first_level_only: false (traverse entire tree)
+#   return_commands: true (include commands)
+#   return_events: true (include events)
+#   return_params: true (include parameters)
+get_supported {ENDPOINT} Device. false true true true
+
+# Note: The test procedure expects all returned names to be verified 
+# against the profile definitions. All the required objects, parameters,
+# events, and commands must be present for the test to pass.

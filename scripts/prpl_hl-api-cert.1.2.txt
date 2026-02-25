@@ -1,0 +1,33 @@
+# USP Controller Test Script
+# Test Sequence: prpl Profile parameters Write requirement verification
+# Converted from ba-cli format to USP controller commands
+# Usage: Run each command in interactive mode or via IPC
+#
+# Format: <command> <endpoint> <path> [value]
+# Commands: get, set, add, delete, get_supported, get_instances
+# Note: {ENDPOINT} will be replaced with actual endpoint ID at runtime
+
+# ===================================================================
+# 1. Verify prpl Profile parameters with 'Write' requirement
+# ===================================================================
+
+# Initiate a GetSupportedDM on the top level object for the profile
+# This command focuses specifically on parameter access attributes,
+# particularly the 'Writable' flag for parameters.
+# 
+# Command syntax:
+#   get_supported <endpoint> <obj_path> [first_level_only] [return_commands] [return_events] [return_params]
+# 
+# Arguments used:
+#   obj_path: Device.
+#   first_level_only: false (traverse entire tree)
+#   return_commands: false (not needed for this test)
+#   return_events: false (not needed for this test)
+#   return_params: true (focus on parameter access attributes)
+get_supported {ENDPOINT} Device. false false false true
+
+# Note: The test procedure expects to verify that any parameter 
+# listed as 'W' (Writable) in the profile definition has the 
+# 'Writable' flag set in the response. This test focuses specifically
+# on parameter access attributes, unlike test 1.1 which verifies 
+# the complete data model structure (objects, parameters, events, commands).

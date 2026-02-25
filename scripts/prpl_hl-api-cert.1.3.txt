@@ -1,0 +1,20 @@
+# USP Controller Test Script
+# Test Sequence: prpl Profile verification using GET
+# Converted from ba-cli format to USP controller commands
+# Usage: Run each command in interactive mode or via IPC
+#
+# Format: <command> <endpoint> <path> [value]
+# Commands: get, set, add, delete, get_supported, get_instances
+# Note: {ENDPOINT} will be replaced with actual endpoint ID at runtime
+
+# ===================================================================
+# 1. Verify prpl Profile using GET
+# ===================================================================
+
+# Initiate a Get on the top level object for the profile
+# This command retrieves all instantiated parameters in the data model.
+get {ENDPOINT} Device.
+
+# Note: The test procedure expects all returned parameters to be 
+# verified against the profile definition. All required parameters 
+# must be present.

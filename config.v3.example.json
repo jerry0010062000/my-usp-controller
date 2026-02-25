@@ -1,0 +1,37 @@
+{
+  "usp_controller": {
+    "transport_protocol": "stomp",
+    "broker_host": "127.0.0.1",
+    "broker_port": 61613,
+    "username": "admin",
+    "password": "password",
+    "controller_endpoint_id": "proto::controller-1",
+    "receive_topic": "/topic/my_send_q",
+    "devices_file": "devices.json",
+    "debug_level": 0,
+    "enable_mdns_discovery": true,
+    "auto_register_devices": true,
+    "mdns_scan_interval": 60,
+    "heartbeat_check_enabled": true,
+    "heartbeat_check_interval": 60,
+    "device_timeout": 300,
+    "heartbeat_check_path": "Device.DeviceInfo.UpTime",
+    "transport_extra": {
+      "heartbeat": "0,0",
+      "timeout": 10
+    }
+  },
+  "ipc": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 6001,
+    "timeout": 30.0
+  },
+  "scripting": {
+    "intelligence_level": 2,
+    "auto_discovery": true,
+    "auto_retry": true,
+    "max_retries": 3,
+    "scripts_dir": "scripts"
+  }
+}

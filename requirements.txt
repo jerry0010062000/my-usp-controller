@@ -14,3 +14,9 @@ pyreadline3>=3.4.1; sys_platform == 'win32'
 
 # mDNS Service Discovery - For automatic USP agent discovery
 zeroconf>=0.131.0
+
+# Test dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-timeout>=2.1.0
+pytest-mock>=3.10.0

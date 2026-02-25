@@ -1,0 +1,24 @@
+# ===================================================================
+# prplOS 1.1.4 - Verify Port BytesSent statistics
+# ===================================================================
+# Auto-discovery version: Works across any environment
+# ===================================================================
+
+# ===================================================================
+# Step 1: Auto-discover Bridge and Port instances
+# ===================================================================
+discover_bridge_port lan lan
+
+# ===================================================================
+# Step 2: Get Port parameters from the data model
+# ===================================================================
+get {ENDPOINT} Device.Bridging.Bridge.{BRIDGE_INST}.Port.{PORT_INST}.
+
+# ===================================================================
+# Step 3: Get Port BytesSent statistics
+# ===================================================================
+get {ENDPOINT} Device.Bridging.Bridge.{BRIDGE_INST}.Port.{PORT_INST}.Stats.BytesSent
+
+# Note: Verify manually that BytesSent value is reasonable
+
+# 驗證：確保統計值隨流量傳送而增加

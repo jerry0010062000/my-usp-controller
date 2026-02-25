@@ -1,196 +1,166 @@
-# USP STOMP Controller
+# USP Controller
 
-雙模式 USP 控制器：人工互動 + AI 自動化
-支援：Linux / Raspberry Pi / Windows
+Python 實現的 TR-369 USP (User Services Platform) Controller。
 
-### 此工具類似miniACS，可以用來作為tr369測試server
-### 除了基礎Get/Set/Add/Delete以外還能執行scripts
-### 備有Windows GUI介面 操作更直觀
+## ✨ 特性
 
+- ✅ 完整 TR-369 USP 協議支援
+- ✅ 模組化架構設計（可擴展）
+- ✅ 多種傳輸協議（STOMP, MQTT 接口）
+- ✅ 統一介面層（CLI/GUI/Web）
+- ✅ 智能腳本引擎
+- ✅ 跨平台支援（Windows/Linux/macOS）
 
-## 系統架構
+## 🚀 快速開始
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    使用場景                              │
-├──────────────────────┬──────────────────────────────────┤
-│   人工操作           │         AI 自動化                │
-│                      │                                  │
-│  互動式 Shell        │      IPC 客戶端                  │
-│  ./usp_controller.py │   ./usp_client.py <cmd>          │
-│         │            │            │                     │
-│  Windows GUI         │      Python Script               │
-│  python usp_gui.py   │   (自動化任務)                   │
-│         │            │            │                     │
-│         └────────────┼────────────┘                     │
-│                      │                                  │
-│              ┌───────▼────────┐                         │
-│              │  Daemon 模式    │                         │
-│              │ (IPC Server)    │                         │
-│              │ Port: 6001      │                         │
-│              └───────┬────────┘                         │
-│                      │                                  │
-│              ┌───────▼────────┐                         │
-│              │  STOMP Manager  │                         │
-│              │  (USP Protocol) │                         │
-│              └───────┬────────┘                         │
-│                      │                                  │
-│              ┌───────▼────────┐                         │
-│              │  ActiveMQ       │                         │
-│              │  STOMP Broker   │                         │
-│              │  Port: 61613    │                         │
-│              └─────────────────┘                         │
-└─────────────────────────────────────────────────────────┘
-```
-
-## 安裝
-
-### Windows
-
-```powershell
-pip install -r requirements.txt
-```
-
-**快速啟動（推薦）：**
-```cmd
-run_ui.bat
-```
-自動啟動 daemon + GUI
-
-### Linux / Raspberry Pi
+### 安裝依賴
 
 ```bash
 pip install -r requirements.txt
-chmod +x usp_controller.py usp_client.py
 ```
 
-## 使用方式
+### 配置
 
-### Windows GUI（推薦）
+複製範例配置並修改：
 
-```powershell
-# 方法 1: 使用啟動腳本
-run_ui.bat
+```bash
+cp config.example.json config.json
+```
 
-# 方法 2: 手動啟動
+編輯 `config.json` 設定 broker 連接資訊。
+
+### 運行
+
+**CLI 模式（推薦）：**
+```bash
+python usp_main.py
+```
+
+**傳統模式：**
+```bash
+python usp_controller.py
+```
+
+**GUI 模式：**
+```bash
+# Terminal 1: 啟動 daemon
 python usp_controller.py --daemon
+
+# Terminal 2: 啟動 GUI
 python usp_gui.py
 ```
 
-**GUI 功能：**
-- 📊 即時監控：設備狀態、連線狀態、即時日誌
-- 🎮 互動操作：GET/SET/ADD/DELETE/GetSupportedDM/GetInstances
-- 🧪 測試腳本：自動化測試執行、變數替換、斷言驗證
-- ⚙️ 設定管理：Broker 配置、Debug 級別、mDNS 控制
-- 🔍 mDNS 發現：自動掃描網路上的 USP Agent
-- 🎯 命令歷史：儲存/載入/重新執行命令
+## 📖 文檔
 
-### 互動模式
+### 模組文檔（docs/）
+- [config.md](docs/config.md) - 配置管理
+- [logger.md](docs/logger.md) - 日誌系統
+- [transport.md](docs/transport.md) - 傳輸層
+- [protocol.md](docs/protocol.md) - USP 協議層
+- [scripting.md](docs/scripting.md) - 腳本引擎
+- [interface.md](docs/interface.md) - 介面層
+
+### 快速參考
+
+**USP 操作：**
+```bash
+get <endpoint> <path>           # 獲取參數
+set <endpoint> <path> <value>   # 設置參數
+add <endpoint> <obj_path>       # 添加對象
+delete <endpoint> <obj_path>    # 刪除對象
+discover <endpoint> [path]      # 發現數據模型
+operate <endpoint> <command>    # 執行命令
+```
+
+**系統命令：**
+```bash
+help                    # 幫助
+list                    # 列出設備
+status                  # 狀態資訊
+debug [0-2]            # 調試級別
+quit                    # 退出
+```
+
+## 📁 專案結構
+
+```
+my-usp-controller/
+├── usp_controller/         # 核心模組（模組化架構）
+│   ├── config.py          #   配置管理
+│   ├── logger.py          #   日誌系統
+│   ├── transport/         #   傳輸層
+│   ├── protocol/          #   協議層
+│   ├── scripting/         #   腳本引擎
+│   └── interface/         #   介面層
+├── usp_main.py            # 新版主程式（推薦）
+├── usp_controller.py      # 傳統主程式（向後兼容）
+├── usp_gui.py             # GUI 應用
+├── tests/                 # 測試文件
+├── scripts/               # 腳本和工具
+├── docs/                  # 模組文檔
+└── config.json            # 配置文件
+```
+
+## 🔧 使用示例
+
+### Python API
+
+```python
+from usp_controller.config import load_config
+from usp_controller.interface import create_cli_interface
+
+# 載入配置
+config = load_config("config.json")
+
+# 創建 CLI 介面
+cli = create_cli_interface()
+cli.initialize()
+cli.run()
+```
+
+### 批次腳本
+
+創建 `script.txt`：
+```bash
+# 變量定義
+$AGENT = proto::agent-001
+
+# 操作命令
+get $AGENT Device.DeviceInfo.
+set $AGENT Device.X.Parameter "value"
+```
+
+執行：
+```bash
+python scripts/run_test.py --script script.txt
+```
+
+## 🧪 測試
 
 ```bash
-python usp_controller.py  # Windows
-./usp_controller.py       # Linux
+# 測試模組化架構
+python tests/test_v3_architecture.py
+
+# 測試介面層
+python tests/test_interface_layer.py
+
+# 查看使用示例
+python tests/example_interface_usage.py
 ```
 
-命令：
-- `list` - 列出設備
-- `status` - 連線狀態
-- `get <endpoint> <path>` - 讀取參數
-- `set <endpoint> <path> <value>` - 設定參數
-- `get_instances <endpoint> <path>` - 列出實例
-- `debug <0-2>` - 調整顯示層級
+## 📋 需求
 
-### Daemon + IPC
+- Python 3.7+
+- 標準庫（無額外依賴）
 
-```bash
-# 啟動 daemon
-python usp_controller.py --daemon       # Windows 前景
-python usp_controller.py --daemon &     # Linux 背景
+**可選增強：**
+- `prompt_toolkit` - 增強 CLI（自動補全、歷史）
+- `rich` - 進階終端輸出
 
-# IPC 客戶端
-python usp_client.py status
-python usp_client.py get <endpoint> <path>
-python usp_client.py set <endpoint> <path> <value>
+## 📄 授權
 
-# 測試腳本
-python scripts/run_test.py --script test.txt --endpoint proto::agent-id
-```
+MIT License
 
-## 配置
+## 🤝 貢獻
 
-`config.json`（參考 `config.example.json`）：
-
-```json
-{
-  "usp_controller": {
-    "broker_host": "127.0.0.1",
-    "broker_port": 61613,
-    "username": "admin",
-    "password": "password",
-    "controller_endpoint_id": "proto::controller-1",
-    "receive_topic": "/topic/my_send_q",
-    "devices_file": "devices.json",
-    "enable_mdns_discovery": true,
-    "heartbeat_check_enabled": true,
-    "heartbeat_check_interval": 60
-  },
-  "ipc": {
-    "host": "127.0.0.1",
-    "port": 6001
-  }
-}
-```
-
-Agent 自動註冊，無需手動配置 destination。
-
-## 功能特色
-
-### 🧪 測試腳本自動化（v2.0.4）
-- 變數替換：`{ENDPOINT}` `{INSTANCE}`
-- 斷言驗證：`# expect: value`
-- 同步等待：GET/GetInstances 等待實際回應（15秒）
-- 重複保護：防止等待期間重複發送
-
-### 🔍 mDNS 自動發現
-- 自動掃描區網 USP Agent（`_usp-agent._tcp.local.`）
-- 被動監聽 + 主動掃描
-- 自動註冊到 devices.json
-
-### 🖥️ Windows GUI
-- Tkinter 原生介面
-- 四大分頁：Operations / Settings / mDNS Debug / Test Scripts
-- 命令歷史、右鍵複製、即時日誌
-
-### 🔧 多模式運行
-- 互動 Shell：人工測試
-- Daemon + IPC：自動化腳本
-- GUI：視覺化管理
-
----
-
-**版本：** 2.0.4 | **協定：** USP 1.4 / STOMP 1.2
-
-## v2.0.4 更新
-
-### 測試腳本
-```bash
-# CLI
-python scripts/run_test.py --script test_dhcpv4_pool.txt --endpoint proto::agent-id
-
-# GUI Test Scripts 標籤頁
-選擇腳本 → 選擇設備 → Run Script
-```
-
-**語法：**
-```
-# 註解
-get {ENDPOINT} Device.Path.Param
-get_instances {ENDPOINT} Device.Path.{INSTANCE}.
-set {ENDPOINT} Device.Path.Param value # expect: OK
-```
-
-### 改進
-- GET/GetInstances 同步等待實際回應（15秒 timeout）
-- 重複請求保護
-- IPC timeout 延長至 20秒
-- 回應格式：`{"status": "ok", "msg": "...", "data": {...}, "instances": [...]}`
+歡迎提交 Issue 和 Pull Request。
