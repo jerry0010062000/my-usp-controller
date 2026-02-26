@@ -10,16 +10,100 @@ Python 實現的 TR-369 USP (User Services Platform) Controller。
 - ✅ 統一介面層（CLI/GUI/Web）
 - ✅ 智能腳本引擎
 - ✅ 跨平台支援（Windows/Linux/macOS）
+- 🆕 **GUI 內建 Broker 控制**（一鍵啟動/停止，開發測試更便捷）
 
 ## 🚀 快速開始
 
-### 安裝依賴
+### 方式 1：一鍵啟動完整環境（最簡單）
+
+**雙擊啟動**，無需任何配置：
+
+```bash
+# Windows: 雙擊批次檔
+start_dev.bat
+
+# Linux/Mac: 執行腳本
+python start_dev.py
+```
+
+這會自動啟動：
+- 🔧 Mini-Broker (STOMP)
+- 🔄 USP Controller Daemon
+- 🖥️ GUI 界面
+
+✅ **所有服務自動管理**，關閉 GUI 會自動停止所有服務。
+
+⚠️ **注意**：Mini-Broker 僅供開發測試，生產環境請使用 `--no-broker` 並配置 ActiveMQ/RabbitMQ。
+
+---
+
+### 方式 2：使用外部 Broker（生產環境）
+
+#### 1. 啟動外部 Broker
+
+**Docker (推薦):**
+```bash
+docker run -d --name activemq \
+  -p 61613:61613 -p 8161:8161 \
+  rmohr/activemq
+```
+
+**或手動安裝 ActiveMQ:**
+- 下載：https://activemq.apache.org/
+- 默認 STOMP 端口：61613
+
+#### 2. 配置
+
+修改 `config.json` 中的 broker 設定：
+
+```json
+{
+  "usp_controller": {
+    "broker_host": "127.0.0.1",
+    "broker_port": 61613,
+    "username": "guest",
+    "password": "guest"
+  }
+}
+```
+
+#### 3. 啟動服務
+
+```bash
+# 使用外部 Broker
+python start_dev.py --no-broker
+
+# 或分別啟動
+python usp_controller.py --daemon
+python usp_gui.py
+```
+
+---
+
+### 方式 3：手動安裝（開發者）
+
+#### 1. 安裝依賴
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 配置
+#### 2. 安裝 Message Broker
+
+選擇一個：
+
+**Docker (推薦):**
+```bash
+docker run -d --name activemq \
+  -p 61613:61613 -p 8161:8161 \
+  rmohr/activemq
+```
+
+**或手動安裝 ActiveMQ:**
+- 下載：https://activemq.apache.org/
+- 默認 STOMP 端口：61613
+
+#### 3. 配置
 
 複製範例配置並修改：
 
@@ -29,7 +113,7 @@ cp config.example.json config.json
 
 編輯 `config.json` 設定 broker 連接資訊。
 
-### 運行
+#### 4. 運行
 
 **CLI 模式（推薦）：**
 ```bash
@@ -101,7 +185,7 @@ my-usp-controller/
 └── config.json            # 配置文件
 ```
 
-## 🔧 使用示例
+##  使用示例
 
 ### Python API
 

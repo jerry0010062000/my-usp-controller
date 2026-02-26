@@ -14,6 +14,16 @@ import queue
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
+
+# Add tools directory to path for embedded broker
+sys.path.insert(0, str(Path(__file__).parent / "tools"))
+try:
+    from embedded_broker import EmbeddedBroker
+    BROKER_AVAILABLE = True
+except ImportError:
+    BROKER_AVAILABLE = False
+    print("Warning: Embedded broker not available")
 
 # Hide console window on Windows
 if sys.platform == 'win32':
@@ -68,8 +78,8 @@ class IPCClient:
 class USPControllerGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("USP Controller GUI V2.0")
-        self.root.geometry("1000x700")
+        self.root.title("USP Controller GUI V2.0 + Embedded Broker")
+        self.root.geometry("1000x750")
         
         self.ipc = IPCClient()
         self.last_log_id = -1
@@ -83,6 +93,19 @@ class USPControllerGUI:
         # Command history
         self.command_history = self._load_history()
         
+        # Load mini-broker config
+        self.mini_broker_enabled = False
+        self.mini_broker_host = "0.0.0.0"
+        self.mini_broker_port = 61613
+        self._load_mini_broker_config()
+        
+        # Embedded Broker
+        self.embedded_broker = None
+        self.broker_running = False
+        
+        # Bind cleanup on close
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+        
         self._setup_ui()
         
         # Start background polling thread
@@ -91,11 +114,15 @@ class USPControllerGUI:
         
         # Start checking queues in main thread
         self.root.after(100, self._process_queues)
+        
+        # Check and warn if mini-broker is enabled but not running
+        if BROKER_AVAILABLE and self.mini_broker_enabled and not self.broker_running:
+            self.root.after(1000, self._show_broker_warning)
 
     def _setup_ui(self):
         # Configure grid weight
         self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(2, weight=1)  # Changed from 1 to 2
         
         # --- Top Bar: Connection Status ---
         top_frame = ttk.Frame(self.root, padding="5")
@@ -107,9 +134,36 @@ class USPControllerGUI:
         btn_reconnect = ttk.Button(top_frame, text="Force Refresh", command=self._force_refresh)
         btn_reconnect.pack(side="right")
         
+        # --- Broker Control Bar (NEW) ---
+        if BROKER_AVAILABLE:
+            broker_frame = ttk.LabelFrame(self.root, text="🔧 Embedded Broker (Development)", padding="5")
+            broker_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=(0, 5))
+            
+            # Broker status
+            self.lbl_broker_status = ttk.Label(broker_frame, text="⚪ Stopped", font=("Segoe UI", 9))
+            self.lbl_broker_status.pack(side="left", padx=(0, 10))
+            
+            # Broker port info
+            broker_info_text = f"Port: {self.mini_broker_port}"
+            if self.mini_broker_enabled:
+                broker_info_text += " (Mini-Broker)"
+            self.lbl_broker_info = ttk.Label(broker_frame, text=broker_info_text, font=("Segoe UI", 9))
+            self.lbl_broker_info.pack(side="left", padx=(0, 10))
+            
+            # Control buttons
+            self.btn_broker_start = ttk.Button(broker_frame, text="▶ Start Broker", command=self._start_broker)
+            self.btn_broker_start.pack(side="left", padx=2)
+            
+            self.btn_broker_stop = ttk.Button(broker_frame, text="⏹ Stop Broker", command=self._stop_broker, state="disabled")
+            self.btn_broker_stop.pack(side="left", padx=2)
+            
+            # Warning label
+            ttk.Label(broker_frame, text="⚠ For development only", 
+                     font=("Segoe UI", 8), foreground="orange").pack(side="right", padx=5)
+        
         # --- Left Panel: Devices ---
         left_panel = ttk.LabelFrame(self.root, text="Devices", padding="5")
-        left_panel.grid(row=1, column=0, sticky="ns", padx=5, pady=5)
+        left_panel.grid(row=2, column=0, sticky="ns", padx=5, pady=5)  # Changed row from 1 to 2
         
         # Device list with status indicators
         tree_frame = ttk.Frame(left_panel)
@@ -138,7 +192,7 @@ class USPControllerGUI:
 
         # --- Right Panel: Controls & Logs ---
         right_panel = ttk.Frame(self.root, padding="5")
-        right_panel.grid(row=1, column=1, sticky="nsew", padx=5, pady=5)
+        right_panel.grid(row=2, column=1, sticky="nsew", padx=5, pady=5)  # Changed row from 1 to 2
         right_panel.rowconfigure(0, weight=1)
         right_panel.columnconfigure(0, weight=1)
 
@@ -633,6 +687,10 @@ class USPControllerGUI:
     
     def _run_script(self):
         """Run selected test script"""
+        # Check if mini-broker is enabled and running
+        if not self._check_broker_ready():
+            return
+        
         script_name = self.cb_script.get()
         if not script_name:
             messagebox.showwarning("No Script", "Please select a script to run")
@@ -1313,6 +1371,179 @@ class USPControllerGUI:
         # Only triggers an immediate status poll in the next thread loop
         # For now, just a placeholder as the thread loops automatically
         pass
+    
+    # ===== Embedded Broker Controls =====
+    
+    def _start_broker(self):
+        """Start embedded STOMP broker"""
+        if not BROKER_AVAILABLE:
+            messagebox.showerror("Error", "Embedded broker module not found!")
+            return
+        
+        if self.broker_running:
+            messagebox.showinfo("Info", "Broker is already running")
+            return
+        
+        # 检查端口是否可用
+        if hasattr(EmbeddedBroker, 'is_port_available'):
+            if not EmbeddedBroker.is_port_available(self.mini_broker_port, self.mini_broker_host):
+                # 查找占用进程
+                process_info = "未知进程"
+                if hasattr(EmbeddedBroker, 'find_process_on_port'):
+                    process_info = EmbeddedBroker.find_process_on_port(self.mini_broker_port)
+                
+                error_msg = (
+                    f"端口 {self.mini_broker_port} 已被占用！\n\n"
+                    f"占用进程: {process_info}\n\n"
+                    f"解决方案：\n"
+                    f"1. 打开命令提示符（管理员）\n"
+                    f"2. 查找占用进程：\n"
+                    f"   netstat -ano | findstr :{self.mini_broker_port}\n"
+                    f"3. 终止进程：\n"
+                    f"   taskkill /PID <PID> /F\n\n"
+                    f"或使用其他端口启动 broker"
+                )
+                
+                messagebox.showerror("端口被占用", error_msg)
+                return
+        
+        try:
+            # Confirm action
+            if not messagebox.askyesno("Start Broker", 
+                                       f"Start embedded STOMP broker on {self.mini_broker_host}:{self.mini_broker_port}?\n\n"
+                                       "⚠ This is for development/testing only!\n"
+                                       "Use ActiveMQ/RabbitMQ for production."):
+                return
+            
+            # Create and start broker
+            self.embedded_broker = EmbeddedBroker(host=self.mini_broker_host, port=self.mini_broker_port)
+            
+            # Start in background thread
+            def start_broker_thread():
+                try:
+                    self.embedded_broker.start()
+                    self.broker_running = True
+                    
+                    # Update UI
+                    self.root.after(0, self._update_broker_ui_running)
+                    
+                    # 成功消息
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "Broker Started", 
+                        f"Embedded broker started on {self.mini_broker_host}:{self.mini_broker_port}\n\n"
+                        f"Connect string: stomp://127.0.0.1:{self.mini_broker_port}\n\n"
+                        f"Now start the daemon:\n"
+                        f"python usp_controller.py --daemon"
+                    ))
+                    
+                except PermissionError as e:
+                    self.broker_running = False
+                    error_msg = (
+                        "权限错误 (WinError 10013)\n\n"
+                        f"无法绑定端口 {self.mini_broker_port}\n\n"
+                        "解决方案：\n"
+                        "1. 以管理员身份运行程序\n"
+                        "2. 使用大于 1024 的端口\n"
+                        "3. 检查防火墙设置\n\n"
+                        f"详细错误: {str(e)}"
+                    )
+                    self.root.after(0, lambda: messagebox.showerror("权限错误", error_msg))
+                
+                except OSError as e:
+                    self.broker_running = False
+                    if '10013' in str(e) or 'WinError 10013' in str(e):
+                        error_msg = (
+                            "端口访问被拒绝 (WinError 10013)\n\n"
+                            f"端口 {self.mini_broker_port} 可能被占用或受限\n\n"
+                            "解决方案：\n"
+                            "1. 以管理员身份运行\n"
+                            "2. 检查是否有其他程序占用端口\n"
+                            "3. 尝试使用其他端口（如 61614）\n"
+                            "4. 检查防火墙设置\n\n"
+                            "快速检查端口占用：\n"
+                            f"netstat -ano | findstr :{self.mini_broker_port}\n\n"
+                            f"详细错误: {str(e)}"
+                        )
+                    else:
+                        error_msg = f"Failed to start broker:\n\n{str(e)}"
+                    
+                    self.root.after(0, lambda: messagebox.showerror("Broker Error", error_msg))
+                
+                except Exception as e:
+                    self.broker_running = False
+                    self.root.after(0, lambda: messagebox.showerror("Broker Error", f"Unexpected error:\n{str(e)}"))
+            
+            threading.Thread(target=start_broker_thread, daemon=True).start()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create broker:\n{e}")
+    
+    def _stop_broker(self):
+        """Stop embedded STOMP broker"""
+        if not self.broker_running or not self.embedded_broker:
+            messagebox.showinfo("Info", "Broker is not running")
+            return
+        
+        try:
+            # Confirm action
+            if not messagebox.askyesno("Stop Broker", "Stop embedded broker?"):
+                return
+            
+            # Stop broker
+            self.embedded_broker.stop()
+            self.broker_running = False
+            self.embedded_broker = None
+            
+            # Update UI
+            self._update_broker_ui_stopped()
+            
+            messagebox.showinfo("Broker Stopped", "Embedded broker has been stopped")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to stop broker:\n{e}")
+    
+    def _update_broker_ui_running(self):
+        """Update UI when broker is running"""
+        if hasattr(self, 'lbl_broker_status'):
+            self.lbl_broker_status.config(text="🟢 Running", foreground="green")
+            self.btn_broker_start.config(state="disabled")
+            self.btn_broker_stop.config(state="normal")
+    
+    def _update_broker_ui_stopped(self):
+        """Update UI when broker is stopped"""
+        if hasattr(self, 'lbl_broker_status'):
+            self.lbl_broker_status.config(text="⚪ Stopped", foreground="gray")
+            self.btn_broker_start.config(state="normal")
+            self.btn_broker_stop.config(state="disabled")
+    
+    def _show_broker_warning(self):
+        """Show warning if mini-broker is enabled but not running"""
+        result = messagebox.showwarning(
+            "Mini-Broker 未运行",
+            f"检测到 Mini-Broker 已启用但未运行！\n\n"
+            f"Broker 地址: {self.mini_broker_host}:{self.mini_broker_port}\n\n"
+            f"在发送 USP 命令前，需要先启动 Mini-Broker。\n"
+            f"请点击界面上方的 '▶ Start Broker' 按钮。\n\n"
+            f"注意：Daemon 也需要使用相同的 broker 配置。",
+            icon='warning'
+        )
+    
+    def _on_closing(self):
+        """Handle window close event"""
+        # Stop broker if running
+        if self.broker_running and self.embedded_broker:
+            try:
+                print("Stopping embedded broker...")
+                self.embedded_broker.stop()
+            except:
+                pass
+        
+        # Stop polling
+        self.polling = False
+        
+        # Destroy window
+        self.root.destroy()
+
 
     def _refresh_status(self):
         # Legacy method kept for compatibility bound to buttons
@@ -1369,6 +1600,10 @@ class USPControllerGUI:
             self.log_queue.put({"logs": [{"id": -1, "time": datetime.now().strftime("%H:%M:%S"), "type": "error", "msg": f"Delete error: {e}"}], "last_id": -1})
 
     def _send_command(self):
+        # Check if mini-broker is enabled and running
+        if not self._check_broker_ready():
+            return
+        
         ep = self.cb_endpoint.get().strip()
         path = self.ent_path.get().strip()
         action = self.cb_action.get().lower()
@@ -1421,6 +1656,34 @@ class USPControllerGUI:
         # Schedule UI update in main thread
         self.root.after(0, lambda: self._handle_command_response(resp, cmd_str))
         
+    def _check_broker_ready(self):
+        """Check if broker is ready before sending commands"""
+        # Only check if BROKER_AVAILABLE and mini-broker is enabled
+        if not BROKER_AVAILABLE or not self.mini_broker_enabled:
+            return True
+        
+        # Check if broker is running
+        if not self.broker_running:
+            result = messagebox.askyesno(
+                "Broker Not Running",
+                f"Mini-Broker 已启用但未运行！\n\n"
+                f"Broker 地址: {self.mini_broker_host}:{self.mini_broker_port}\n\n"
+                f"需要先启动 Mini-Broker 才能发送命令。\n\n"
+                f"是否现在启动 Broker？",
+                icon='warning'
+            )
+            if result:
+                self._start_broker()
+                # Wait a moment for broker to start
+                import time
+                time.sleep(0.5)
+                if not self.broker_running:
+                    messagebox.showerror("启动失败", "Broker 启动失败，请检查日志")
+                    return False
+            return False
+        
+        return True
+    
     def _handle_command_response(self, resp, cmd_str):
         if resp:
             if resp.get("status") == "ok":
@@ -1439,12 +1702,28 @@ class USPControllerGUI:
         if resp and resp.get("status") == "ok":
             cfg = resp.get("config", {})
             
+            # Reload mini-broker config
+            self._load_mini_broker_config()
+            
             # Update entry widgets in main thread
             self.root.after(0, lambda: self.ent_broker_host.delete(0, tk.END))
             self.root.after(0, lambda: self.ent_broker_host.insert(0, cfg.get('broker_host', '')))
             
             self.root.after(0, lambda: self.ent_broker_port.delete(0, tk.END))
             self.root.after(0, lambda: self.ent_broker_port.insert(0, str(cfg.get('broker_port', ''))))
+            
+            # Disable broker config fields if mini-broker is enabled
+            if self.mini_broker_enabled:
+                self.root.after(0, lambda: self.ent_broker_host.config(state='disabled'))
+                self.root.after(0, lambda: self.ent_broker_port.config(state='disabled'))
+                # Update display to show mini-broker is active
+                broker_addr = f"{self.mini_broker_host}:{self.mini_broker_port} (Mini-Broker)"
+                self.root.after(0, lambda: self.lbl_broker_addr.config(text=f"Address: {broker_addr}", foreground="orange"))
+            else:
+                self.root.after(0, lambda: self.ent_broker_host.config(state='normal'))
+                self.root.after(0, lambda: self.ent_broker_port.config(state='normal'))
+                broker_addr = f"{cfg.get('broker_host', 'N/A')}:{cfg.get('broker_port', 'N/A')}"
+                self.root.after(0, lambda: self.lbl_broker_addr.config(text=f"Address: {broker_addr}", foreground=""))
             
             self.root.after(0, lambda: self.ent_username.delete(0, tk.END))
             self.root.after(0, lambda: self.ent_username.insert(0, cfg.get('username', '')))
@@ -1462,9 +1741,7 @@ class USPControllerGUI:
             lvl = cfg.get("debug_level", 1)
             self.root.after(0, lambda: self.var_debug.set(lvl))
             
-            # Update broker status display
-            broker_addr = f"{cfg.get('broker_host', 'N/A')}:{cfg.get('broker_port', 'N/A')}"
-            self.root.after(0, lambda: self.lbl_broker_addr.config(text=f"Address: {broker_addr}"))
+            # Update broker user status
             self.root.after(0, lambda: self.lbl_broker_user.config(text=f"Username: {cfg.get('username', 'N/A')}"))
     
     def _save_config(self):
@@ -1828,6 +2105,20 @@ class USPControllerGUI:
                 json.dump(self.command_history, f, indent=2)
         except Exception as e:
             print(f"Failed to save history: {e}")
+    
+    def _load_mini_broker_config(self):
+        """Load mini-broker config from config.json"""
+        config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    mini_broker = config.get('mini_broker', {})
+                    self.mini_broker_enabled = mini_broker.get('enable', False)
+                    self.mini_broker_host = mini_broker.get('host', '0.0.0.0')
+                    self.mini_broker_port = mini_broker.get('port', 61613)
+            except Exception as e:
+                print(f"[!] 无法加载 mini-broker 配置: {e}")
     
     def _add_to_history(self, action, endpoint, path, value):
         """Add command to history"""

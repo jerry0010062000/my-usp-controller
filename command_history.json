@@ -1,90 +1,10 @@
 [
-  {
-    "timestamp": "2026-02-03T10:13:19.948369",
-    "action": "GET",
-    "endpoint": "proto::agent-id",
-    "path": "Device.WiFi.",
-    "value": "",
-    "status": "pending"
-  },
-  {
-    "timestamp": "2026-01-29T17:54:40.534731",
-    "action": "GET",
-    "endpoint": "proto::agent-id",
-    "path": "Device.LocalAgent.",
-    "value": "",
-    "status": "pending"
-  },
-  {
-    "timestamp": "2026-01-29T17:45:25.259164",
-    "action": "SET",
-    "endpoint": "proto::agent-id",
-    "path": "Device.LocalAgent.",
-    "value": "test",
-    "status": "success"
-  },
-  {
-    "timestamp": "2026-02-03T15:37:21.074669",
-    "action": "GET",
-    "endpoint": "proto::agent-id",
-    "path": "Device.LocalAgent.MTP.1.",
-    "value": "",
-    "status": "pending"
-  },
-  {
-    "timestamp": "2026-02-03T10:31:33.101439",
-    "action": "GetInstances",
-    "endpoint": "proto::agent-id",
-    "path": "Device.LocalAgent.",
-    "value": "",
-    "status": "success"
-  },
-  {
-    "timestamp": "2026-02-03T10:32:08.795887",
-    "action": "GetSupportedDM",
-    "endpoint": "proto::agent-id",
-    "path": "Device.LocalAgent.",
-    "value": "",
-    "status": "success"
-  },
-  {
-    "timestamp": "2026-02-11T14:25:30.806651",
-    "action": "GetSupportedDM",
-    "endpoint": "proto::agent-id",
-    "path": "Device.LocalAgent.",
-    "value": "192.168.1.5",
-    "status": "pending"
-  },
-  {
-    "timestamp": "2026-02-03T17:48:37.168057",
-    "action": "GET",
-    "endpoint": "proto::agent-id",
-    "path": "Device.WiFi.",
-    "value": "192.168.1.5",
-    "status": "pending"
-  },
-  {
-    "timestamp": "2026-02-12T11:02:37.369867",
-    "action": "GET",
-    "endpoint": "proto::agent-opl",
-    "path": "Device.LocalAgent.MTP.1.",
-    "value": "192.168.1.5",
-    "status": "success"
-  },
-  {
-    "timestamp": "2026-02-25T16:39:15.599591",
-    "action": "GET",
-    "endpoint": "proto::agent-opl",
-    "path": "Device.WiFi.",
-    "value": "192.168.1.5",
-    "status": "pending"
-  },
-  {
-    "timestamp": "2026-02-13T11:34:57.701633",
-    "action": "GET",
-    "endpoint": "proto::agent-opl",
-    "path": "Device.",
-    "value": "192.168.1.5",
-    "status": "error"
-  }
+  "get proto::agent-id Device.WiFi.",
+  "get proto::agent-id Device.LocalAgent.",
+  "set proto::agent-id Device.LocalAgent. test",
+  "get proto::agent-id Device.LocalAgent.MTP.1.",
+  "get proto::agent-opl Device.LocalAgent.MTP.1.",
+  "get proto::agent-opl Device.WiFi.",
+  "get proto::agent-opl Device.",
+  "get proto::agent-id Device.WiFi."
 ]

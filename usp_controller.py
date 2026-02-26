@@ -126,20 +126,41 @@ def validate_config(config):
 
 # Load configuration
 CONFIG = load_config()
+CONFIG_VALID = validate_config(CONFIG)
 
-if not validate_config(CONFIG):
-    print("\n[!] Configuration validation failed. Exiting.")
-    sys.exit(1)
+if not CONFIG_VALID:
+    print("\n[!] Configuration validation failed.")
+    print("[!] In daemon mode, IPC will still start to allow GUI access for configuration.")
+    # Use fallback defaults to allow daemon to start
+    usp_config = {}
+    mini_broker_config = {}
+else:
+    # Apply configuration with defaults for optional fields
+    usp_config = CONFIG['usp_controller']
 
-# Apply configuration with defaults for optional fields
-usp_config = CONFIG['usp_controller']
+# Initialize all variables with defaults (allows daemon to start even with invalid config)
 BROKER_HOST = usp_config.get('broker_host', DEFAULT_CONFIG['broker_host'])
 BROKER_PORT = usp_config.get('broker_port', DEFAULT_CONFIG['broker_port'])
 USERNAME = usp_config.get('username', DEFAULT_CONFIG['username'])
 PASSWORD = usp_config.get('password', DEFAULT_CONFIG['password'])
-CONTROLLER_ENDPOINT_ID = usp_config['controller_endpoint_id']  # Required
-RECEIVE_TOPIC = usp_config['receive_topic']  # Required
+CONTROLLER_ENDPOINT_ID = usp_config.get('controller_endpoint_id', 'controller.default')
+RECEIVE_TOPIC = usp_config.get('receive_topic', '/topic/agent')
 DEVICES_FILE = usp_config.get('devices_file', DEFAULT_CONFIG['devices_file'])
+
+# Mini-Broker configuration (overrides broker settings when enabled)
+if CONFIG_VALID:
+    mini_broker_config = CONFIG.get('mini_broker', {})
+else:
+    mini_broker_config = {}
+    
+MINI_BROKER_ENABLED = mini_broker_config.get('enable', False)
+
+if MINI_BROKER_ENABLED:
+    # When mini-broker is enabled, use its configuration and lock broker settings
+    BROKER_HOST = mini_broker_config.get('host', '127.0.0.1')
+    BROKER_PORT = mini_broker_config.get('port', 61613)
+    print(f"[*] Mini-Broker enabled: {BROKER_HOST}:{BROKER_PORT}")
+    print(f"[*] Broker configuration locked (cannot be overridden via command line)")
 
 # Derived configuration
 REPLY_TO_QUEUE = usp_config.get('reply_to_queue', f'/queue/{CONTROLLER_ENDPOINT_ID}')
@@ -717,16 +738,16 @@ class STOMPManager:
                 # self.heartbeat_thread.start()
                 Logger.info("Heartbeat thread disabled for testing", level=1)
                 
-                # Controller 只訂閱自己的接收佇列
+                # Controller only subscribes to its own receive queue
                 self.subscribe(RECEIVE_TOPIC)
                 Logger.info(f"Subscribed to: {RECEIVE_TOPIC}", level=1)
                 
-                # 如果 reply_to_queue 不同，也訂閱
+                # If reply_to_queue is different, subscribe to it as well
                 if RECEIVE_TOPIC != REPLY_TO_QUEUE:
                     self.subscribe(REPLY_TO_QUEUE)
                     Logger.info(f"Subscribed to: {REPLY_TO_QUEUE}", level=1)
                 
-                # 載入已知設備（只記錄 reply_to，不訂閱）
+                # Load known devices (only record reply_to, don't subscribe)
                 self.load_devices()
                 if self.devices:
                     Logger.info(f"Loaded {len(self.devices)} known devices (reply addresses stored)", level=1)
@@ -1473,6 +1494,10 @@ class IPCServer(threading.Thread):
             print(f"[!] IPC Server error: {e}")
 
     def _handle_client(self, client):
+        # Declare global variables that may be modified by IPC commands
+        global CONFIG, CONFIG_VALID, BROKER_HOST, BROKER_PORT, USERNAME, PASSWORD
+        global CONTROLLER_ENDPOINT_ID, RECEIVE_TOPIC, REPLY_TO_QUEUE, MINI_BROKER_ENABLED
+        
         try:
             data = client.recv(4096).decode('utf-8').strip()
             if not data: return
@@ -1652,48 +1677,55 @@ class IPCServer(threading.Thread):
                     field = cmd_parts[1]
                     value = " ".join(cmd_parts[2:])
                     
-                    # Load current config
-                    config = load_config()
-                    if not config:
-                        response = {"status": "error", "msg": "Failed to load config.json"}
+                    # Check if trying to modify broker config when mini-broker is enabled
+                    if field in ["broker_host", "broker_port"] and MINI_BROKER_ENABLED:
+                        response = {
+                            "status": "error", 
+                            "msg": f"Cannot modify {field}: Mini-Broker enabled, broker config is locked"
+                        }
                     else:
-                        try:
-                            # Update the appropriate field
-                            if field == "broker_host":
-                                config['usp_controller']['broker_host'] = value
-                            elif field == "broker_port":
-                                config['usp_controller']['broker_port'] = int(value)
-                            elif field == "controller_id":
-                                config['usp_controller']['controller_endpoint_id'] = value
-                                # Also update receive_topic if not custom
-                                if 'receive_topic' not in config['usp_controller'] or \
-                                   config['usp_controller']['receive_topic'].endswith(CONTROLLER_ENDPOINT_ID.split('::')[-1]):
-                                    config['usp_controller']['receive_topic'] = f'/queue/usp.controller.{value.split("::")[-1]}'
-                            elif field == "receive_topic":
-                                config['usp_controller']['receive_topic'] = value
-                            elif field == "username":
-                                config['usp_controller']['username'] = value
-                            elif field == "password":
-                                config['usp_controller']['password'] = value
-                            elif field == "ipc_port":
-                                if 'ipc' not in config:
-                                    config['ipc'] = {}
-                                config['ipc']['port'] = int(value)
-                            else:
-                                response = {"status": "error", "msg": f"Unknown field: {field}"}
-                                client.sendall(json.dumps(response).encode('utf-8'))
-                                client.close()
-                                return
-                            
-                            # Save updated config
-                            if save_config(config):
-                                response = {"status": "ok", "msg": f"Config updated. Restart daemon to apply changes."}
-                            else:
-                                response = {"status": "error", "msg": "Failed to save config.json"}
-                        except ValueError as e:
-                            response = {"status": "error", "msg": f"Invalid value: {str(e)}"}
-                        except Exception as e:
-                            response = {"status": "error", "msg": f"Error: {str(e)}"}
+                        # Load current config
+                        config = load_config()
+                        if not config:
+                            response = {"status": "error", "msg": "Failed to load config.json"}
+                        else:
+                            try:
+                                # Update the appropriate field
+                                if field == "broker_host":
+                                    config['usp_controller']['broker_host'] = value
+                                elif field == "broker_port":
+                                    config['usp_controller']['broker_port'] = int(value)
+                                elif field == "controller_id":
+                                    config['usp_controller']['controller_endpoint_id'] = value
+                                    # Also update receive_topic if not custom
+                                    if 'receive_topic' not in config['usp_controller'] or \
+                                           config['usp_controller']['receive_topic'].endswith(CONTROLLER_ENDPOINT_ID.split('::')[-1]):
+                                        config['usp_controller']['receive_topic'] = f'/queue/usp.controller.{value.split("::")[-1]}'
+                                elif field == "receive_topic":
+                                    config['usp_controller']['receive_topic'] = value
+                                elif field == "username":
+                                    config['usp_controller']['username'] = value
+                                elif field == "password":
+                                    config['usp_controller']['password'] = value
+                                elif field == "ipc_port":
+                                    if 'ipc' not in config:
+                                        config['ipc'] = {}
+                                    config['ipc']['port'] = int(value)
+                                else:
+                                    response = {"status": "error", "msg": f"Unknown field: {field}"}
+                                    client.sendall(json.dumps(response).encode('utf-8'))
+                                    client.close()
+                                    return
+                                
+                                # Save updated config
+                                if save_config(config):
+                                    response = {"status": "ok", "msg": f"Config updated. Restart daemon to apply changes."}
+                                else:
+                                    response = {"status": "error", "msg": "Failed to save config.json"}
+                            except ValueError as e:
+                                response = {"status": "error", "msg": f"Invalid value: {str(e)}"}
+                            except Exception as e:
+                                response = {"status": "error", "msg": f"Error: {str(e)}"}
                 else:
                     response = {"status": "error", "msg": "usage: update_config <field> <value>"}
             
@@ -1725,6 +1757,46 @@ class IPCServer(threading.Thread):
                         response = {"status": "error", "msg": "Reconnection failed (Check logs)"}
                 except Exception as e:
                     response = {"status": "error", "msg": f"Reconnection error: {str(e)}"}
+            
+            elif cmd == "reload_config":
+                # Reload configuration from config.json and reconnect if valid
+                try:
+                    # Reload config file
+                    CONFIG = load_config()
+                    CONFIG_VALID = validate_config(CONFIG)
+                    
+                    if not CONFIG_VALID:
+                        response = {"status": "error", "msg": "Configuration validation failed. Check config.json"}
+                    else:
+                        # Update global variables
+                        usp_config = CONFIG['usp_controller']
+                        BROKER_HOST = usp_config.get('broker_host', DEFAULT_CONFIG['broker_host'])
+                        BROKER_PORT = usp_config.get('broker_port', DEFAULT_CONFIG['broker_port'])
+                        USERNAME = usp_config.get('username', DEFAULT_CONFIG['username'])
+                        PASSWORD = usp_config.get('password', DEFAULT_CONFIG['password'])
+                        CONTROLLER_ENDPOINT_ID = usp_config['controller_endpoint_id']
+                        RECEIVE_TOPIC = usp_config['receive_topic']
+                        REPLY_TO_QUEUE = usp_config.get('reply_to_queue', f'/queue/{CONTROLLER_ENDPOINT_ID}')
+                        
+                        # Update mini-broker configuration
+                        mini_broker_config = CONFIG.get('mini_broker', {})
+                        MINI_BROKER_ENABLED = mini_broker_config.get('enable', False)
+                        if MINI_BROKER_ENABLED:
+                            BROKER_HOST = mini_broker_config.get('host', '127.0.0.1')
+                            BROKER_PORT = mini_broker_config.get('port', 61613)
+                        
+                        # Try to reconnect with new configuration
+                        if self.stomp.connected:
+                            self.stomp.sock.close()
+                            self.stomp.connected = False
+                            time.sleep(1)
+                        
+                        if self.stomp.connect():
+                            response = {"status": "ok", "msg": f"Configuration reloaded and connected to {BROKER_HOST}:{BROKER_PORT}"}
+                        else:
+                            response = {"status": "partial", "msg": "Configuration reloaded but connection failed. Check broker availability."}
+                except Exception as e:
+                    response = {"status": "error", "msg": f"Reload config error: {str(e)}"}
             
             elif cmd == "mdns_status":
                 # Get mDNS discovery status
@@ -3042,13 +3114,21 @@ def main():
                        help='Override broker address (format: host:port)')
     args = parser.parse_args()
     
-    # Apply command line overrides
-    global DEBUG_LEVEL, CONTROLLER_ENDPOINT_ID, BROKER_HOST, BROKER_PORT, REPLY_TO_QUEUE
+    # Check configuration validity - exit only in non-daemon mode
+    global DEBUG_LEVEL, CONTROLLER_ENDPOINT_ID, BROKER_HOST, BROKER_PORT, REPLY_TO_QUEUE, CONFIG_VALID
+    
+    if not CONFIG_VALID:
+        if args.daemon:
+            print("[!] Warning: Configuration invalid. Starting daemon to allow GUI configuration access.")
+        else:
+            print("[!] Critical: Configuration invalid. Cannot start in interactive mode.")
+            print("[!] Please fix config.json or run in daemon mode (--daemon) to use GUI.")
+            sys.exit(1)
     
     if args.debug is not None:
         DEBUG_LEVEL = args.debug
     
-    # 顯示當前 debug level
+    # Show current debug level
     debug_names = ["Agent Only", "Both Payloads", "Full Details"]
     print(f"[*] Debug Level: {DEBUG_LEVEL} ({debug_names[DEBUG_LEVEL]})")
     
@@ -3058,37 +3138,47 @@ def main():
         print(f"[*] Controller Endpoint ID overridden: {CONTROLLER_ENDPOINT_ID}")
     
     if args.broker:
-        if ':' in args.broker:
-            host, port = args.broker.split(':', 1)
-            BROKER_HOST = host
-            BROKER_PORT = int(port)
+        if MINI_BROKER_ENABLED:
+            print(f"[!] Warning: Mini-Broker enabled, cannot modify broker config via command line")
+            print(f"[!] Currently using: {BROKER_HOST}:{BROKER_PORT}")
         else:
-            BROKER_HOST = args.broker
-        print(f"[*] Broker overridden: {BROKER_HOST}:{BROKER_PORT}")
+            if ':' in args.broker:
+                host, port = args.broker.split(':', 1)
+                BROKER_HOST = host
+                BROKER_PORT = int(port)
+            else:
+                BROKER_HOST = args.broker
+            print(f"[*] Broker overridden: {BROKER_HOST}:{BROKER_PORT}")
     
     # Check for old daemon in daemon mode
     if args.daemon:
         if not check_and_kill_old_daemon(force=args.force):
-            sys.exit(1)
+            print("[!] Warning: Could not clean up old daemon, but continuing anyway...")
+            print("[!] If port conflicts occur, the new daemon may fail to bind IPC port.")
+            # Don't exit - try to start anyway. IPC bind failure will be caught later.
     
-    # 顯示配置資訊
+    # Display configuration information
     sys.stdout.flush()  # Ensure previous output is visible
     print(f"[*] Controller: {CONTROLLER_ENDPOINT_ID}")
     print(f"[*] Broker: {BROKER_HOST}:{BROKER_PORT}")
     print(f"[*] Receive Topic: {RECEIVE_TOPIC}")
     sys.stdout.flush()
     
-    # Init STOMP
+    # Init STOMP (skip if config is invalid)
     stomp_mgr = STOMPManager()
-    if not stomp_mgr.connect():
+    if CONFIG_VALID and not stomp_mgr.connect():
         if args.daemon:
             print("[!] Warning: STOMP connection failed. Starting daemon anyway to allow IPC access.")
         else:
             print("[!] Critical: STOMP connection failed. Exiting.")
             sys.exit(1)
+    elif not CONFIG_VALID:
+        print("[!] Warning: Configuration invalid. STOMP connection skipped.")
+        if args.daemon:
+            print("[!] IPC server will start. Use GUI to fix configuration and reconnect.")
     
-    # Start mDNS discovery if enabled
-    if ENABLE_MDNS_DISCOVERY:
+    # Start mDNS discovery if enabled and connected
+    if CONFIG_VALID and stomp_mgr.connected and ENABLE_MDNS_DISCOVERY:
         stomp_mgr.start_mdns_discovery()
     
     # Start IPC Server only in daemon mode
@@ -3100,22 +3190,40 @@ def main():
         
         ipc_server = IPCServer(stomp_mgr)
         ipc_server.start()
+        
+        # Wait for IPC server to start (or fail)
+        time.sleep(0.5)
+        
         sys.stdout.flush()  # Ensure previous output is visible
         print("="*60)
         print(f"[OK] USP Controller Daemon Started")
         print(f"[OK] PID: {os.getpid()}")
-        print(f"[OK] IPC Server: {IPC_HOST}:{IPC_PORT}")
-        print(f"[OK] STOMP Broker: {BROKER_HOST}:{BROKER_PORT}")
+        
+        # Check IPC server status
+        if ipc_server.started:
+            print(f"[OK] IPC Server: {IPC_HOST}:{IPC_PORT}")
+        elif ipc_server.error:
+            print(f"[ERROR] IPC Server failed to start: {ipc_server.error}")
+            print(f"[WARNING] GUI will not be able to connect!")
+            if "already in use" in str(ipc_server.error).lower() or "98" in str(ipc_server.error):
+                print(f"[TIP] Port {IPC_PORT} is already in use. Kill old daemon or change port in config.json")
+        else:
+            print(f"[WARNING] IPC Server status unknown")
+        
+        # Show STOMP status
+        if stomp_mgr.connected:
+            print(f"[OK] STOMP Broker: {BROKER_HOST}:{BROKER_PORT}")
+        else:
+            print(f"[WARNING] STOMP Broker: NOT CONNECTED")
+            print(f"[INFO] Use GUI to fix configuration and reconnect")
+        
         print("="*60)
         print("[WARNING] This is a background daemon process")
         print("[WARNING] DO NOT close this window - GUI depends on it")
         print("[INFO] You can minimize this window safely")
-        print("[INFO] Logs are being written to usp_controller.log")
         print("="*60)
         print("")
-        sys.stdout.flush()  # Force output to displayNFO] Logs are being written to usp_controller.log")
-        print("="*60)
-        print("")
+        sys.stdout.flush()  # Force output to display
         
         try:
             while True:
