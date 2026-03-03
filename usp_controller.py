@@ -69,7 +69,7 @@ except ImportError:
 def load_config(config_file='config.json'):
     """Load configuration from JSON file"""
     try:
-        with open(config_file, 'r') as f:
+        with open(config_file, 'r', encoding='utf-8') as f:
             config = json.load(f)
         return config
     except FileNotFoundError:
@@ -78,12 +78,16 @@ def load_config(config_file='config.json'):
     except json.JSONDecodeError as e:
         print(f"[!] Error parsing config file: {e}")
         return None
+    except UnicodeDecodeError as e:
+        print(f"[!] Config file encoding error: {e}")
+        print(f"[!] Please ensure config.json is saved in UTF-8 encoding.")
+        return None
 
 def save_config(config, config_file='config.json'):
     """Save configuration to JSON file"""
     try:
-        with open(config_file, 'w') as f:
-            json.dump(config, f, indent=2)
+        with open(config_file, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
         return True
     except Exception as e:
         print(f"[!] Error saving config file: {e}")
@@ -562,8 +566,8 @@ class STOMPManager:
     def save_devices(self):
         """Save known devices to file"""
         try:
-            with open(DEVICES_FILE, 'w') as f:
-                json.dump(self.devices, f, indent=2)
+            with open(DEVICES_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.devices, f, indent=2, ensure_ascii=False)
         except Exception as e:
             Logger.critical(f"Failed to save devices: {e}")
     
@@ -759,6 +763,38 @@ class STOMPManager:
                 
         except Exception as e:
             Logger.critical(f"Connection error: {e}")
+            return False
+
+    def disconnect(self):
+        """Disconnect from STOMP broker"""
+        try:
+            self.running = False
+            self.connected = False
+            
+            if self.sock:
+                try:
+                    # Send DISCONNECT frame
+                    disconnect_frame = "DISCONNECT\n\n\0"
+                    self.sock.sendall(disconnect_frame.encode('utf-8'))
+                    time.sleep(0.1)  # Give broker time to process
+                except:
+                    pass
+                
+                try:
+                    self.sock.close()
+                except:
+                    pass
+                
+                self.sock = None
+            
+            # Clear subscription IDs
+            self.subscription_ids = {}
+            
+            Logger.info("Disconnected from STOMP broker", level=0)
+            return True
+            
+        except Exception as e:
+            Logger.critical(f"Disconnect error: {e}")
             return False
 
     def subscribe(self, destination):
@@ -1510,7 +1546,11 @@ class IPCServer(threading.Thread):
             if cmd == "status":
                 response = {
                     "status": "ok",
-                    "connected": self.stomp.connected,
+                    "daemon_running": True,  # IPC server is responding
+                    "broker_connected": self.stomp.connected,
+                    "broker_host": BROKER_HOST,
+                    "broker_port": BROKER_PORT,
+                    "config_valid": CONFIG_VALID,
                     "devices_count": len(self.stomp.devices),
                     "last_active": self.stomp.last_active_device,
                     "subscriptions": list(self.stomp.subscription_ids.keys())
@@ -1743,20 +1783,82 @@ class IPCServer(threading.Thread):
                 else:
                     response = {"status": "error", "msg": "usage: set_debug <level>"}
             
-            elif cmd == "reconnect":
-                # Attempt STOMP reconnection
+            elif cmd == "start_broker" or cmd == "connect_broker":
+                # Start/Connect to STOMP broker
+                if not CONFIG_VALID:
+                    response = {"status": "error", "msg": "Configuration invalid. Fix config first."}
+                elif self.stomp.connected:
+                    response = {"status": "ok", "msg": "Broker already connected"}
+                else:
+                    try:
+                        if self.stomp.connect():
+                            # Start mDNS discovery if enabled
+                            if ENABLE_MDNS_DISCOVERY:
+                                self.stomp.start_mdns_discovery()
+                            response = {"status": "ok", "msg": f"Connected to broker {BROKER_HOST}:{BROKER_PORT}"}
+                        else:
+                            response = {"status": "error", "msg": "Failed to connect to broker"}
+                    except Exception as e:
+                        response = {"status": "error", "msg": f"Connection error: {str(e)}"}
+            
+            elif cmd == "stop_broker" or cmd == "disconnect_broker":
+                # Disconnect from STOMP broker
+                if not self.stomp.connected:
+                    response = {"status": "ok", "msg": "Broker already disconnected"}
+                else:
+                    try:
+                        # Stop mDNS discovery
+                        self.stomp.stop_mdns_discovery()
+                        
+                        if self.stomp.disconnect():
+                            response = {"status": "ok", "msg": "Disconnected from broker"}
+                        else:
+                            response = {"status": "error", "msg": "Disconnect failed"}
+                    except Exception as e:
+                        response = {"status": "error", "msg": f"Disconnect error: {str(e)}"}
+            
+            elif cmd == "restart_broker" or cmd == "reconnect":
+                # Restart STOMP broker connection
+                if not CONFIG_VALID:
+                    response = {"status": "error", "msg": "Configuration invalid. Fix config first."}
+                else:
+                    try:
+                        # Disconnect if connected
+                        if self.stomp.connected:
+                            self.stomp.stop_mdns_discovery()
+                            self.stomp.disconnect()
+                            time.sleep(0.5)  # Wait for clean disconnect
+                        
+                        # Reconnect
+                        if self.stomp.connect():
+                            if ENABLE_MDNS_DISCOVERY:
+                                self.stomp.start_mdns_discovery()
+                            response = {"status": "ok", "msg": f"Reconnected to broker {BROKER_HOST}:{BROKER_PORT}"}
+                        else:
+                            response = {"status": "error", "msg": "Reconnection failed"}
+                    except Exception as e:
+                        response = {"status": "error", "msg": f"Reconnection error: {str(e)}"}
+            
+            elif cmd == "get_config":
+                # Return current configuration
                 try:
-                    if self.stomp.connected:
-                        self.stomp.sock.close()
-                        self.stomp.connected = False
-                        time.sleep(1) # Wait for close
-                    
-                    if self.stomp.connect():
-                        response = {"status": "ok", "msg": "Reconnected to STOMP Broker"}
-                    else:
-                        response = {"status": "error", "msg": "Reconnection failed (Check logs)"}
+                    response = {
+                        "status": "ok",
+                        "config": {
+                            "broker_host": BROKER_HOST,
+                            "broker_port": BROKER_PORT,
+                            "username": USERNAME,
+                            "password": "***" if PASSWORD else "",  # Don't expose password
+                            "controller_endpoint_id": CONTROLLER_ENDPOINT_ID,
+                            "receive_topic": RECEIVE_TOPIC,
+                            "reply_to_queue": REPLY_TO_QUEUE,
+                            "mini_broker_enabled": MINI_BROKER_ENABLED,
+                            "mdns_discovery": ENABLE_MDNS_DISCOVERY,
+                            "config_valid": CONFIG_VALID
+                        }
+                    }
                 except Exception as e:
-                    response = {"status": "error", "msg": f"Reconnection error: {str(e)}"}
+                    response = {"status": "error", "msg": f"Error: {str(e)}"}
             
             elif cmd == "reload_config":
                 # Reload configuration from config.json and reconnect if valid
@@ -2473,6 +2575,26 @@ class IPCServer(threading.Thread):
                 
                 result = self.stomp.mdns_scan_now(timeout)
                 response = result
+
+            elif cmd == "shutdown" or cmd == "quit":
+                # Shutdown daemon gracefully
+                response = {"status": "ok", "msg": "Daemon shutting down..."}
+                client.sendall(json.dumps(response).encode('utf-8'))
+                client.close()
+                
+                # Schedule shutdown
+                print("[*] Shutdown command received via IPC")
+                self.running = False
+                
+                # Disconnect from broker
+                if self.stomp.connected:
+                    print("[*] Disconnecting from broker...")
+                    self.stomp.stop_mdns_discovery()
+                    self.stomp.disconnect()
+                
+                # Exit daemon
+                import sys
+                sys.exit(0)
 
             elif cmd == "poll_logs":
                 # poll_logs [last_id]
