@@ -503,6 +503,15 @@ class STOMPManager:
         # mDNS Service Discovery
         self.mdns_zeroconf = None
         self.mdns_browser = None
+
+    def is_connection_alive(self):
+        """Return True only when connected flag and socket state are both healthy."""
+        if not self.connected or not self.sock:
+            return False
+        try:
+            return self.sock.fileno() != -1
+        except Exception:
+            return False
     
     def _match_param_to_template(self, instance_path, template_paths):
         """Match instance path to template path with {i} placeholders
@@ -712,9 +721,33 @@ class STOMPManager:
 
     def connect(self):
         try:
+            target_host = str(BROKER_HOST).strip()
+            target_port = BROKER_PORT
+
+            # Normalize host forms that are invalid for socket connect target
+            if target_host.startswith('stomp://'):
+                target_host = target_host[len('stomp://'):]
+            if target_host.startswith('tcp://'):
+                target_host = target_host[len('tcp://'):]
+
+            if target_host in ('0.0.0.0', '::', ''):
+                Logger.info(f"Broker host '{BROKER_HOST}' is not connectable as client target, using 127.0.0.1", level=0)
+                target_host = '127.0.0.1'
+
+            # Allow accidental host:port in broker_host
+            if ':' in target_host and target_host.count(':') == 1:
+                maybe_host, maybe_port = target_host.split(':', 1)
+                if maybe_port.isdigit():
+                    target_host = maybe_host.strip() or '127.0.0.1'
+                    target_port = int(maybe_port)
+
+            target_port = int(target_port)
+            if not (1 <= target_port <= 65535):
+                raise ValueError(f"Invalid broker port: {target_port}")
+
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(10)
-            self.sock.connect((BROKER_HOST, BROKER_PORT))
+            self.sock.connect((target_host, target_port))
             
             # heart-beat: send,receive (milliseconds)
             # 0,0 = disable heartbeat (heartbeat thread is disabled)
@@ -737,7 +770,7 @@ class STOMPManager:
             if response and b'CONNECTED' in response:
                 self.connected = True
                 self.running = True
-                Logger.success(f"Connected to STOMP Broker ({BROKER_HOST}:{BROKER_PORT})", level=0)
+                Logger.success(f"Connected to STOMP Broker ({target_host}:{target_port})", level=0)
                 
                 # Start receiver thread
                 self.recv_thread = threading.Thread(target=self._receiver_loop, daemon=True)
@@ -749,12 +782,15 @@ class STOMPManager:
                 Logger.info("Heartbeat thread disabled for testing", level=1)
                 
                 # Controller only subscribes to its own receive queue
-                self.subscribe(RECEIVE_TOPIC)
+                self.subscription_ids = {}
+                if not self.subscribe(RECEIVE_TOPIC):
+                    raise RuntimeError(f"Failed to subscribe to {RECEIVE_TOPIC}")
                 Logger.info(f"Subscribed to: {RECEIVE_TOPIC}", level=1)
                 
                 # If reply_to_queue is different, subscribe to it as well
                 if RECEIVE_TOPIC != REPLY_TO_QUEUE:
-                    self.subscribe(REPLY_TO_QUEUE)
+                    if not self.subscribe(REPLY_TO_QUEUE):
+                        raise RuntimeError(f"Failed to subscribe to {REPLY_TO_QUEUE}")
                     Logger.info(f"Subscribed to: {REPLY_TO_QUEUE}", level=1)
                 
                 # Load known devices (only record reply_to, don't subscribe)
@@ -769,6 +805,14 @@ class STOMPManager:
                 
         except Exception as e:
             Logger.critical(f"Connection error: {e}")
+            self.connected = False
+            self.running = False
+            try:
+                if self.sock:
+                    self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
             return False
 
     def disconnect(self):
@@ -804,18 +848,24 @@ class STOMPManager:
             return False
 
     def subscribe(self, destination):
-        if not self.connected: return
-        
-        sub_id = f"sub-{len(self.subscription_ids)}"
-        frame = (
-            f"SUBSCRIBE\n"
-            f"id:{sub_id}\n"
-            f"destination:{destination}\n"
-            f"ack:auto\n"
-            f"\n\0"
-        )
-        self.sock.sendall(frame.encode('utf-8'))
-        self.subscription_ids[destination] = sub_id
+        if not self.connected:
+            return False
+
+        try:
+            sub_id = f"sub-{len(self.subscription_ids)}"
+            frame = (
+                f"SUBSCRIBE\n"
+                f"id:{sub_id}\n"
+                f"destination:{destination}\n"
+                f"ack:auto\n"
+                f"\n\0"
+            )
+            self.sock.sendall(frame.encode('utf-8'))
+            self.subscription_ids[destination] = sub_id
+            return True
+        except Exception as e:
+            Logger.critical(f"Subscribe error ({destination}): {e}")
+            return False
 
     def send(self, destination, body_bytes, content_type='application/vnd.bbf.usp.msg', reply_to=None):
         if not self.connected: return False
@@ -917,6 +967,7 @@ class STOMPManager:
             except Exception as e:
                 if self.running:
                     Logger.critical(f"Receiver error: {e}")
+                self.connected = False
                 break
 
     def _heartbeat_loop(self):
@@ -1552,10 +1603,13 @@ class IPCServer(threading.Thread):
             cmd = cmd_parts[0].lower()
             
             if cmd == "status":
+                broker_connected = self.stomp.is_connection_alive()
+                if self.stomp.connected != broker_connected:
+                    self.stomp.connected = broker_connected
                 response = {
                     "status": "ok",
                     "daemon_running": True,  # IPC server is responding
-                    "broker_connected": self.stomp.connected,
+                    "broker_connected": broker_connected,
                     "broker_host": BROKER_HOST,
                     "broker_port": BROKER_PORT,
                     "config_valid": CONFIG_VALID,
@@ -1704,17 +1758,32 @@ class IPCServer(threading.Thread):
                     response = {"status": "error", "msg": "usage: operate <endpoint> <command> [key=value ...]"}
 
             elif cmd == "get_config":
-                # Returns current configuration and debug level
+                # Returns current configuration and debug level (normalized schema)
                 response = {
                     "status": "ok",
                     "config": {
+                        # Legacy flat keys
                         "broker_host": BROKER_HOST,
                         "broker_port": BROKER_PORT,
+                        "controller_endpoint_id": CONTROLLER_ENDPOINT_ID,
                         "controller_id": CONTROLLER_ENDPOINT_ID,
                         "receive_topic": RECEIVE_TOPIC,
                         "debug_level": DEBUG_LEVEL,
                         "username": USERNAME,
-                        "ipc_port": IPC_PORT
+                        "ipc_port": IPC_PORT,
+                        # GUI-preferred nested keys
+                        "usp_controller": {
+                            "broker_host": BROKER_HOST,
+                            "broker_port": BROKER_PORT,
+                            "username": USERNAME,
+                            "controller_endpoint_id": CONTROLLER_ENDPOINT_ID,
+                            "receive_topic": RECEIVE_TOPIC,
+                            "devices_file": DEVICES_FILE,
+                        },
+                        "ipc": {
+                            "host": IPC_HOST,
+                            "port": IPC_PORT,
+                        }
                     }
                 }
             
@@ -2697,13 +2766,31 @@ class IPCServer(threading.Thread):
         """Helper to construct USP Get"""
         import queue
         from datetime import datetime
+
+        def _supersede_pending_request(request_key):
+            existing_msg_id = self.stomp.pending_requests.get(request_key)
+            if not existing_msg_id:
+                return
+
+            previous = self.stomp.pending_ipc_requests.pop(existing_msg_id, None)
+            self.stomp.pending_requests.pop(request_key, None)
+
+            if previous:
+                previous_queue = previous.get('result_queue')
+                if previous_queue:
+                    try:
+                        previous_queue.put_nowait({
+                            "status": "superseded",
+                            "msg": "Request superseded by a newer duplicate request"
+                        })
+                    except Exception:
+                        pass
+                Logger.info(f"[IPC] Superseded pending request: {request_key}", level=1)
         
         # Check for duplicate request
         request_key = (endpoint, 'get', path)
         if wait_response and request_key in self.stomp.pending_requests:
-            existing_msg_id = self.stomp.pending_requests[request_key]
-            if existing_msg_id in self.stomp.pending_ipc_requests:
-                return {"status": "error", "msg": "Duplicate request already pending"}
+            _supersede_pending_request(request_key)
         
         msg_id = str(uuid.uuid4())
         usp_msg = msg_pb2.Msg()
@@ -2747,7 +2834,15 @@ class IPCServer(threading.Thread):
                     del self.stomp.pending_ipc_requests[msg_id]
                 if request_key in self.stomp.pending_requests:
                     del self.stomp.pending_requests[request_key]
-                return {"status": "timeout", "msg": f"No response after {timeout}s"}
+                return {
+                    "status": "timeout",
+                    "msg": f"Message sent to broker, but no agent response after {timeout}s",
+                    "sent_to_broker": True,
+                    "no_agent_response": True,
+                    "daemon_alive": True,
+                    "endpoint": endpoint,
+                    "path": path,
+                }
         
         return True
     
@@ -2767,13 +2862,31 @@ class IPCServer(threading.Thread):
         """
         import queue
         from datetime import datetime
+
+        def _supersede_pending_request(request_key):
+            existing_msg_id = self.stomp.pending_requests.get(request_key)
+            if not existing_msg_id:
+                return
+
+            previous = self.stomp.pending_ipc_requests.pop(existing_msg_id, None)
+            self.stomp.pending_requests.pop(request_key, None)
+
+            if previous:
+                previous_queue = previous.get('result_queue')
+                if previous_queue:
+                    try:
+                        previous_queue.put_nowait({
+                            "status": "superseded",
+                            "msg": "Request superseded by a newer duplicate request"
+                        })
+                    except Exception:
+                        pass
+                Logger.info(f"[IPC] Superseded pending request: {request_key}", level=1)
         
         # Check for duplicate request
         request_key = (endpoint, 'set', path)
         if wait_response and request_key in self.stomp.pending_requests:
-            existing_msg_id = self.stomp.pending_requests[request_key]
-            if existing_msg_id in self.stomp.pending_ipc_requests:
-                return {"status": "error", "msg": "Duplicate request already pending"}
+            _supersede_pending_request(request_key)
         
         msg_id = str(uuid.uuid4())
         usp_msg = msg_pb2.Msg()
@@ -2832,7 +2945,15 @@ class IPCServer(threading.Thread):
                     del self.stomp.pending_ipc_requests[msg_id]
                 if request_key in self.stomp.pending_requests:
                     del self.stomp.pending_requests[request_key]
-                return {"status": "timeout", "msg": f"No response after {timeout}s"}
+                return {
+                    "status": "timeout",
+                    "msg": f"Message sent to broker, but no agent response after {timeout}s",
+                    "sent_to_broker": True,
+                    "no_agent_response": True,
+                    "daemon_alive": True,
+                    "endpoint": endpoint,
+                    "path": path,
+                }
         
         return True
     
@@ -2890,13 +3011,31 @@ class IPCServer(threading.Thread):
         """Helper to construct USP GetInstances"""
         import queue
         from datetime import datetime
+
+        def _supersede_pending_request(request_key):
+            existing_msg_id = self.stomp.pending_requests.get(request_key)
+            if not existing_msg_id:
+                return
+
+            previous = self.stomp.pending_ipc_requests.pop(existing_msg_id, None)
+            self.stomp.pending_requests.pop(request_key, None)
+
+            if previous:
+                previous_queue = previous.get('result_queue')
+                if previous_queue:
+                    try:
+                        previous_queue.put_nowait({
+                            "status": "superseded",
+                            "msg": "Request superseded by a newer duplicate request"
+                        })
+                    except Exception:
+                        pass
+                Logger.info(f"[IPC] Superseded pending request: {request_key}", level=1)
         
         # Check for duplicate request
         request_key = (endpoint, 'get_instances', obj_path)
         if wait_response and request_key in self.stomp.pending_requests:
-            existing_msg_id = self.stomp.pending_requests[request_key]
-            if existing_msg_id in self.stomp.pending_ipc_requests:
-                return {"status": "error", "msg": "Duplicate request already pending"}
+            _supersede_pending_request(request_key)
         
         msg_id = str(uuid.uuid4())
         usp_msg = msg_pb2.Msg()
@@ -2942,7 +3081,15 @@ class IPCServer(threading.Thread):
                     del self.stomp.pending_ipc_requests[msg_id]
                 if request_key in self.stomp.pending_requests:
                     del self.stomp.pending_requests[request_key]
-                return {"status": "timeout", "msg": f"No response after {timeout}s"}
+                return {
+                    "status": "timeout",
+                    "msg": f"Message sent to broker, but no agent response after {timeout}s",
+                    "sent_to_broker": True,
+                    "no_agent_response": True,
+                    "daemon_alive": True,
+                    "endpoint": endpoint,
+                    "path": obj_path,
+                }
         
         return True
     

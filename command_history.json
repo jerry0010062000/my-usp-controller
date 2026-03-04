@@ -6,5 +6,15 @@
   "get proto::agent-opl Device.LocalAgent.MTP.1.",
   "get proto::agent-opl Device.WiFi.",
   "get proto::agent-opl Device.",
-  "get proto::agent-id Device.WiFi."
+  "get proto::agent-id Device.WiFi.",
+  "get proto::agent-id Device.DeviceInfo.SoftwareVersion",
+  "status",
+  "reconnect",
+  "status",
+  "get proto::agent-id Device.DeviceInfo.SoftwareVersion",
+  "get proto::agent-id Device.LocalAgent.",
+  "get proto::agent-id Device.WiFi.",
+  "get proto::agent-id Device.DeviceInfo.SoftwareVersion",
+  "get proto::agent-id Device.WiFi.",
+  "get proto::agent-id Device.LocalAgent."
 ]

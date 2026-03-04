@@ -62,6 +62,23 @@ class ConfigManager:
                 resp = ipc_client.send_command('get_config')
                 if resp and resp.get('status') == 'ok':
                     config = resp.get('config', {})
+
+                    # Normalize legacy flat config shape from daemon
+                    if isinstance(config, dict) and 'usp_controller' not in config:
+                        controller_id = config.get('controller_endpoint_id') or config.get('controller_id', '')
+                        config['usp_controller'] = {
+                            'controller_endpoint_id': controller_id,
+                            'receive_topic': config.get('receive_topic', ''),
+                            'broker_host': config.get('broker_host', ''),
+                            'broker_port': config.get('broker_port', ''),
+                            'username': config.get('username', ''),
+                        }
+                        ipc_port = config.get('ipc_port')
+                        if ipc_port:
+                            config['ipc'] = {
+                                'host': config.get('ipc_host', '127.0.0.1'),
+                                'port': ipc_port,
+                            }
             except:
                 pass
         
@@ -99,8 +116,9 @@ class IPCClient:
     def send_command(self, cmd):
         """Send command string and return JSON response. Blocking call."""
         try:
+            timeout_seconds = self._resolve_timeout(cmd)
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(30.0)
+            s.settimeout(timeout_seconds)
             
             # Validate before connect  
             if not isinstance(self.host, str) or not self.host:
@@ -130,7 +148,7 @@ class IPCClient:
             data = b''.join(data_chunks).decode('utf-8')
             return json.loads(data)
         except socket.timeout:
-            return {"status": "error", "msg": "Connection timeout (30s) - daemon may be busy"}
+            return {"status": "error", "msg": f"Connection timeout ({int(timeout_seconds)}s) - daemon may be busy"}
         except ConnectionRefusedError:
             return None
         except ConnectionResetError:
@@ -151,6 +169,31 @@ class IPCClient:
             print(f"[!] IPC Error: {e}")
             print(error_details)
             return {"status": "error", "msg": f"{type(e).__name__}: {str(e)}"}
+
+    def _resolve_timeout(self, cmd):
+        """Resolve IPC socket timeout with buffer to avoid racing daemon-side wait timeout."""
+        default_timeout = 45.0
+        buffer_seconds = 15.0
+
+        try:
+            text = (cmd or "").strip()
+            if not text:
+                return default_timeout
+
+            parts = text.split()
+            if '--timeout' in parts:
+                idx = parts.index('--timeout')
+                if idx + 1 < len(parts):
+                    requested = float(parts[idx + 1])
+                    return max(default_timeout, requested + buffer_seconds)
+
+            verb = parts[0].lower()
+            if verb in {'get', 'set', 'get_instances'}:
+                return default_timeout
+        except Exception:
+            pass
+
+        return default_timeout
 
 # Add tools directory for embedded broker
 sys.path.insert(0, str(Path(__file__).parent / "tools"))
@@ -179,6 +222,7 @@ class BrokerPage(ttk.Frame):
         self.broker_thread = None
         self.broker_running = False
         self.debug_auto_refresh = tk.BooleanVar(value=True)
+        self._last_subscription_signature = None
         
         # Use centralized config manager
         self.config_manager = ConfigManager()
@@ -348,6 +392,7 @@ class BrokerPage(ttk.Frame):
             self.start_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
             self.broker_state_label.config(text="State: ✅ Running", foreground='green')
+            self._last_subscription_signature = self._get_subscription_signature()
             self._show_broker_snapshot()
         else:
             self._log("❌ Mini-Broker failed to start")
@@ -360,6 +405,7 @@ class BrokerPage(ttk.Frame):
             try:
                 self.broker.stop()
                 self.broker_running = False
+                self._last_subscription_signature = None
                 self._log("✅ Mini-Broker stopped")
                 self.start_btn.config(state=tk.NORMAL)
                 self.stop_btn.config(state=tk.DISABLED)
@@ -367,6 +413,24 @@ class BrokerPage(ttk.Frame):
                 self._refresh_broker_status()
             except Exception as e:
                 self._log(f"ERROR: {e}")
+
+    def _get_subscription_signature(self):
+        """Get subscription-only signature for auto snapshot trigger."""
+        if not self.broker_running or not self.broker:
+            return ("stopped",)
+
+        try:
+            with self.broker.lock:
+                subscriber_map = tuple(sorted(
+                    (dest, len(subs)) for dest, subs in self.broker.subscribers.items() if subs
+                ))
+
+            return (
+                "running",
+                subscriber_map,
+            )
+        except Exception:
+            return ("error",)
 
     def _refresh_broker_status(self):
         """Refresh runtime broker metrics"""
@@ -468,6 +532,12 @@ class BrokerPage(ttk.Frame):
         try:
             if self.debug_auto_refresh.get():
                 self._refresh_broker_status()
+
+                signature = self._get_subscription_signature()
+                if signature != self._last_subscription_signature:
+                    self._last_subscription_signature = signature
+                    self._log("[DEBUG] Subscription changed, auto snapshot dump")
+                    self._show_broker_snapshot()
         except Exception:
             pass
         self.after(1500, self._poll_broker_debug)
@@ -585,11 +655,8 @@ class DaemonPage(ttk.Frame):
         
         self.start_btn = ttk.Button(daemon_btn_frame, text="Start Daemon", command=self._start_daemon)
         self.start_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.stop_btn = ttk.Button(daemon_btn_frame, text="Stop Daemon", command=self._stop_daemon, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.force_stop_btn = ttk.Button(daemon_btn_frame, text="🚫 Force Stop", command=self._force_stop_daemon, state=tk.DISABLED)
+
+        self.force_stop_btn = ttk.Button(daemon_btn_frame, text="🚫 Stop Daemon (Force)", command=self._force_stop_daemon, state=tk.DISABLED)
         self.force_stop_btn.pack(side=tk.LEFT, padx=5)
         
         self.restart_btn = ttk.Button(daemon_btn_frame, text="🔄 Restart Daemon", command=self._restart_daemon, state=tk.DISABLED)
@@ -733,7 +800,6 @@ class DaemonPage(ttk.Frame):
                 # Daemon status
                 self.daemon_status_label.config(text="Daemon: ✅ Running", foreground='green')
                 self.start_btn.config(state=tk.DISABLED)
-                self.stop_btn.config(state=tk.NORMAL)
                 self.force_stop_btn.config(state=tk.NORMAL)
                 self.restart_btn.config(state=tk.NORMAL)
                 
@@ -755,14 +821,12 @@ class DaemonPage(ttk.Frame):
                 self.daemon_status_label.config(text="Daemon: ❌ Not Running", foreground='red')
                 self.broker_status_label.config(text="Mini-Broker: ⚪ Unknown", foreground='gray')
                 self.start_btn.config(state=tk.NORMAL)
-                self.stop_btn.config(state=tk.DISABLED)
                 self.force_stop_btn.config(state=tk.DISABLED)
                 self.restart_btn.config(state=tk.DISABLED)
         except:
             self.daemon_status_label.config(text="Daemon: ❌ Not Running", foreground='red')
             self.broker_status_label.config(text="Mini-Broker: ⚪ Unknown", foreground='gray')
             self.start_btn.config(state=tk.NORMAL)
-            self.stop_btn.config(state=tk.DISABLED)
             self.force_stop_btn.config(state=tk.DISABLED)
             self.restart_btn.config(state=tk.DISABLED)
     
@@ -805,7 +869,11 @@ class DaemonPage(ttk.Frame):
             usp_cfg = config.get('usp_controller', {})
             ipc_cfg = config.get('ipc', {})
 
-            endpoint_id = usp_cfg.get('controller_endpoint_id') or config.get('controller_endpoint_id', '')
+            endpoint_id = (
+                usp_cfg.get('controller_endpoint_id')
+                or config.get('controller_endpoint_id')
+                or config.get('controller_id', '')
+            )
             ipc_host = ipc_cfg.get('host', '127.0.0.1')
             ipc_port = ipc_cfg.get('port', 6001)
 
@@ -1132,7 +1200,6 @@ class DaemonPage(ttk.Frame):
                     self._log("ℹ️ Daemon process already exited", 'info')
                 
                 self.daemon_process = None
-                self.stop_btn.config(state=tk.DISABLED)
                 self.force_stop_btn.config(state=tk.DISABLED)
                 self.restart_btn.config(state=tk.DISABLED)
                 self.start_btn.config(state=tk.NORMAL)
@@ -1251,7 +1318,6 @@ class DaemonPage(ttk.Frame):
         
         # Update UI
         self.daemon_process = None
-        self.stop_btn.config(state=tk.DISABLED)
         self.force_stop_btn.config(state=tk.DISABLED)
         self.restart_btn.config(state=tk.DISABLED)
         self.start_btn.config(state=tk.NORMAL)
@@ -1290,14 +1356,12 @@ class DaemonPage(ttk.Frame):
             else:
                 self._log("✅ Daemon stopped successfully", 'success')
                 self.daemon_process = None
-                self.stop_btn.config(state=tk.DISABLED)
                 self.restart_btn.config(state=tk.DISABLED)
                 self.start_btn.config(state=tk.NORMAL)
                 self._update_status()
         except:
             self._log("✅ Daemon stopped (no IPC response)", 'success')
             self.daemon_process = None
-            self.stop_btn.config(state=tk.DISABLED)
             self.force_stop_btn.config(state=tk.DISABLED)
             self.restart_btn.config(state=tk.DISABLED)
             self.start_btn.config(state=tk.NORMAL)
@@ -1490,7 +1554,7 @@ class DaemonPage(ttk.Frame):
                 exit_msg = f"⚠️ Daemon process exited with code {exit_code}"
                 self.after(0, self._log_from_thread, exit_msg, 'warning')
                 self.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
-                self.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
+                self.after(0, lambda: self.force_stop_btn.config(state=tk.DISABLED))
     
     def _log_from_thread(self, message, level='output'):
         """Helper to log from background thread"""
@@ -1717,7 +1781,13 @@ class DaemonConfigEditorDialog(tk.Toplevel):
         ttk.Label(frame, text="Endpoint ID:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.endpoint_entry = ttk.Entry(frame, width=40)
         usp_cfg = self.config.get('usp_controller', {})
-        self.endpoint_entry.insert(0, usp_cfg.get('controller_endpoint_id', self.config.get('controller_endpoint_id', '')))
+        self.endpoint_entry.insert(
+            0,
+            usp_cfg.get(
+                'controller_endpoint_id',
+                self.config.get('controller_endpoint_id', self.config.get('controller_id', ''))
+            )
+        )
         self.endpoint_entry.grid(row=0, column=1, sticky=tk.EW, padx=10, pady=5)
         
         ttk.Label(frame, text="Example: proto::controller.my-laptop", 
@@ -2322,8 +2392,30 @@ class CLIPage(ttk.Frame):
         
         # All other commands require daemon - send via IPC
         try:
+            is_usp_payload = self._is_usp_payload_command(command)
+
             # Execute command via IPC in background thread
             def execute_in_background():
+                if is_usp_payload:
+                    status_resp = self.ipc.send_command('status')
+
+                    if status_resp is None or status_resp.get('status') != 'ok':
+                        self.after(0, lambda: self._display_route_blocked(
+                            "Daemon not running. Start daemon first so CLI commands follow GUI -> Daemon -> Broker -> Agent."
+                        ))
+                        return
+
+                    if not status_resp.get('broker_connected', False):
+                        broker_host = status_resp.get('broker_host', '127.0.0.1')
+                        broker_port = status_resp.get('broker_port', 61613)
+                        self.after(0, lambda: self._display_route_blocked(
+                            f"Daemon is running but broker is not connected ({broker_host}:{broker_port}). "
+                            "Connect broker from Daemon tab first."
+                        ))
+                        return
+
+                    self.after(0, self._display_route_info)
+
                 response = self.ipc.send_command(command)
                 # Update UI in main thread
                 self.after(0, lambda: self._display_response(command, response))
@@ -2334,19 +2426,53 @@ class CLIPage(ttk.Frame):
             self.output_text.insert(tk.END, f"Error: {e}\n", 'error')
             self.output_text.insert(tk.END, "\n>>> ")
             self.output_text.see(tk.END)
+
+    def _is_usp_payload_command(self, command):
+        """Return True if command is a USP payload command that must pass full architecture path."""
+        if not command:
+            return False
+        cmd = command.strip().split()[0].lower()
+        return cmd in {'get', 'set', 'add', 'delete', 'get_instances', 'get_supported', 'operate'}
+
+    def _display_route_info(self):
+        """Display architecture route for USP payload commands."""
+        self.output_text.insert(
+            tk.END,
+            "🔁 Route: CLI -> Daemon(IPC) -> Broker(STOMP) -> Agent\n",
+            'info'
+        )
+        self.output_text.see(tk.END)
+
+    def _display_route_blocked(self, reason):
+        """Display why USP command was blocked before dispatch."""
+        self.output_text.insert(tk.END, f"❌ Route guard blocked command: {reason}\n", 'error')
+        self.output_text.insert(tk.END, "\n>>> ")
+        self.output_text.see(tk.END)
+        self.output_text.update_idletasks()
     
     def _display_response(self, command, response):
         """Display command response in terminal"""
         if response is None:
-            # Daemon not running - provide clear instructions
+            # Distinguish between truly-down daemon and command-level no-response
+            status_probe = self.ipc.send_command('status')
+
             self.output_text.insert(tk.END, "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", 'error')
-            self.output_text.insert(tk.END, "❌ Daemon Not Running\n\n", 'error')
-            self.output_text.insert(tk.END, "This command requires the USP daemon to be running.\n\n", 'info')
-            self.output_text.insert(tk.END, "To start daemon:\n", 'info')
-            self.output_text.insert(tk.END, "  1. Switch to 'Daemon' tab\n", 'info')
-            self.output_text.insert(tk.END, "  2. Click 'Start Daemon'\n\n", 'info')
-            self.output_text.insert(tk.END, "Or run manually in terminal:\n", 'info')
-            self.output_text.insert(tk.END, "  python usp_controller.py --daemon\n", 'command')
+            if status_probe and status_probe.get('status') == 'ok':
+                self.output_text.insert(tk.END, "❌ Command returned no response\n\n", 'error')
+                self.output_text.insert(tk.END, "Daemon is reachable, but this command did not return a payload.\n", 'warning')
+                self.output_text.insert(tk.END, "Possible causes:\n", 'warning')
+                self.output_text.insert(tk.END, "  - Agent did not respond in time\n", 'warning')
+                self.output_text.insert(tk.END, "  - Broker route/session issue\n", 'warning')
+                self.output_text.insert(tk.END, "  - Command processing failed in daemon\n", 'warning')
+            else:
+                self.output_text.insert(tk.END, "❌ Daemon Not Running\n\n", 'error')
+                self.output_text.insert(tk.END, "This command requires the USP daemon to be running.\n\n", 'info')
+                self.output_text.insert(tk.END, "To start daemon:\n", 'info')
+                self.output_text.insert(tk.END, "  1. Switch to 'Daemon' tab\n", 'info')
+                self.output_text.insert(tk.END, "  2. Click 'Start Daemon'\n\n", 'info')
+                self.output_text.insert(tk.END, "Or run manually in terminal:\n", 'info')
+                self.output_text.insert(tk.END, "  python usp_controller.py --daemon\n", 'command')
+
             self.output_text.insert(tk.END, "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", 'error')
         elif response.get('status') == 'ok':
             # Success - format output based on command type
@@ -2363,6 +2489,15 @@ class CLIPage(ttk.Frame):
                 for key, value in response.items():
                     if key not in ['status', 'msg']:
                         self.output_text.insert(tk.END, f"   {key}: {value}\n", 'info')
+        elif response.get('status') == 'timeout' and response.get('sent_to_broker'):
+            self.output_text.insert(tk.END, f"⏱️ {response.get('msg', 'No agent response')}\n", 'warning')
+            endpoint = response.get('endpoint')
+            path = response.get('path')
+            if endpoint or path:
+                self.output_text.insert(tk.END, f"   endpoint: {endpoint}\n", 'warning')
+                self.output_text.insert(tk.END, f"   path: {path}\n", 'warning')
+            self.output_text.insert(tk.END, "   daemon: reachable\n", 'warning')
+            self.output_text.insert(tk.END, "   route: CLI -> Daemon -> Broker (sent) -> Agent (no response)\n", 'warning')
         else:
             # Error response
             self.output_text.insert(tk.END, f"❌ Error: {response.get('msg', 'Unknown error')}\n", 'error')
@@ -2374,7 +2509,7 @@ class CLIPage(ttk.Frame):
     def _display_status_response(self, response):
         """Display status command response"""
         self.output_text.insert(tk.END, "Connection Status:\n", 'info')
-        self.output_text.insert(tk.END, f"  Connected: {response.get('connected', False)}\n", 'info')
+        self.output_text.insert(tk.END, f"  Connected: {response.get('broker_connected', False)}\n", 'info')
         self.output_text.insert(tk.END, f"  Devices: {response.get('devices_count', 0)}\n", 'info')
         if response.get('last_active'):
             self.output_text.insert(tk.END, f"  Last Active: {response.get('last_active')}\n", 'info')
@@ -2450,7 +2585,8 @@ DISCOVERY COMMANDS (Require daemon):
 
 💡 TIPS:
   • Local commands (help, clear, version) work without daemon
-  • USP commands require daemon to be running
+    • USP payload commands are enforced to run via: CLI -> Daemon -> Broker -> Agent
+    • If daemon/broker is not ready, CLI will block USP payload commands before send
   • Start daemon from 'Daemon' tab or run: python usp_controller.py --daemon
   • Use ↑↓ arrow keys to navigate command history
   • Double-click history items to load
@@ -2683,11 +2819,16 @@ class USPControllerGUI:
         self.status_bar = ttk.Label(self.root, text="Ready - Daemon: Not checked", relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Auto start mini-broker when GUI opens
-        self.root.after(300, self._auto_start_mini_broker)
+        # Auto startup sequence when GUI opens: mini-broker -> daemon
+        self.root.after(300, self._auto_start_sequence)
         
         # Check daemon status after GUI loads
         self.root.after(500, self._check_daemon_status)
+
+    def _auto_start_sequence(self):
+        """Auto startup sequence: mini-broker first, then daemon."""
+        self._auto_start_mini_broker()
+        self.root.after(1200, lambda: self._auto_start_daemon_after_broker(retries=8))
 
     def _auto_start_mini_broker(self):
         """Auto-start mini-broker on GUI startup."""
@@ -2702,6 +2843,46 @@ class USPControllerGUI:
                 self.broker_page._log(f"[AUTO] Failed to start Mini-Broker: {e}")
             except Exception:
                 pass
+
+    def _auto_start_daemon_after_broker(self, retries=8):
+        """Auto-start daemon after broker startup sequence (if daemon not already running)."""
+        try:
+            if self._is_daemon_running():
+                try:
+                    self.daemon_page._log("[AUTO] Daemon already running, skip auto-start", 'info')
+                except Exception:
+                    pass
+                return
+
+            # Wait until broker is running before starting daemon
+            if not getattr(self.broker_page, 'broker_running', False):
+                if retries > 0:
+                    self.root.after(700, lambda: self._auto_start_daemon_after_broker(retries=retries - 1))
+                else:
+                    try:
+                        self.daemon_page._log("[AUTO] Mini-Broker not ready, skip daemon auto-start", 'warning')
+                    except Exception:
+                        pass
+                return
+
+            try:
+                self.daemon_page._log("[AUTO] Starting Daemon after Mini-Broker...", 'info')
+            except Exception:
+                pass
+            self.daemon_page._start_daemon()
+        except Exception as e:
+            try:
+                self.daemon_page._log(f"[AUTO] Failed to auto-start daemon: {e}", 'error')
+            except Exception:
+                pass
+
+    def _is_daemon_running(self):
+        """Check daemon runtime status via daemon page IPC client."""
+        try:
+            resp = self.daemon_page.ipc.send_command('status')
+            return bool(resp and resp.get('status') == 'ok' and resp.get('daemon_running'))
+        except Exception:
+            return False
     
     def _check_daemon_status(self):
         """Check daemon status and update status bar"""
@@ -2723,7 +2904,7 @@ class USPControllerGUI:
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="Reload Config", command=self._reload_config)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
+        file_menu.add_command(label="Exit", command=self.on_close)
         
         # Help menu
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -2763,10 +2944,50 @@ class USPControllerGUI:
             "© 2026"
         )
 
+    def on_close(self):
+        """Graceful GUI shutdown: stop polling, daemon and mini-broker."""
+        try:
+            self.status_bar.config(text="Shutting down services...")
+        except Exception:
+            pass
+
+        # Stop CLI background polling first
+        try:
+            self.cli_page.on_close()
+        except Exception:
+            pass
+
+        # Stop daemon via IPC first, then force-stop fallback
+        try:
+            resp = self.daemon_page.ipc.send_command('shutdown')
+            if not (resp and resp.get('status') == 'ok'):
+                self.daemon_page._force_stop_daemon()
+            else:
+                # Give daemon a short moment to exit cleanly
+                time.sleep(0.4)
+        except Exception:
+            try:
+                self.daemon_page._force_stop_daemon()
+            except Exception:
+                pass
+
+        # Stop embedded mini-broker (if running in GUI process)
+        try:
+            if getattr(self.broker_page, 'broker_running', False) and getattr(self.broker_page, 'broker', None):
+                self.broker_page._stop_broker()
+        except Exception:
+            pass
+
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
 
 def main():
     root = tk.Tk()
     app = USPControllerGUI(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
 
 
