@@ -25,6 +25,60 @@ IPC_HOST = '127.0.0.1'
 IPC_PORT = 6001
 
 
+class ConfigManager:
+    """Centralized configuration management with caching"""
+    _instance = None
+    _config_cache = None
+    _cache_time = 0
+    _cache_ttl = 5  # Cache valid for 5 seconds
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def get_config(self, ipc_client=None, force_reload=False):
+        """Get configuration with caching strategy
+        
+        Priority:
+        1. If force_reload: skip cache
+        2. If cache is fresh (< TTL): use cache
+        3. Try IPC (if daemon running)
+        4. Fallback to file
+        """
+        current_time = time.time()
+        
+        # Return cached config if fresh and not forcing reload
+        if not force_reload and self._config_cache and (current_time - self._cache_time < self._cache_ttl):
+            return self._config_cache
+        
+        config = None
+        
+        # Try IPC first if client provided
+        if ipc_client:
+            try:
+                resp = ipc_client.send_command('get_config')
+                if resp and resp.get('status') == 'ok':
+                    config = resp.get('config', {})
+            except:
+                pass
+        
+        # Fallback to file if IPC failed
+        if not config:
+            from usp_core import load_config as load_config_from_file
+            config = load_config_from_file() or {}
+        
+        # Update cache
+        self._config_cache = config
+        self._cache_time = current_time
+        
+        return config
+    
+    def invalidate_cache(self):
+        """Force cache invalidation (e.g., after config save)"""
+        self._cache_time = 0
+
+
 class IPCClient:
     """IPC Client for communicating with daemon"""
     def __init__(self, host=IPC_HOST, port=IPC_PORT):
@@ -123,8 +177,9 @@ class BrokerPage(ttk.Frame):
         self.broker_thread = None
         self.broker_running = False
         
-        # Load config to get default values
-        self.config = load_config() or {}
+        # Use centralized config manager
+        self.config_manager = ConfigManager()
+        self.config = self.config_manager.get_config()
         
         self._create_widgets()
     
@@ -233,8 +288,10 @@ class BrokerPage(ttk.Frame):
             self.after(1000, self._check_broker_started)
             
         except ValueError:
+            self._log("❌ Invalid port number", 'error')
             messagebox.showerror("Error", "Invalid port number")
         except Exception as e:
+            self._log(f"❌ Failed to start broker: {e}", 'error')
             messagebox.showerror("Error", f"Failed to start broker: {e}")
     
     def _check_broker_started(self):
@@ -279,12 +336,36 @@ class DaemonPage(ttk.Frame):
         self.output_reader = None  # Output reader thread
         self.output_reader_running = False  # Output reader control flag
         
+        # Use centralized config manager
+        self.config_manager = ConfigManager()
+        
         self._create_widgets()
         
         # Start background status updater
         self.polling = True
         self.poll_thread = threading.Thread(target=self._status_poller, daemon=True)
         self.poll_thread.start()
+        
+        # Perform initial status check
+        self.after(500, self._initial_status_check)
+    
+    def _initial_status_check(self):
+        """Perform initial status check and provide guidance"""
+        try:
+            resp = self.ipc.send_command('status')
+            if resp and resp.get('status') == 'ok':
+                self._log("✅ Daemon is already running", 'success')
+                if not resp.get('broker_connected'):
+                    self._log("⚠️ Daemon is not connected to broker", 'warning')
+                    self._log("💡 Use 'Connect' button to connect to Mini-Broker", 'info')
+                else:
+                    self._log("✅ Daemon is connected to broker", 'success')
+            else:
+                self._log("ℹ️ No daemon detected", 'info')
+                self._log("💡 Start daemon from this page or run externally", 'info')
+        except:
+            self._log("ℹ️ No daemon detected", 'info')
+            self._log("💡 Click 'Start Daemon' to begin", 'info')
     
     def _status_poller(self):
         """Background thread to poll daemon and broker status"""
@@ -307,8 +388,8 @@ class DaemonPage(ttk.Frame):
         info_frame = ttk.Frame(self)
         info_frame.pack(fill=tk.X, padx=10, pady=(0,5))
         
-        # Get mini broker port from config
-        config = load_config() or {}
+        # Get mini broker port from config manager
+        config = self.config_manager.get_config(self.ipc)
         broker_port = config.get('mini_broker', {}).get('port', 61613)
         
         ttk.Label(info_frame, text=f"💡 Daemon自動連接到Mini Broker (localhost:{broker_port})", 
@@ -340,10 +421,27 @@ class DaemonPage(ttk.Frame):
         self.stop_btn = ttk.Button(daemon_btn_frame, text="Stop Daemon", command=self._stop_daemon, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
         
+        self.force_stop_btn = ttk.Button(daemon_btn_frame, text="🚫 Force Stop", command=self._force_stop_daemon, state=tk.DISABLED)
+        self.force_stop_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.restart_btn = ttk.Button(daemon_btn_frame, text="🔄 Restart Daemon", command=self._restart_daemon, state=tk.DISABLED)
+        self.restart_btn.pack(side=tk.LEFT, padx=5)
+        
         ttk.Separator(daemon_btn_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
         
-        ttk.Button(daemon_btn_frame, text="Edit Endpoint ID", command=self._edit_config).pack(side=tk.LEFT, padx=5)
+        ttk.Button(daemon_btn_frame, text="📝 View Config", command=self._view_config).pack(side=tk.LEFT, padx=5)
+        ttk.Button(daemon_btn_frame, text="⚙️ Edit Config", command=self._edit_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(daemon_btn_frame, text="Reload Config", command=self._reload_config).pack(side=tk.LEFT, padx=5)
+        
+        # Diagnostic tools
+        ttk.Separator(daemon_control_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+        
+        diag_frame = ttk.Frame(daemon_control_frame)
+        diag_frame.pack(fill=tk.X)
+        
+        ttk.Label(diag_frame, text="Diagnostics:", font=('Arial', 9, 'bold')).pack(side=tk.LEFT, padx=5)
+        ttk.Button(diag_frame, text="🔍 Test IPC", command=self._test_ipc).pack(side=tk.LEFT, padx=5)
+        ttk.Button(diag_frame, text="📊 Show Status", command=self._show_detailed_status).pack(side=tk.LEFT, padx=5)
         
         # Broker Connection Control
         broker_control_frame = ttk.LabelFrame(self, text="Mini-Broker Connection Control", padding=10)
@@ -352,9 +450,9 @@ class DaemonPage(ttk.Frame):
         broker_btn_frame = ttk.Frame(broker_control_frame)
         broker_btn_frame.pack(fill=tk.X)
         
-        ttk.Button(broker_btn_frame, text="Connect", command=self._connect_broker).pack(side=tk.LEFT, padx=5)
-        ttk.Button(broker_btn_frame, text="Disconnect", command=self._disconnect_broker).pack(side=tk.LEFT, padx=5)
-        ttk.Button(broker_btn_frame, text="Restart Connection", command=self._restart_broker).pack(side=tk.LEFT, padx=5)
+        ttk.Button(broker_btn_frame, text="▶️ Connect", command=self._connect_broker).pack(side=tk.LEFT, padx=5)
+        ttk.Button(broker_btn_frame, text="⏹️ Disconnect", command=self._disconnect_broker).pack(side=tk.LEFT, padx=5)
+        ttk.Button(broker_btn_frame, text="🔄 Restart", command=self._restart_broker).pack(side=tk.LEFT, padx=5)
         
         # Daemon Output Display
         output_frame = ttk.LabelFrame(self, text="Daemon Output (Real-time)", padding=10)
@@ -381,6 +479,11 @@ class DaemonPage(ttk.Frame):
         # Initial messages
         self._log("Daemon control panel initialized", 'info')
         self._log("Click 'Start Daemon' to launch daemon process", 'info')
+        self._log("", 'info')
+        self._log("💡 Tips:", 'info')
+        self._log("  - Use '🔍 Test IPC' to verify daemon connection", 'info')
+        self._log("  - Use '📊 Show Status' to see detailed daemon info", 'info')
+        self._log("  - Daemon must be running for CLI commands to work", 'info')
     
     def _add_output_context_menu(self):
         """Add context menu to output text widget"""
@@ -404,6 +507,8 @@ class DaemonPage(ttk.Frame):
                 self.daemon_status_label.config(text="Daemon: ✅ Running", foreground='green')
                 self.start_btn.config(state=tk.DISABLED)
                 self.stop_btn.config(state=tk.NORMAL)
+                self.force_stop_btn.config(state=tk.NORMAL)
+                self.restart_btn.config(state=tk.NORMAL)
                 
                 # Mini-Broker connection status (daemon connects to it)
                 broker_connected = resp.get('broker_connected', False)
@@ -424,11 +529,15 @@ class DaemonPage(ttk.Frame):
                 self.broker_status_label.config(text="Mini-Broker: ⚪ Unknown", foreground='gray')
                 self.start_btn.config(state=tk.NORMAL)
                 self.stop_btn.config(state=tk.DISABLED)
+                self.force_stop_btn.config(state=tk.DISABLED)
+                self.restart_btn.config(state=tk.DISABLED)
         except:
             self.daemon_status_label.config(text="Daemon: ❌ Not Running", foreground='red')
             self.broker_status_label.config(text="Mini-Broker: ⚪ Unknown", foreground='gray')
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
+            self.force_stop_btn.config(state=tk.DISABLED)
+            self.restart_btn.config(state=tk.DISABLED)
     
     def _reload_config(self):
         """Reload configuration via IPC"""
@@ -437,15 +546,18 @@ class DaemonPage(ttk.Frame):
             
             # Handle no response
             if resp is None:
+                self._log("❌ Daemon not responding (connection refused)", 'error')
                 messagebox.showerror("Error", "Daemon not responding (connection refused)")
                 return
             
             # Handle error response
             if resp.get('status') != 'ok':
                 error_msg = resp.get('msg', 'Reload failed')
+                self._log(f"❌ {error_msg}", 'error')
                 messagebox.showerror("Error", error_msg)
             else:
-                # Success
+                # Success - invalidate config cache
+                self.config_manager.invalidate_cache()
                 success_msg = resp.get('msg', 'Config reloaded')
                 messagebox.showinfo("Success", success_msg)
             
@@ -453,6 +565,7 @@ class DaemonPage(ttk.Frame):
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
+            self._log(f"❌ Reload config error: {e}", 'error')
             print(f"[!] Reload config error: {e}")
             print(error_details)
             messagebox.showerror("Error", f"Failed to reload config: {e}")
@@ -465,11 +578,19 @@ class DaemonPage(ttk.Frame):
                 if resp.get('status') == 'ok':
                     messagebox.showinfo("Success", resp.get('msg', 'Connecting to Mini-Broker...'))
                 else:
-                    messagebox.showerror("Error", resp.get('msg', 'Connection failed'))
+                    error_msg = resp.get('msg', 'Connection failed')
+                    self._log(f"❌ Failed to connect to broker: {error_msg}", 'error')
+                    messagebox.showerror("Error", f"Failed to connect to broker:\n\n{error_msg}")
             else:
-                messagebox.showerror("Error", "Daemon not responding")
+                self._log("❌ Daemon not responding", 'error')
+                messagebox.showerror("Error", 
+                                   "Daemon not responding\n\n"
+                                   "Possible causes:\n"
+                                   "- Daemon not running (start from Daemon tab)\n"
+                                   "- IPC connection issue (use 'Test IPC' button)")
             self._update_status()
         except Exception as e:
+            self._log(f"❌ Failed to connect: {e}", 'error')
             messagebox.showerror("Error", f"Failed to connect: {e}")
     
     def _disconnect_broker(self):
@@ -480,11 +601,15 @@ class DaemonPage(ttk.Frame):
                 if resp.get('status') == 'ok':
                     messagebox.showinfo("Success", resp.get('msg', 'Disconnected from Mini-Broker'))
                 else:
-                    messagebox.showerror("Error", resp.get('msg', 'Disconnect failed'))
+                    error_msg = resp.get('msg', 'Disconnect failed')
+                    self._log(f"❌ {error_msg}", 'error')
+                    messagebox.showerror("Error", error_msg)
             else:
+                self._log("❌ Daemon not responding", 'error')
                 messagebox.showerror("Error", "Daemon not responding")
             self._update_status()
         except Exception as e:
+            self._log(f"❌ Failed to disconnect: {e}", 'error')
             messagebox.showerror("Error", f"Failed to disconnect: {e}")
     
     def _restart_broker(self):
@@ -495,16 +620,24 @@ class DaemonPage(ttk.Frame):
                 if resp.get('status') == 'ok':
                     messagebox.showinfo("Success", resp.get('msg', 'Broker connection restarted'))
                 else:
-                    messagebox.showerror("Error", resp.get('msg', 'Restart failed'))
+                    error_msg = resp.get('msg', 'Restart failed')
+                    self._log(f"❌ {error_msg}", 'error')
+                    messagebox.showerror("Error", error_msg)
             else:
+                self._log("❌ Daemon not responding", 'error')
                 messagebox.showerror("Error", "Daemon not responding")
             self._update_status()
         except Exception as e:
+            self._log(f"❌ Failed to restart: {e}", 'error')
             messagebox.showerror("Error", f"Failed to restart: {e}")
     
     def _edit_config(self):
         """Open config editor dialog"""
-        ConfigEditorDialog(self, self.ipc)
+        DaemonConfigEditorDialog(self, self.ipc, self.config_manager)
+    
+    def _view_config(self):
+        """View full configuration in a read-only dialog"""
+        ConfigViewDialog(self, self.ipc, self.config_manager)
     
     def _start_daemon(self):
         """Start daemon process with output capture"""
@@ -529,6 +662,8 @@ class DaemonPage(ttk.Frame):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding='utf-8',
+                errors='replace',  # Replace invalid characters instead of failing
                 bufsize=1,
                 cwd=script_dir,  # Set working directory to script location
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
@@ -543,7 +678,10 @@ class DaemonPage(ttk.Frame):
             self.output_reader.start()
             
             self.start_btn.config(state=tk.DISABLED)
-            self.after(2000, self._update_status)  # Update status after 2 seconds
+            
+            # Wait for daemon to start and verify IPC
+            self._log("⏳ Waiting for daemon initialization...", 'info')
+            self.after(3000, self._verify_daemon_started)
         except FileNotFoundError as e:
             self._log(f"❌ {e}", 'error')
             messagebox.showerror("Error", str(e))
@@ -551,20 +689,61 @@ class DaemonPage(ttk.Frame):
             self._log(f"❌ Failed to start daemon: {e}", 'error')
             messagebox.showerror("Error", f"Failed to start daemon: {e}")
     
+    def _verify_daemon_started(self):
+        """Verify daemon started successfully and IPC is working"""
+        max_retries = 5
+        retry_count = 0
+        
+        def check_ipc():
+            nonlocal retry_count
+            retry_count += 1
+            
+            try:
+                resp = self.ipc.send_command('status')
+                if resp and resp.get('status') == 'ok':
+                    self._log("✅ Daemon started successfully!", 'success')
+                    self._log(f"  - IPC Server: operational", 'success')
+                    self._log(f"  - Broker: {'connected' if resp.get('broker_connected') else 'not connected'}", 
+                             'success' if resp.get('broker_connected') else 'warning')
+                    self._update_status()
+                    return True
+                else:
+                    return False
+            except:
+                return False
+        
+        if check_ipc():
+            return
+        
+        if retry_count < max_retries:
+            self._log(f"  Waiting for IPC server ({retry_count}/{max_retries})...", 'info')
+            self.after(1000, self._verify_daemon_started)
+        else:
+            self._log("⚠️ Daemon started but IPC server not responding", 'warning')
+            self._log("ℹ️ Check daemon console for errors", 'info')
+            self._update_status()
+    
     def _stop_daemon(self):
         """Stop daemon process"""
+        self._log("⏹️ Attempting to stop daemon...", 'info')
+        
         # First try IPC shutdown command
+        ipc_success = False
         try:
             resp = self.ipc.send_command('shutdown')
             if resp and resp.get('status') == 'ok':
-                self._log("⏹️ Daemon shutdown command sent via IPC", 'info')
-                messagebox.showinfo("Success", "Daemon shutdown command sent")
-                self.daemon_process = None
-                self.stop_btn.config(state=tk.DISABLED)
-                self.start_btn.config(state=tk.NORMAL)
+                self._log("✅ Daemon shutdown command sent via IPC", 'success')
+                ipc_success = True
+                
+                # Wait a moment for daemon to shutdown
+                self.after(1000, self._verify_daemon_stopped)
                 return
-        except:
-            pass  # IPC failed, try process termination
+            else:
+                self._log("⚠️ IPC shutdown returned unexpected response", 'warning')
+        except ConnectionRefusedError:
+            self._log("ℹ️ Daemon not responding (may already be stopped)", 'info')
+        except Exception as e:
+            self._log(f"⚠️ IPC shutdown failed: {e}", 'warning')
         
         # Fall back to process termination if daemon was started by GUI
         if self.daemon_process:
@@ -572,15 +751,348 @@ class DaemonPage(ttk.Frame):
                 # Stop output reader thread
                 self.output_reader_running = False
                 
-                self.daemon_process.terminate()
-                self._log("⏹️ Daemon process terminated", 'warning')
+                # Check if process is still running
+                if self.daemon_process.poll() is None:
+                    self._log("🔨 Terminating daemon process...", 'info')
+                    self.daemon_process.terminate()
+                    
+                    # Wait for termination (with timeout)
+                    try:
+                        self.daemon_process.wait(timeout=5)
+                        self._log("✅ Daemon process terminated", 'success')
+                    except subprocess.TimeoutExpired:
+                        self._log("⚠️ Daemon not responding, force killing...", 'warning')
+                        self.daemon_process.kill()
+                        self._log("✅ Daemon process killed", 'success')
+                else:
+                    self._log("ℹ️ Daemon process already exited", 'info')
+                
                 self.daemon_process = None
                 self.stop_btn.config(state=tk.DISABLED)
+                self.force_stop_btn.config(state=tk.DISABLED)
+                self.restart_btn.config(state=tk.DISABLED)
                 self.start_btn.config(state=tk.NORMAL)
+                self._update_status()
+                
             except Exception as e:
                 self._log(f"❌ Failed to stop daemon: {e}", 'error')
+                messagebox.showerror("Error", f"Failed to stop daemon process: {e}")
         else:
-            messagebox.showwarning("Warning", "Cannot stop daemon.\n\nDaemon was not started by GUI or IPC command failed.\nTo stop: Close daemon console window or use Task Manager")
+            # Daemon not started by GUI - try to verify if it's really stopped
+            self._log("ℹ️ Daemon was not started by GUI", 'info')
+            self.after(1000, self._verify_daemon_stopped)
+    
+    def _force_stop_daemon(self):
+        """Force stop daemon using PID file and taskkill"""
+        self._log("🚫 Force stopping daemon...", 'warning')
+        
+        stopped = False
+        
+        # Method 1: Kill by PID file (same location as usp_controller.py uses)
+        if sys.platform == 'win32':
+            pid_file = os.path.join(os.environ.get('TEMP', 'C:\\Temp'), 'usp_controller.pid')
+        else:
+            pid_file = '/tmp/usp_controller.pid'
+        
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file, 'r') as f:
+                    pid = int(f.read().strip())
+                
+                self._log(f"📋 Found PID file: {pid}", 'info')
+                
+                if sys.platform == 'win32':
+                    # Windows: use taskkill
+                    result = subprocess.run(
+                        ['taskkill', '/F', '/PID', str(pid)],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    
+                    if result.returncode == 0:
+                        self._log(f"✅ Process {pid} terminated", 'success')
+                        stopped = True
+                    else:
+                        self._log(f"⚠️ taskkill failed: {result.stderr}", 'warning')
+                else:
+                    # Unix: use kill
+                    import signal
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        self._log(f"✅ Process {pid} killed", 'success')
+                        stopped = True
+                    except ProcessLookupError:
+                        self._log(f"ℹ️ Process {pid} not found", 'info')
+                        stopped = True
+                
+                # Remove PID file
+                try:
+                    os.remove(pid_file)
+                    self._log("🗑️ PID file removed", 'info')
+                except Exception as e:
+                    self._log(f"⚠️ Failed to remove PID file: {e}", 'warning')
+                    
+            except Exception as e:
+                self._log(f"❌ Error reading PID file: {e}", 'error')
+        else:
+            self._log("ℹ️ No PID file found", 'info')
+        
+        # Method 2: Kill GUI-started process
+        if self.daemon_process:
+            try:
+                self.output_reader_running = False
+                
+                if self.daemon_process.poll() is None:
+                    self._log("🔨 Killing daemon process...", 'warning')
+                    self.daemon_process.kill()
+                    self.daemon_process.wait(timeout=3)
+                    self._log("✅ Daemon process killed", 'success')
+                    stopped = True
+                    
+                self.daemon_process = None
+            except Exception as e:
+                self._log(f"⚠️ Failed to kill process: {e}", 'warning')
+        
+        # Method 3: Kill all python processes running usp_controller.py (nuclear option)
+        if not stopped and messagebox.askyesno(
+            "Force Stop - Nuclear Option",
+            "Kill all python processes running usp_controller.py?\n\n"
+            "⚠️ This may affect other instances if running multiple controllers."
+        ):
+            try:
+                if sys.platform == 'win32':
+                    # Find and kill all usp_controller.py processes
+                    result = subprocess.run(
+                        ['wmic', 'process', 'where', 'CommandLine like "%usp_controller.py%"', 'get', 'ProcessId'],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    
+                    pids = []
+                    for line in result.stdout.split('\n'):
+                        line = line.strip()
+                        if line and line.isdigit():
+                            pids.append(line)
+                    
+                    if pids:
+                        self._log(f"Found {len(pids)} usp_controller processes", 'info')
+                        for pid in pids:
+                            subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True, timeout=3)
+                        self._log("✅ All processes terminated", 'success')
+                        stopped = True
+            except Exception as e:
+                self._log(f"❌ Nuclear option failed: {e}", 'error')
+        
+        # Update UI
+        self.daemon_process = None
+        self.stop_btn.config(state=tk.DISABLED)
+        self.force_stop_btn.config(state=tk.DISABLED)
+        self.restart_btn.config(state=tk.DISABLED)
+        self.start_btn.config(state=tk.NORMAL)
+        
+        # Verify
+        self.after(1500, self._verify_daemon_stopped)
+        
+        if stopped:
+            self._log("✅ Daemon force stopped", 'success')
+            messagebox.showinfo("Force Stop", "Daemon force stopped. Verify status in a moment.")
+        else:
+            self._log("❌ Force stop failed - requires manual intervention", 'error')
+            messagebox.showwarning(
+                "Force Stop Failed",
+                "Could not force stop daemon.\n\n"
+                "Please manually:\n"
+                "1. Open Task Manager\n"
+                "2. Find python.exe process running usp_controller.py\n"
+                "3. End the process"
+            )
+    
+    def _verify_daemon_stopped(self):
+        """Verify daemon has stopped"""
+        try:
+            resp = self.ipc.send_command('status')
+            if resp:
+                self._log("⚠️ Daemon still running after stop attempt", 'warning')
+                messagebox.showwarning(
+                    "Daemon Still Running",
+                    "Daemon is still responding.\n\n"
+                    "Possible solutions:\n"
+                    "1. If started externally: Close the daemon console window\n"
+                    "2. Use Task Manager to end python process\n"
+                    "3. Try '🚫 Force Stop' button"
+                )
+            else:
+                self._log("✅ Daemon stopped successfully", 'success')
+                self.daemon_process = None
+                self.stop_btn.config(state=tk.DISABLED)
+                self.restart_btn.config(state=tk.DISABLED)
+                self.start_btn.config(state=tk.NORMAL)
+                self._update_status()
+        except:
+            self._log("✅ Daemon stopped (no IPC response)", 'success')
+            self.daemon_process = None
+            self.stop_btn.config(state=tk.DISABLED)
+            self.force_stop_btn.config(state=tk.DISABLED)
+            self.restart_btn.config(state=tk.DISABLED)
+            self.start_btn.config(state=tk.NORMAL)
+            self._update_status()
+    
+    def _restart_daemon(self):
+        """Restart daemon process (stop then start with proper verification)"""
+        self._log("🔄 Restarting daemon...", 'info')
+        
+        # Disable restart button during operation
+        self.restart_btn.config(state=tk.DISABLED)
+        
+        # Step 1: Stop daemon
+        stop_success = False
+        try:
+            resp = self.ipc.send_command('shutdown')
+            if resp and resp.get('status') == 'ok':
+                self._log("⏹️ Daemon shutdown command sent via IPC", 'info')
+                stop_success = True
+        except:
+            self._log("⚠️ IPC shutdown failed, trying process termination", 'warning')
+        
+        # If daemon was started by GUI process
+        if self.daemon_process:
+            try:
+                self.output_reader_running = False
+                self.daemon_process.terminate()
+                self._log("⏹️ Daemon process terminated", 'info')
+                stop_success = True
+                self.daemon_process = None
+            except Exception as e:
+                self._log(f"⚠️ Error stopping daemon: {e}", 'warning')
+        
+        if not stop_success:
+            self._log("❌ Failed to stop daemon", 'error')
+            messagebox.showerror("Error", "Failed to stop daemon. Please stop it manually and try again.")
+            self.restart_btn.config(state=tk.NORMAL)
+            return
+        
+        # Step 2: Wait and verify daemon stopped
+        self._log("⏳ Waiting for port release (3 seconds)...", 'info')
+        self.after(3000, self._verify_and_start)
+    
+    def _verify_and_start(self):
+        """Verify daemon stopped and start it again"""
+        # Check if port is free
+        import socket
+        port_free = False
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                result = s.connect_ex((IPC_HOST, IPC_PORT))
+                if result != 0:  # Connection failed = port is free
+                    port_free = True
+                    self._log("✅ Port is free, daemon stopped successfully", 'success')
+        except:
+            port_free = True
+        
+        if not port_free:
+            self._log("⚠️ Port still occupied, waiting longer...", 'warning')
+            # Wait another 2 seconds
+            self.after(2000, self._verify_and_start)
+            return
+        
+        # Port is free, start daemon
+        try:
+            self._start_daemon()
+            self._log("✅ Daemon restarted successfully", 'success')
+        except Exception as e:
+            self._log(f"❌ Failed to restart daemon: {e}", 'error')
+            messagebox.showerror("Error", f"Failed to restart daemon: {e}")
+            self.restart_btn.config(state=tk.NORMAL)
+    
+    def _test_ipc(self):
+        """Test IPC connection and display detailed results"""
+        self._log("🔍 Testing IPC connection...", 'info')
+        
+        try:
+            # Test 1: Port connectivity
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2.0)
+            
+            try:
+                s.connect((IPC_HOST, IPC_PORT))
+                s.close()
+                self._log(f"✅ Port {IPC_PORT} is reachable", 'success')
+            except ConnectionRefusedError:
+                self._log(f"❌ Port {IPC_PORT} connection refused - Daemon not running", 'error')
+                messagebox.showerror("IPC Test Failed", 
+                                   f"Cannot connect to port {IPC_PORT}\n\n"
+                                   "Daemon is not running or not listening on this port.")
+                return
+            except socket.timeout:
+                self._log(f"❌ Connection timeout", 'error')
+                messagebox.showerror("IPC Test Failed", "Connection timeout")
+                return
+            
+            # Test 2: Status command
+            resp = self.ipc.send_command('status')
+            if resp:
+                if resp.get('status') == 'ok':
+                    self._log("✅ IPC communication successful", 'success')
+                    self._log(f"  - Daemon running: {resp.get('daemon_running')}", 'info')
+                    self._log(f"  - Broker connected: {resp.get('broker_connected')}", 'info')
+                    self._log(f"  - Devices: {resp.get('devices_count', 0)}", 'info')
+                    
+                    messagebox.showinfo(
+                        "IPC Test Successful",
+                        f"✅ IPC connection working!\n\n"
+                        f"Daemon: Running\n"
+                        f"Broker: {'Connected' if resp.get('broker_connected') else 'Disconnected'}\n"
+                        f"Devices: {resp.get('devices_count', 0)}\n"
+                        f"Config: {'Valid' if resp.get('config_valid') else 'Invalid'}"
+                    )
+                else:
+                    self._log(f"⚠️ IPC response error: {resp.get('msg')}", 'warning')
+                    messagebox.showwarning("IPC Test Warning", 
+                                         f"Daemon responded but with error:\n{resp.get('msg')}")
+            else:
+                self._log("❌ IPC returned no response", 'error')
+                messagebox.showerror("IPC Test Failed", "Daemon returned no response")
+                
+        except Exception as e:
+            self._log(f"❌ IPC test failed: {e}", 'error')
+            messagebox.showerror("IPC Test Failed", f"Error: {e}")
+    
+    def _show_detailed_status(self):
+        """Show detailed status information"""
+        try:
+            resp = self.ipc.send_command('status')
+            if resp and resp.get('status') == 'ok':
+                # Display detailed status in output
+                self._log("=" * 60, 'info')
+                self._log("📊 DAEMON STATUS REPORT", 'info')
+                self._log("=" * 60, 'info')
+                self._log(f"Daemon Running: ✅ Yes", 'success')
+                self._log(f"Broker Connected: {'No' if not resp.get('broker_connected') else '✅ Yes'}", 
+                         'error' if not resp.get('broker_connected') else 'success')
+                self._log(f"Broker Address: {resp.get('broker_host')}:{resp.get('broker_port')}", 'info')
+                self._log(f"Configuration: {'Invalid' if not resp.get('config_valid') else '✅ Valid'}", 
+                         'error' if not resp.get('config_valid') else 'success')
+                self._log(f"Devices Count: {resp.get('devices_count', 0)}", 'info')
+                
+                if resp.get('last_active'):
+                    self._log(f"Last Active Device: {resp.get('last_active')}", 'info')
+                
+                if resp.get('subscriptions'):
+                    self._log(f"Active Subscriptions:", 'info')
+                    for sub in resp.get('subscriptions', []):
+                        self._log(f"  - {sub}", 'info')
+                
+                self._log("=" * 60, 'info')
+            else:
+                self._log("❌ Cannot get daemon status - daemon not responding", 'error')
+                messagebox.showerror("Error", "Cannot get daemon status - daemon not responding")
+        except Exception as e:
+            self._log(f"❌ Failed to get status: {e}", 'error')
+            messagebox.showerror("Error", f"Failed to get status: {e}")
     
     def _output_reader_thread(self):
         """Thread to read daemon output continuously"""
@@ -592,8 +1104,13 @@ class DaemonPage(ttk.Frame):
                 # Schedule GUI update in main thread (avoid lambda closure issues)
                 msg = line.rstrip()
                 self.after(0, self._log_from_thread, msg, 'output')
+            except UnicodeDecodeError as e:
+                # Log encoding error but continue reading
+                error_msg = f"⚠️ Encoding error in daemon output (character skipped)"
+                self.after(0, self._log_from_thread, error_msg, 'warning')
+                continue  # Continue reading instead of breaking
             except Exception as e:
-                error_msg = f"Output reader error: {e}"
+                error_msg = f"❌ Output reader error: {e}"
                 self.after(0, self._log_from_thread, error_msg, 'error')
                 break
         
@@ -641,25 +1158,42 @@ class DaemonPage(ttk.Frame):
         # Configure tags
         self.output_text.tag_config('timestamp', foreground='#888888')
         self.output_text.tag_config(level, foreground=color)
-
-
-class ConfigEditorDialog(tk.Toplevel):
-    """Dialog for editing controller endpoint ID"""
     
-    def __init__(self, parent, ipc):
+    def _display_config(self):
+        """Refresh and display current configuration (called from main menu)"""
+        try:
+            # Force reload from daemon/file
+            config = self.config_manager.get_config(self.ipc, force_reload=True)
+            self._log("📋 Configuration reloaded", 'info')
+            
+            # Display key configuration values
+            endpoint_id = config.get('controller_endpoint_id', 'Not set')
+            broker_host = config.get('broker_host', 'Not set')
+            broker_port = config.get('broker_port', 'Not set')
+            mini_broker = config.get('mini_broker', {})
+            
+            self._log("=" * 50, 'info')
+            self._log(f"Controller Endpoint: {endpoint_id}", 'info')
+            self._log(f"Broker Connection: {broker_host}:{broker_port}", 'info')
+            self._log(f"Mini Broker: {mini_broker.get('host', '0.0.0.0')}:{mini_broker.get('port', 61613)}", 'info')
+            self._log("=" * 50, 'info')
+            
+        except Exception as e:
+            self._log(f"❌ Failed to load config: {e}", 'error')
+
+
+class ConfigViewDialog(tk.Toplevel):
+    """Read-only dialog to view full configuration"""
+    
+    def __init__(self, parent, ipc, config_manager):
         super().__init__(parent)
         self.ipc = ipc
-        self.title("Edit Controller Configuration")
-        self.geometry("550x280")
-        
-        # Get current config
-        resp = ipc.send_command('get_config')
-        if resp and resp.get('status') == 'ok':
-            self.config = resp.get('config', {})
-        else:
-            self.config = load_config() or {}
+        self.config_manager = config_manager
+        self.title("Configuration Viewer")
+        self.geometry("700x600")
         
         self._create_widgets()
+        self._load_and_display()
     
     def _create_widgets(self):
         # Main frame
@@ -667,67 +1201,275 @@ class ConfigEditorDialog(tk.Toplevel):
         main_frame.pack(fill=tk.BOTH, expand=True)
         
         # Title
-        ttk.Label(main_frame, text="Controller Configuration", font=('Arial', 12, 'bold')).pack(pady=(0, 10))
+        title_frame = ttk.Frame(main_frame)
+        title_frame.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(title_frame, text="Current Configuration", font=('Arial', 14, 'bold')).pack(side=tk.LEFT)
+        ttk.Button(title_frame, text="🔄 Refresh", command=self._load_and_display).pack(side=tk.RIGHT)
         
-        # Info - dynamically show broker port
-        info_frame = ttk.Frame(main_frame)
-        info_frame.pack(fill=tk.X, pady=(0, 15))
+        # Config display
+        config_frame = ttk.Frame(main_frame)
+        config_frame.pack(fill=tk.BOTH, expand=True)
         
-        broker_port = self.config.get('mini_broker', {}).get('port', 61613)
-        
-        ttk.Label(info_frame, text=f"💡 Daemon automatically connects to Mini Broker (localhost:{broker_port})", 
-                 font=('Arial', 9), foreground='blue').pack(anchor=tk.W)
-        ttk.Label(info_frame, text="   Only controller endpoint ID is configurable.", 
-                 font=('Arial', 9), foreground='blue').pack(anchor=tk.W)
-        ttk.Label(info_frame, text=f"   Broker port is configured in Mini Broker page (current: {broker_port})", 
-                 font=('Arial', 9), foreground='gray').pack(anchor=tk.W)
-        
-        # Form frame
-        form_frame = ttk.LabelFrame(main_frame, text="Controller Settings", padding=15)
-        form_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Controller Endpoint ID
-        ttk.Label(form_frame, text="Controller Endpoint ID:").grid(row=0, column=0, sticky=tk.W, pady=10)
-        self.endpoint_entry = ttk.Entry(form_frame, width=40)
-        self.endpoint_entry.insert(0, self.config.get('controller_endpoint_id', ''))
-        self.endpoint_entry.grid(row=0, column=1, sticky=tk.EW, padx=10, pady=10)
-        
-        form_frame.columnconfigure(1, weight=1)
-        
-        # Example
-        example_label = ttk.Label(form_frame, text="Example: proto::controller.my-laptop", 
-                                 foreground='gray', font=('Arial', 8))
-        example_label.grid(row=1, column=1, sticky=tk.W, padx=10)
+        self.config_text = scrolledtext.ScrolledText(
+            config_frame,
+            height=25,
+            width=80,
+            font=('Consolas', 10),
+            wrap=tk.WORD,
+            bg='#f5f5f5',
+            fg='#000000'
+        )
+        self.config_text.pack(fill=tk.BOTH, expand=True)
         
         # Buttons
         btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(pady=15)
+        btn_frame.pack(pady=10)
         
-        ttk.Button(btn_frame, text="Save", command=self._save_and_reload).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Edit Config", command=self._open_editor).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Close", command=self.destroy).pack(side=tk.LEFT, padx=5)
+    
+    def _load_and_display(self):
+        """Load and display configuration"""
+        try:
+            config = self.config_manager.get_config(self.ipc, force_reload=True)
+            
+            self.config_text.delete(1.0, tk.END)
+            
+            # Format and display config in a readable way
+            self._insert_section("CONTROLLER SETTINGS")
+            self._insert_item("Endpoint ID", config.get('controller_endpoint_id', 'Not set'))
+            
+            self._insert_section("\nBROKER CONNECTION")
+            self._insert_item("Host", config.get('broker_host', 'Not set'))
+            self._insert_item("Port", config.get('broker_port', 'Not set'))
+            self._insert_item("Username", config.get('username', 'Not set'))
+            self._insert_item("Password", '****' if config.get('password') else 'Not set')
+            
+            self._insert_section("\nMINI BROKER SETTINGS")
+            mini_broker = config.get('mini_broker', {})
+            self._insert_item("Enabled", str(mini_broker.get('enable', False)))
+            self._insert_item("Host", mini_broker.get('host', 'Not set'))
+            self._insert_item("Port", str(mini_broker.get('port', 61613)))
+            
+            self._insert_section("\nRAW JSON")
+            self.config_text.insert(tk.END, json.dumps(config, indent=2, ensure_ascii=False))
+            
+        except Exception as e:
+            self.config_text.delete(1.0, tk.END)
+            self.config_text.insert(tk.END, f"Error loading configuration: {e}")
+    
+    def _insert_section(self, title):
+        """Insert section header"""
+        self.config_text.insert(tk.END, f"{title}\n", 'section')
+        self.config_text.insert(tk.END, "=" * 60 + "\n")
+        self.config_text.tag_config('section', foreground='#0066cc', font=('Consolas', 11, 'bold'))
+    
+    def _insert_item(self, key, value):
+        """Insert config item"""
+        self.config_text.insert(tk.END, f"  {key:20s}: ", 'key')
+        self.config_text.insert(tk.END, f"{value}\n", 'value')
+        self.config_text.tag_config('key', foreground='#666666')
+        self.config_text.tag_config('value', foreground='#000000', font=('Consolas', 10, 'bold'))
+    
+    def _open_editor(self):
+        """Open config editor"""
+        DaemonConfigEditorDialog(self, self.ipc, self.config_manager)
+        # Refresh after editing
+        self.after(500, self._load_and_display)
+
+
+class DaemonConfigEditorDialog(tk.Toplevel):
+    """Enhanced dialog for editing daemon configuration"""
+    
+    def __init__(self, parent, ipc, config_manager):
+        super().__init__(parent)
+        self.ipc = ipc
+        self.config_manager = config_manager
+        self.title("⚙️ Edit Daemon Configuration")
+        self.geometry("650x500")
+        
+        # Load current config
+        self.config = self.config_manager.get_config(ipc)
+        
+        self._create_widgets()
+    
+    def _create_widgets(self):
+        # Main frame with scrollbar
+        main_frame = ttk.Frame(self, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Title
+        ttk.Label(main_frame, text="Daemon Configuration Editor", 
+                 font=('Arial', 13, 'bold')).pack(pady=(0, 15))
+        
+        # Notebook for different config sections
+        notebook = ttk.Notebook(main_frame)
+        notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        # Tab 1: Controller Settings
+        controller_tab = ttk.Frame(notebook, padding=15)
+        notebook.add(controller_tab, text="Controller")
+        self._create_controller_tab(controller_tab)
+        
+        # Tab 2: Broker Settings
+        broker_tab = ttk.Frame(notebook, padding=15)
+        notebook.add(broker_tab, text="Broker Connection")
+        self._create_broker_tab(broker_tab)
+        
+        # Tab 3: Advanced Settings
+        advanced_tab = ttk.Frame(notebook, padding=15)
+        notebook.add(advanced_tab, text="Advanced")
+        self._create_advanced_tab(advanced_tab)
+        
+        # Bottom buttons
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(pady=10)
+        
+        ttk.Button(btn_frame, text="💾 Save & Reload", command=self._save_and_reload, 
+                  width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="💾 Save Only", command=self._save_only, 
+                  width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy, 
+                  width=15).pack(side=tk.LEFT, padx=5)
+    
+    def _create_controller_tab(self, parent):
+        """Create controller settings tab"""
+        # Info
+        info = ttk.Label(parent, text="💡 Controller identification settings", 
+                        foreground='blue', font=('Arial', 9))
+        info.pack(anchor=tk.W, pady=(0, 15))
+        
+        # Endpoint ID
+        frame = ttk.LabelFrame(parent, text="Controller Endpoint ID", padding=10)
+        frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(frame, text="Endpoint ID:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.endpoint_entry = ttk.Entry(frame, width=40)
+        self.endpoint_entry.insert(0, self.config.get('controller_endpoint_id', ''))
+        self.endpoint_entry.grid(row=0, column=1, sticky=tk.EW, padx=10, pady=5)
+        
+        ttk.Label(frame, text="Example: proto::controller.my-laptop", 
+                 foreground='gray', font=('Arial', 8)).grid(row=1, column=1, sticky=tk.W, padx=10)
+        
+        frame.columnconfigure(1, weight=1)
+    
+    def _create_broker_tab(self, parent):
+        """Create broker connection settings tab"""
+        # Info
+        mini_broker_port = self.config.get('mini_broker', {}).get('port', 61613)
+        info_text = f"💡 Daemon connects to Mini Broker (localhost:{mini_broker_port})\nThese settings are auto-configured based on Mini Broker settings."
+        info = ttk.Label(parent, text=info_text, foreground='blue', font=('Arial', 9))
+        info.pack(anchor=tk.W, pady=(0, 15))
+        
+        # Broker settings (read-only info)
+        frame = ttk.LabelFrame(parent, text="Broker Connection (Auto-configured)", padding=10)
+        frame.pack(fill=tk.X, pady=5)
+        
+        settings = [
+            ("Host:", self.config.get('broker_host', '127.0.0.1')),
+            ("Port:", str(self.config.get('broker_port', mini_broker_port))),
+            ("Username:", self.config.get('username', 'guest')),
+            ("Password:", '****' if self.config.get('password') else '')
+        ]
+        
+        for i, (label, value) in enumerate(settings):
+            ttk.Label(frame, text=label).grid(row=i, column=0, sticky=tk.W, pady=3)
+            value_label = ttk.Label(frame, text=value, foreground='#666', font=('Arial', 9, 'bold'))
+            value_label.grid(row=i, column=1, sticky=tk.W, padx=10, pady=3)
+        
+        ttk.Label(frame, text="ℹ️ These are automatically set from Mini Broker configuration", 
+                 foreground='gray', font=('Arial', 8)).grid(row=len(settings), column=0, 
+                                                           columnspan=2, sticky=tk.W, pady=10)
+    
+    def _create_advanced_tab(self, parent):
+        """Create advanced settings tab"""
+        # Warning
+        warning = ttk.Label(parent, text="⚠️ Advanced settings - modify with caution", 
+                          foreground='#ff6600', font=('Arial', 9, 'bold'))
+        warning.pack(anchor=tk.W, pady=(0, 15))
+        
+        # IPC Settings
+        frame = ttk.LabelFrame(parent, text="IPC Settings", padding=10)
+        frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(frame, text="IPC Host:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.ipc_host_entry = ttk.Entry(frame, width=30)
+        ipc_host = self.config.get('ipc', {}).get('host', '127.0.0.1')
+        self.ipc_host_entry.insert(0, ipc_host)
+        self.ipc_host_entry.grid(row=0, column=1, sticky=tk.EW, padx=10, pady=5)
+        
+        ttk.Label(frame, text="IPC Port:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.ipc_port_entry = ttk.Entry(frame, width=30)
+        ipc_port = self.config.get('ipc', {}).get('port', 6001)
+        self.ipc_port_entry.insert(0, str(ipc_port))
+        self.ipc_port_entry.grid(row=1, column=1, sticky=tk.EW, padx=10, pady=5)
+        
+        frame.columnconfigure(1, weight=1)
+        
+        ttk.Label(frame, text="ℹ️ Default: 127.0.0.1:6001", 
+                 foreground='gray', font=('Arial', 8)).grid(row=2, column=1, sticky=tk.W, padx=10)
+    
+    def _validate_config(self):
+        """Validate configuration before saving"""
+        errors = []
+        
+        # Validate endpoint ID
+        endpoint_id = self.endpoint_entry.get().strip()
+        if not endpoint_id:
+            errors.append("Controller Endpoint ID cannot be empty")
+        
+        # Validate IPC port
+        try:
+            ipc_port = int(self.ipc_port_entry.get())
+            if not (1 <= ipc_port <= 65535):
+                errors.append("IPC Port must be between 1 and 65535")
+        except ValueError:
+            errors.append("IPC Port must be a valid number")
+        
+        return errors
+    
+    def _save_only(self):
+        """Save configuration without reloading daemon"""
+        self._save_config(reload_daemon=False)
     
     def _save_and_reload(self):
         """Save configuration and reload daemon"""
+        self._save_config(reload_daemon=True)
+    
+    def _save_config(self, reload_daemon=True):
+        """Save configuration to file"""
+        # Validate first
+        errors = self._validate_config()
+        if errors:
+            error_msg = "\n".join(errors)
+            print(f"[!] Config validation error: {error_msg}")
+            messagebox.showerror("Validation Error", error_msg)
+            return
+        
         try:
-            # Get absolute path to config.json in script directory
+            # Get absolute path to config.json
             script_dir = os.path.dirname(os.path.abspath(__file__))
             config_file = os.path.join(script_dir, 'config.json')
             
-            # Load current config
-            full_config = load_config(config_file)
+            # Load current config from file
+            from usp_core import load_config as load_config_file
+            full_config = load_config_file(config_file)
             if not full_config:
+                print("[!] Failed to load current configuration")
                 messagebox.showerror("Error", "Failed to load current configuration")
                 return
             
-            # Only update controller endpoint ID
+            # Update controller settings
             endpoint_id = self.endpoint_entry.get().strip()
-            if not endpoint_id:
-                messagebox.showerror("Error", "Controller Endpoint ID cannot be empty")
-                return
-            
             full_config['controller_endpoint_id'] = endpoint_id
             
-            # Auto-configure for mini broker - use configured port from mini_broker settings
+            # Update IPC settings
+            if 'ipc' not in full_config:
+                full_config['ipc'] = {}
+            full_config['ipc']['host'] = self.ipc_host_entry.get().strip()
+            full_config['ipc']['port'] = int(self.ipc_port_entry.get())
+            
+            # Auto-configure broker connection based on mini_broker settings
             mini_broker_config = full_config.get('mini_broker', {})
             broker_port = mini_broker_config.get('port', 61613)
             
@@ -736,20 +1478,43 @@ class ConfigEditorDialog(tk.Toplevel):
             full_config['username'] = 'guest'
             full_config['password'] = 'guest'
             
-            # Save file using usp_core function
-            if not save_config(full_config, config_file):
+            # Save config file
+            from usp_core import save_config as save_config_file
+            if not save_config_file(full_config, config_file):
+                print("[!] Failed to save configuration file")
                 messagebox.showerror("Error", "Failed to save configuration file")
                 return
             
-            # Reload via IPC
-            resp = self.ipc.send_command('reload_config')
-            if resp and resp.get('status') == 'ok':
-                messagebox.showinfo("Success", f"Configuration saved!\n\nController Endpoint: {endpoint_id}\nBroker: localhost:{broker_port} (from Mini Broker settings)")
-                self.destroy()
+            # Invalidate cache
+            self.config_manager.invalidate_cache()
+            
+            # Reload daemon if requested
+            if reload_daemon:
+                resp = self.ipc.send_command('reload_config')
+                if resp and resp.get('status') == 'ok':
+                    messagebox.showinfo("Success", 
+                                      f"✅ Configuration saved and reloaded!\n\n"
+                                      f"Controller Endpoint: {endpoint_id}\n"
+                                      f"Broker: localhost:{broker_port}")
+                    self.destroy()
+                else:
+                    messagebox.showwarning("Partial Success", 
+                                         f"💾 Configuration saved to file\n\n"
+                                         f"⚠️ Daemon reload failed or daemon not running.\n"
+                                         f"Please restart daemon manually to apply changes.")
             else:
-                messagebox.showwarning("Warning", "Config saved but daemon reload failed. Restart daemon manually.")
+                messagebox.showinfo("Success", 
+                                  f"💾 Configuration saved!\n\n"
+                                  f"ℹ️ Restart daemon to apply changes.")
+                self.destroy()
+                
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to save config: {e}")
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"[!] Failed to save configuration: {e}")
+            print(error_details)
+            traceback.print_exc()
+            messagebox.showerror("Error", f"Failed to save configuration: {e}")
 
 
 class CLIPage(ttk.Frame):
@@ -1564,8 +2329,22 @@ class USPControllerGUI:
     
     def _reload_config(self):
         """Reload configuration"""
+        # Invalidate cache and reload
+        config_manager = ConfigManager()
+        config_manager.invalidate_cache()
+        
         self.daemon_page._display_config()
-        self.broker_page._load_config()
+        # Reload broker config
+        try:
+            self.broker_page.config = config_manager.get_config(force_reload=True)
+            # Update broker UI fields
+            broker_config = self.broker_page.config.get('mini_broker', {})
+            self.broker_page.host_entry.delete(0, tk.END)
+            self.broker_page.host_entry.insert(0, broker_config.get('host', '0.0.0.0'))
+            self.broker_page.port_entry.delete(0, tk.END)
+            self.broker_page.port_entry.insert(0, str(broker_config.get('port', 61613)))
+        except Exception as e:
+            print(f"Error reloading broker config: {e}")
         messagebox.showinfo("Success", "Configuration reloaded from config.json")
     
     def _show_about(self):

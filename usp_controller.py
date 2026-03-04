@@ -161,9 +161,13 @@ MINI_BROKER_ENABLED = mini_broker_config.get('enable', False)
 
 if MINI_BROKER_ENABLED:
     # When mini-broker is enabled, use its configuration and lock broker settings
-    BROKER_HOST = mini_broker_config.get('host', '127.0.0.1')
+    # Note: mini_broker.host is for server listening (can be 0.0.0.0)
+    #       but client connection must use 127.0.0.1 (cannot connect to 0.0.0.0)
+    mini_broker_host = mini_broker_config.get('host', '0.0.0.0')
+    BROKER_HOST = '127.0.0.1'  # Client always connects to localhost
     BROKER_PORT = mini_broker_config.get('port', 61613)
-    print(f"[*] Mini-Broker enabled: {BROKER_HOST}:{BROKER_PORT}")
+    print(f"[*] Mini-Broker enabled: {mini_broker_host}:{BROKER_PORT}")
+    print(f"[*] Client connecting to: {BROKER_HOST}:{BROKER_PORT}")
     print(f"[*] Broker configuration locked (cannot be overridden via command line)")
 
 # Derived configuration
@@ -1864,14 +1868,14 @@ class IPCServer(threading.Thread):
                 # Reload configuration from config.json and reconnect if valid
                 try:
                     # Reload config file
-                    CONFIG = load_config()
-                    CONFIG_VALID = validate_config(CONFIG)
+                    new_config = load_config()
+                    new_config_valid = validate_config(new_config)
                     
-                    if not CONFIG_VALID:
+                    if not new_config_valid:
                         response = {"status": "error", "msg": "Configuration validation failed. Check config.json"}
                     else:
-                        # Update global variables
-                        usp_config = CONFIG['usp_controller']
+                        # Update global variables with global keyword
+                        usp_config = new_config['usp_controller']
                         BROKER_HOST = usp_config.get('broker_host', DEFAULT_CONFIG['broker_host'])
                         BROKER_PORT = usp_config.get('broker_port', DEFAULT_CONFIG['broker_port'])
                         USERNAME = usp_config.get('username', DEFAULT_CONFIG['username'])
@@ -1881,23 +1885,54 @@ class IPCServer(threading.Thread):
                         REPLY_TO_QUEUE = usp_config.get('reply_to_queue', f'/queue/{CONTROLLER_ENDPOINT_ID}')
                         
                         # Update mini-broker configuration
-                        mini_broker_config = CONFIG.get('mini_broker', {})
+                        mini_broker_config = new_config.get('mini_broker', {})
                         MINI_BROKER_ENABLED = mini_broker_config.get('enable', False)
                         if MINI_BROKER_ENABLED:
-                            BROKER_HOST = mini_broker_config.get('host', '127.0.0.1')
+                            # Client always connects to localhost (cannot connect to 0.0.0.0)
+                            BROKER_HOST = '127.0.0.1'
                             BROKER_PORT = mini_broker_config.get('port', 61613)
                         
-                        # Try to reconnect with new configuration
+                        # Update CONFIG global variable
+                        CONFIG = new_config
+                        CONFIG_VALID = new_config_valid
+                        
+                        Logger.info(f"[ReloadConfig] Configuration reloaded", level=0)
+                        Logger.info(f"[ReloadConfig] Broker: {BROKER_HOST}:{BROKER_PORT}", level=0)
+                        Logger.info(f"[ReloadConfig] Controller: {CONTROLLER_ENDPOINT_ID}", level=0)
+                        
+                        # Reconnect to broker with new configuration
+                        reconnect_success = False
                         if self.stomp.connected:
-                            self.stomp.sock.close()
-                            self.stomp.connected = False
+                            Logger.info(f"[ReloadConfig] Disconnecting from old broker...", level=0)
+                            try:
+                                self.stomp.stop_mdns_discovery()
+                                self.stomp.sock.close()
+                                self.stomp.connected = False
+                            except:
+                                pass
                             time.sleep(1)
                         
+                        Logger.info(f"[ReloadConfig] Connecting to new broker...", level=0)
                         if self.stomp.connect():
-                            response = {"status": "ok", "msg": f"Configuration reloaded and connected to {BROKER_HOST}:{BROKER_PORT}"}
+                            reconnect_success = True
+                            if ENABLE_MDNS_DISCOVERY:
+                                self.stomp.start_mdns_discovery()
+                            response = {
+                                "status": "ok", 
+                                "msg": f"Configuration reloaded and reconnected to {BROKER_HOST}:{BROKER_PORT}",
+                                "broker_connected": True
+                            }
                         else:
-                            response = {"status": "partial", "msg": "Configuration reloaded but connection failed. Check broker availability."}
+                            response = {
+                                "status": "partial", 
+                                "msg": f"Configuration reloaded but broker connection failed. Broker may be offline.",
+                                "broker_connected": False
+                            }
                 except Exception as e:
+                    import traceback
+                    error_details = traceback.format_exc()
+                    Logger.error(f"[ReloadConfig] Error: {e}", level=0)
+                    Logger.error(f"[ReloadConfig] Details: {error_details}", level=0)
                     response = {"status": "error", "msg": f"Reload config error: {str(e)}"}
             
             elif cmd == "mdns_status":
@@ -2582,19 +2617,37 @@ class IPCServer(threading.Thread):
                 client.sendall(json.dumps(response).encode('utf-8'))
                 client.close()
                 
-                # Schedule shutdown
-                print("[*] Shutdown command received via IPC")
-                self.running = False
+                # Schedule shutdown with delay to ensure response is sent
+                def delayed_shutdown():
+                    print("[*] Shutdown command received via IPC")
+                    self.running = False
+                    
+                    # Disconnect from broker
+                    if self.stomp.connected:
+                        print("[*] Disconnecting from broker...")
+                        try:
+                            self.stomp.stop_mdns_discovery()
+                            self.stomp.disconnect()
+                        except:
+                            pass
+                    
+                    # Close IPC server
+                    try:
+                        self.server_sock.close()
+                    except:
+                        pass
+                    
+                    # Exit daemon
+                    print("[*] Daemon shutdown complete")
+                    import sys
+                    sys.exit(0)
                 
-                # Disconnect from broker
-                if self.stomp.connected:
-                    print("[*] Disconnecting from broker...")
-                    self.stomp.stop_mdns_discovery()
-                    self.stomp.disconnect()
-                
-                # Exit daemon
-                import sys
-                sys.exit(0)
+                # Delay shutdown to ensure response is sent
+                import threading
+                shutdown_thread = threading.Timer(0.5, delayed_shutdown)
+                shutdown_thread.daemon = True
+                shutdown_thread.start()
+                return  # Don't process further
 
             elif cmd == "poll_logs":
                 # poll_logs [last_id]
