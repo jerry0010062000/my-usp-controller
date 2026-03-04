@@ -51,6 +51,17 @@ Thumbs.db
 # Device configuration
 devices.json
 
+# Local runtime JSON (keep examples only)
+config.json
+command_history.json
+temp/*.json
+
+# Keep tracked templates / fixed version file
+!config.example.json
+!config.v3.example.json
+!devices.example.json
+!version.json
+
 # Runtime files
 *.pid
 /tmp/usp_controller.pid

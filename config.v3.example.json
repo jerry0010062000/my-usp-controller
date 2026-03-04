@@ -2,11 +2,11 @@
   "usp_controller": {
     "transport_protocol": "stomp",
     "broker_host": "127.0.0.1",
-    "broker_port": 61613,
-    "username": "admin",
-    "password": "password",
-    "controller_endpoint_id": "proto::controller-1",
-    "receive_topic": "/topic/my_send_q",
+    "broker_port": 61614,
+    "username": "guest",
+    "password": "guest",
+    "controller_endpoint_id": "proto::controller.default",
+    "receive_topic": "/queue/usp.controller.default",
     "devices_file": "devices.json",
     "debug_level": 0,
     "enable_mdns_discovery": true,
@@ -33,5 +33,10 @@
     "auto_retry": true,
     "max_retries": 3,
     "scripts_dir": "scripts"
+  },
+  "mini_broker": {
+    "enable": true,
+    "host": "0.0.0.0",
+    "port": 61614
   }
 }

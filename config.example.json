@@ -1,11 +1,11 @@
 {
   "usp_controller": {
     "broker_host": "127.0.0.1",
-    "broker_port": 61613,
-    "username": "admin",
-    "password": "password",
-    "controller_endpoint_id": "proto::controller-1",
-    "receive_topic": "/topic/my_send_q",
+    "broker_port": 61614,
+    "username": "guest",
+    "password": "guest",
+    "controller_endpoint_id": "proto::controller.default",
+    "receive_topic": "/queue/usp.controller.default",
     "devices_file": "devices.json",
     "enable_mdns_discovery": true,
     "heartbeat_check_enabled": true,
@@ -14,5 +14,10 @@
   "ipc": {
     "host": "127.0.0.1",
     "port": 6001
+  },
+  "mini_broker": {
+    "enable": true,
+    "host": "0.0.0.0",
+    "port": 61614
   }
 }

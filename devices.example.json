@@ -1,0 +1,6 @@
+{
+  "proto::agent.example": {
+    "reply_to": "/queue/usp.agent.example",
+    "last_seen": "1970-01-01T00:00:00"
+  }
+}
