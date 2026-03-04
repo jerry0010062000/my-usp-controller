@@ -1,250 +1,84 @@
 # USP Controller
 
-Python 實現的 TR-369 USP (User Services Platform) Controller。
+TR-369 USP Controller（GUI 版本）。
 
-## ✨ 特性
+## 系統架構
 
-- ✅ 完整 TR-369 USP 協議支援
-- ✅ 模組化架構設計（可擴展）
-- ✅ 多種傳輸協議（STOMP, MQTT 接口）
-- ✅ 統一介面層（CLI/GUI/Web）
-- ✅ 智能腳本引擎
-- ✅ 跨平台支援（Windows/Linux/macOS）
-- 🆕 **GUI 內建 Broker 控制**（一鍵啟動/停止，開發測試更便捷）
+本專案採用「GUI 控制面 + Daemon 執行面 + Mini-Broker 訊息面」三層設計：
 
-## 🚀 快速開始
+- **GUI**
+   - 使用者唯一操作入口
+   - 啟動時自動啟動 Mini-Broker
+   - 透過 IPC（127.0.0.1:6001）控制 Daemon
+   - 顯示 Daemon 即時輸出與狀態
 
-### 方式 1：一鍵啟動完整環境（最簡單）
+- **Daemon（背景模式）**
+   - 負責 USP 訊息組包、發送、回應解析
+   - 維護設備清單、快取、連線狀態
+   - 對 GUI 提供 IPC 指令服務（status/get/set/reload...）
 
-**雙擊啟動**，無需任何配置：
+- **Mini-Broker（內建）**
+   - 內建 STOMP 測試 broker
+   - 提供本機訊息路由，不需外部 ActiveMQ/RabbitMQ
+   - GUI 可查看 broker 狀態與 debug 訊息
 
-```bash
-# Windows: 雙擊批次檔
-start_dev.bat
+### 架構圖（Mermaid）
 
-# Linux/Mac: 執行腳本
-python start_dev.py
+```mermaid
+flowchart LR
+      U[User] --> G[GUI]
+
+      G -->|Auto start| MB[Mini-Broker]
+      G -->|IPC commands\n127.0.0.1:6001| D[Daemon]
+      D -->|Status/Logs/Responses| G
+
+      D -->|STOMP publish/subscribe| MB
+      MB -->|STOMP frames| D
+
+      D -->|USP Record/Message| A[USP Agents]
+      A -->|USP Response/Notify| D
+
+      D --> C[(config.json)]
+      G --> C
 ```
 
-這會自動啟動：
-- 🔧 Mini-Broker (STOMP)
-- 🔄 USP Controller Daemon
-- 🖥️ GUI 界面
+### 啟動與執行流程
 
-✅ **所有服務自動管理**，關閉 GUI 會自動停止所有服務。
+1. 使用者執行 `run_gui.bat`
+2. GUI 啟動後，自動啟動 Mini-Broker
+3. 使用者在 Daemon 頁啟動 Daemon（GUI 會清理舊 daemon，避免殘留衝突）
+4. Daemon 連到 Mini-Broker，並開始接收/發送 USP 訊息
+5. GUI 透過 IPC 控制 Daemon，CLI/按鈕操作都轉為 IPC 命令
+6. Daemon 將結果回送 GUI 顯示
 
-⚠️ **注意**：Mini-Broker 僅供開發測試，生產環境請使用 `--no-broker` 並配置 ActiveMQ/RabbitMQ。
+## Windows 使用方式（唯一入口）
 
----
+1. 雙擊 `run_gui.bat`
+2. 腳本會自動完成：
+   - Python 可用性檢查
+   - `requirements.txt` 依賴安裝/更新
+   - 啟動 GUI
 
-### 方式 2：使用外部 Broker（生產環境）
+> Windows 安裝流程已封裝在 `run_gui.bat`，不需要手動 pip 安裝步驟。
 
-#### 1. 啟動外部 Broker
+## Mini Broker 支援
 
-**Docker (推薦):**
-```bash
-docker run -d --name activemq \
-  -p 61613:61613 -p 8161:8161 \
-  rmohr/activemq
-```
+- GUI 內建 Mini Broker 管理（啟動/停止/狀態）。
+- 開發與一般使用不需要額外安裝或配置外部 Broker（如 ActiveMQ/RabbitMQ）。
+- 預設可直接用內建 Mini Broker 運作。
 
-**或手動安裝 ActiveMQ:**
-- 下載：https://activemq.apache.org/
-- 默認 STOMP 端口：61613
+## 目錄分工
 
-#### 2. 配置
+- `scripts/`: 僅放 USP 測試腳本內容（例如 `.txt` 測試流程）
+- `tools/`: 維運與開發工具（例如版本號工具、資料收集工具）
+- `docs/`: 各模組功能說明文件
 
-修改 `config.json` 中的 broker 設定：
+## 需求
 
-```json
-{
-  "usp_controller": {
-    "broker_host": "127.0.0.1",
-    "broker_port": 61613,
-    "username": "guest",
-    "password": "guest"
-  }
-}
-```
+- Windows
+- Python 3.8+
 
-#### 3. 啟動服務
+## 備註
 
-```bash
-# 使用外部 Broker
-python start_dev.py --no-broker
-
-# 或分別啟動
-python usp_controller.py --daemon
-python usp_gui.py
-```
-
----
-
-### 方式 3：手動安裝（開發者）
-
-#### 1. 安裝依賴
-
-```bash
-pip install -r requirements.txt
-```
-
-#### 2. 安裝 Message Broker
-
-選擇一個：
-
-**Docker (推薦):**
-```bash
-docker run -d --name activemq \
-  -p 61613:61613 -p 8161:8161 \
-  rmohr/activemq
-```
-
-**或手動安裝 ActiveMQ:**
-- 下載：https://activemq.apache.org/
-- 默認 STOMP 端口：61613
-
-#### 3. 配置
-
-複製範例配置並修改：
-
-```bash
-cp config.example.json config.json
-```
-
-編輯 `config.json` 設定 broker 連接資訊。
-
-#### 4. 運行
-
-**CLI 模式（推薦）：**
-```bash
-python usp_main.py
-```
-
-**傳統模式：**
-```bash
-python usp_controller.py
-```
-
-**GUI 模式：**
-```bash
-# Terminal 1: 啟動 daemon
-python usp_controller.py --daemon
-
-# Terminal 2: 啟動 GUI
-python usp_gui.py
-```
-
-## 📖 文檔
-
-### 模組文檔（docs/）
-- [config.md](docs/config.md) - 配置管理
-- [logger.md](docs/logger.md) - 日誌系統
-- [transport.md](docs/transport.md) - 傳輸層
-- [protocol.md](docs/protocol.md) - USP 協議層
-- [scripting.md](docs/scripting.md) - 腳本引擎
-- [interface.md](docs/interface.md) - 介面層
-
-### 快速參考
-
-**USP 操作：**
-```bash
-get <endpoint> <path>           # 獲取參數
-set <endpoint> <path> <value>   # 設置參數
-add <endpoint> <obj_path>       # 添加對象
-delete <endpoint> <obj_path>    # 刪除對象
-discover <endpoint> [path]      # 發現數據模型
-operate <endpoint> <command>    # 執行命令
-```
-
-**系統命令：**
-```bash
-help                    # 幫助
-list                    # 列出設備
-status                  # 狀態資訊
-debug [0-2]            # 調試級別
-quit                    # 退出
-```
-
-## 📁 專案結構
-
-```
-my-usp-controller/
-├── usp_controller/         # 核心模組（模組化架構）
-│   ├── config.py          #   配置管理
-│   ├── logger.py          #   日誌系統
-│   ├── transport/         #   傳輸層
-│   ├── protocol/          #   協議層
-│   ├── scripting/         #   腳本引擎
-│   └── interface/         #   介面層
-├── usp_main.py            # 新版主程式（推薦）
-├── usp_controller.py      # 傳統主程式（向後兼容）
-├── usp_gui.py             # GUI 應用
-├── tests/                 # 測試文件
-├── scripts/               # 腳本和工具
-├── docs/                  # 模組文檔
-└── config.json            # 配置文件
-```
-
-##  使用示例
-
-### Python API
-
-```python
-from usp_controller.config import load_config
-from usp_controller.interface import create_cli_interface
-
-# 載入配置
-config = load_config("config.json")
-
-# 創建 CLI 介面
-cli = create_cli_interface()
-cli.initialize()
-cli.run()
-```
-
-### 批次腳本
-
-創建 `script.txt`：
-```bash
-# 變量定義
-$AGENT = proto::agent-001
-
-# 操作命令
-get $AGENT Device.DeviceInfo.
-set $AGENT Device.X.Parameter "value"
-```
-
-執行：
-```bash
-python scripts/run_test.py --script script.txt
-```
-
-## 🧪 測試
-
-```bash
-# 測試模組化架構
-python tests/test_v3_architecture.py
-
-# 測試介面層
-python tests/test_interface_layer.py
-
-# 查看使用示例
-python tests/example_interface_usage.py
-```
-
-## 📋 需求
-
-- Python 3.7+
-- 標準庫（無額外依賴）
-
-**可選增強：**
-- `prompt_toolkit` - 增強 CLI（自動補全、歷史）
-- `rich` - 進階終端輸出
-
-## 📄 授權
-
-MIT License
-
-## 🤝 貢獻
-
-歡迎提交 Issue 和 Pull Request。
+- 本專案已精簡為單一使用者入口：`run_gui.bat`。
+- 其餘啟動與除錯用腳本已移除。

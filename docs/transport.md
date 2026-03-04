@@ -1,75 +1,17 @@
-# Transport Module
+# Transport 模組
 
-## 概述
+## 目的
 
-傳輸層抽象，支援多種協議（STOMP, MQTT, WebSocket）。
+封裝與 STOMP broker 的連線、訂閱、發送流程，對上層提供穩定傳輸介面。
 
-## 架構設計
+## 核心職責
 
-```
-TransportProtocol (ABC)
-├── STOMPTransport (已實現)
-├── MQTTTransport (接口保留)
-└── WebSocketTransport (未來)
-```
+- 建立 broker 連線與重連
+- 訂閱控制器接收佇列
+- 傳送 USP Record 封包
+- 維護已連線狀態與基本健康檢查
 
-## 主要類
+## 與 Mini-Broker 關係
 
-### `TransportProtocol` (抽象基類)
-定義所有傳輸協議必須實現的接口：
-- `connect()`: 建立連接
-- `disconnect()`: 斷開連接
-- `subscribe()`: 訂閱目的地
-- `send()`: 發送訊息
-- `set_message_callback()`: 設置訊息回調
-
-### `TransportState` (狀態枚舉)
-- `DISCONNECTED`: 未連接
-- `CONNECTING`: 連接中
-- `CONNECTED`: 已連接
-- `DISCONNECTING`: 斷開中
-- `ERROR`: 錯誤狀態
-
-### `TransportFactory` (工廠類)
-動態創建傳輸協議實例。
-
-## 使用方式
-
-```python
-from usp_controller.transport import TransportFactory
-
-# 創建 STOMP 傳輸
-transport = TransportFactory.create('stomp', {
-    'broker_host': '127.0.0.1',
-    'broker_port': 61613,
-    'username': 'admin',
-    'password': 'admin'
-})
-
-# 設置回調
-transport.set_message_callback(on_message_received)
-transport.set_state_callback(on_state_changed)
-
-# 連接和訂閱
-transport.connect()
-transport.subscribe('/queue/usp.controller')
-
-# 發送訊息
-transport.send('/queue/usp.agent', message_bytes)
-```
-
-## 已實現協議
-
-### STOMP 1.2
-- 完整實現
-- 支援心跳機制
-- 自動重連（可選）
-
-### MQTT
-- 接口保留，未來實現
-
-## 相關文件
-
-- `usp_controller/transport/base.py` - 抽象基類
-- `usp_controller/transport/stomp.py` - STOMP 實現
-- `usp_controller/transport/mqtt.py` - MQTT 接口
+- 開發模式下，transport 直接連到內建 Mini-Broker
+- 若切換外部 broker，transport 層保持相同操作介面

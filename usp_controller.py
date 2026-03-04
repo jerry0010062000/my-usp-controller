@@ -6,7 +6,9 @@ Mode 1: Interactive Shell (User)
 Mode 2: Background Daemon with IPC (Automation)
 """
 
-__version__ = "2.0.4"
+from usp_version import FULL_VERSION
+
+__version__ = FULL_VERSION
 __author__ = "Jerry Bai"
 
 import sys
@@ -1516,7 +1518,8 @@ class IPCServer(threading.Thread):
             while self.running:
                 try:
                     client, addr = self.server_sock.accept()
-                    self._handle_client(client)
+                    client_thread = threading.Thread(target=self._handle_client, args=(client,), daemon=True)
+                    client_thread.start()
                 except socket.timeout:
                     # Normal timeout, continue checking self.running
                     continue
@@ -1539,6 +1542,7 @@ class IPCServer(threading.Thread):
         global CONTROLLER_ENDPOINT_ID, RECEIVE_TOPIC, REPLY_TO_QUEUE, MINI_BROKER_ENABLED
         
         try:
+            client.settimeout(5.0)
             data = client.recv(4096).decode('utf-8').strip()
             if not data: return
             

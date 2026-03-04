@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-USP Controller GUI V3.0 - Multi-Page Architecture
+USP Controller GUI - Multi-Page Architecture
 Embedded mode: Runs CLI, Daemon, and Broker management in single process
 """
 
@@ -15,8 +15,10 @@ import socket
 import time
 import subprocess
 import atexit
+import re
 from pathlib import Path
 from datetime import datetime
+from usp_version import FULL_VERSION, GUI_VERSION
 
 # Constants
 HISTORY_FILE = 'command_history.json'
@@ -176,12 +178,14 @@ class BrokerPage(ttk.Frame):
         self.broker = None
         self.broker_thread = None
         self.broker_running = False
+        self.debug_auto_refresh = tk.BooleanVar(value=True)
         
         # Use centralized config manager
         self.config_manager = ConfigManager()
         self.config = self.config_manager.get_config()
         
         self._create_widgets()
+        self.after(1500, self._poll_broker_debug)
     
     def _create_widgets(self):
         # Title
@@ -194,6 +198,8 @@ class BrokerPage(ttk.Frame):
         info_frame.pack(fill=tk.X, padx=10, pady=5)
         ttk.Label(info_frame, text="💡 Mini Broker用於測試環境，無需外部broker", 
                  font=('Arial', 9), foreground='blue').pack(anchor=tk.W)
+        ttk.Label(info_frame, text="💡 支援即時狀態監控與測試訊息注入（debug）", 
+             font=('Arial', 9), foreground='#666').pack(anchor=tk.W)
         
         # Configuration
         config_frame = ttk.LabelFrame(self, text="Mini Broker 設定", padding=10)
@@ -226,6 +232,46 @@ class BrokerPage(ttk.Frame):
         
         self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self._stop_broker, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(btn_frame, text="Refresh Status", command=self._refresh_broker_status).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Show Snapshot", command=self._show_broker_snapshot).pack(side=tk.LEFT, padx=5)
+
+        ttk.Checkbutton(btn_frame, text="Auto Debug Refresh", variable=self.debug_auto_refresh).pack(side=tk.RIGHT, padx=5)
+
+        # Broker runtime status
+        status_frame = ttk.LabelFrame(self, text="Runtime Status", padding=10)
+        status_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.broker_state_label = ttk.Label(status_frame, text="State: ⚪ Stopped", font=('Arial', 9, 'bold'))
+        self.broker_state_label.pack(side=tk.LEFT, padx=(0, 15))
+
+        self.clients_label = ttk.Label(status_frame, text="Clients: 0", font=('Arial', 9))
+        self.clients_label.pack(side=tk.LEFT, padx=10)
+
+        self.subscriptions_label = ttk.Label(status_frame, text="Subscriptions: 0", font=('Arial', 9))
+        self.subscriptions_label.pack(side=tk.LEFT, padx=10)
+
+        self.queued_label = ttk.Label(status_frame, text="Queued Msgs: 0", font=('Arial', 9))
+        self.queued_label.pack(side=tk.LEFT, padx=10)
+
+        # Debug tools
+        debug_tools_frame = ttk.LabelFrame(self, text="Debug Tools", padding=10)
+        debug_tools_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        test_msg_row = ttk.Frame(debug_tools_frame)
+        test_msg_row.pack(fill=tk.X, pady=2)
+        ttk.Label(test_msg_row, text="Destination:", width=12).pack(side=tk.LEFT)
+        self.test_destination_entry = ttk.Entry(test_msg_row, width=32)
+        self.test_destination_entry.insert(0, "/topic/test")
+        self.test_destination_entry.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(test_msg_row, text="Body:", width=6).pack(side=tk.LEFT)
+        self.test_body_entry = ttk.Entry(test_msg_row, width=32)
+        self.test_body_entry.insert(0, "hello from mini-broker debug")
+        self.test_body_entry.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(test_msg_row, text="Send Test Msg", command=self._send_test_message).pack(side=tk.LEFT, padx=5)
+        ttk.Button(test_msg_row, text="Clear Log", command=self._clear_broker_log).pack(side=tk.LEFT, padx=5)
         
         # Status/Log
         log_frame = ttk.LabelFrame(self, text="Status & Log", padding=10)
@@ -237,6 +283,7 @@ class BrokerPage(ttk.Frame):
         
         self._log("Mini Broker ready to start")
         self._log("Note: Agents will connect to this broker instead of external broker")
+        self._refresh_broker_status()
         
     
     def _start_broker(self):
@@ -300,8 +347,11 @@ class BrokerPage(ttk.Frame):
             self._log("✅ Mini-Broker started successfully")
             self.start_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
+            self.broker_state_label.config(text="State: ✅ Running", foreground='green')
+            self._show_broker_snapshot()
         else:
             self._log("❌ Mini-Broker failed to start")
+            self.broker_state_label.config(text="State: ❌ Failed", foreground='red')
     
     def _stop_broker(self):
         """Stop mini broker"""
@@ -313,8 +363,114 @@ class BrokerPage(ttk.Frame):
                 self._log("✅ Mini-Broker stopped")
                 self.start_btn.config(state=tk.NORMAL)
                 self.stop_btn.config(state=tk.DISABLED)
+                self.broker_state_label.config(text="State: ⚪ Stopped", foreground='#666')
+                self._refresh_broker_status()
             except Exception as e:
                 self._log(f"ERROR: {e}")
+
+    def _refresh_broker_status(self):
+        """Refresh runtime broker metrics"""
+        try:
+            if not self.broker_running or not self.broker:
+                self.clients_label.config(text="Clients: 0")
+                self.subscriptions_label.config(text="Subscriptions: 0")
+                self.queued_label.config(text="Queued Msgs: 0")
+                if not self.broker_running:
+                    self.broker_state_label.config(text="State: ⚪ Stopped", foreground='#666')
+                return
+
+            with self.broker.lock:
+                client_count = len(self.broker.clients)
+                subscription_count = sum(len(v) for v in self.broker.subscribers.values())
+                queued_count = sum(len(v) for v in self.broker.destinations.values())
+
+            self.clients_label.config(text=f"Clients: {client_count}")
+            self.subscriptions_label.config(text=f"Subscriptions: {subscription_count}")
+            self.queued_label.config(text=f"Queued Msgs: {queued_count}")
+            self.broker_state_label.config(text="State: ✅ Running", foreground='green')
+        except Exception as e:
+            self._log(f"[DEBUG] status refresh error: {e}")
+
+    def _show_broker_snapshot(self):
+        """Print detailed broker state snapshot to log"""
+        if not self.broker_running or not self.broker:
+            self._log("[DEBUG] Broker snapshot unavailable: broker is not running")
+            return
+
+        try:
+            with self.broker.lock:
+                clients = list(self.broker.clients)
+                subscriber_map = {dest: len(subs) for dest, subs in self.broker.subscribers.items() if subs}
+                queued_map = {dest: len(msgs) for dest, msgs in self.broker.destinations.items() if msgs}
+
+            self._log("[DEBUG] ===== Mini-Broker Snapshot =====")
+            self._log(f"[DEBUG] Clients: {len(clients)}")
+            for idx, client in enumerate(clients, start=1):
+                self._log(f"[DEBUG]   #{idx} {client.addr} | session={client.session_id} | subs={len(client.subscriptions)}")
+
+            if subscriber_map:
+                self._log("[DEBUG] Active subscriptions:")
+                for dest, count in subscriber_map.items():
+                    self._log(f"[DEBUG]   {dest} -> {count} subscriber(s)")
+            else:
+                self._log("[DEBUG] Active subscriptions: none")
+
+            if queued_map:
+                self._log("[DEBUG] Queued messages:")
+                for dest, count in queued_map.items():
+                    self._log(f"[DEBUG]   {dest} -> {count} message(s)")
+            else:
+                self._log("[DEBUG] Queued messages: none")
+
+            self._log("[DEBUG] =================================")
+            self._refresh_broker_status()
+        except Exception as e:
+            self._log(f"[DEBUG] snapshot error: {e}")
+
+    def _send_test_message(self):
+        """Inject a test message into broker for debug validation"""
+        if not self.broker_running or not self.broker:
+            messagebox.showwarning("Broker Not Running", "Start Mini-Broker first.")
+            return
+
+        destination = self.test_destination_entry.get().strip()
+        body = self.test_body_entry.get().strip()
+
+        if not destination:
+            messagebox.showwarning("Invalid Destination", "Destination cannot be empty.")
+            return
+
+        try:
+            payload = body.encode('utf-8') if body else b''
+
+            with self.broker.lock:
+                subscribers = list(self.broker.subscribers.get(destination, []))
+                if subscribers:
+                    for subscriber in subscribers:
+                        self.broker._send_message_to_client(subscriber, destination, payload)
+                else:
+                    self.broker.destinations[destination].append(payload)
+
+            self._log(f"[DEBUG] Test message sent to {destination} ({len(payload)} bytes)")
+            self._refresh_broker_status()
+        except Exception as e:
+            self._log(f"[DEBUG] Failed to send test message: {e}")
+
+    def _clear_broker_log(self):
+        """Clear broker status log"""
+        self.status_text.config(state=tk.NORMAL)
+        self.status_text.delete(1.0, tk.END)
+        self.status_text.config(state=tk.DISABLED)
+        self._log("Broker log cleared")
+
+    def _poll_broker_debug(self):
+        """Periodic broker status polling"""
+        try:
+            if self.debug_auto_refresh.get():
+                self._refresh_broker_status()
+        except Exception:
+            pass
+        self.after(1500, self._poll_broker_debug)
     
     def _log(self, message):
         """Log message to status text"""
@@ -335,6 +491,10 @@ class DaemonPage(ttk.Frame):
         self.daemon_process = None  # Daemon subprocess
         self.output_reader = None  # Output reader thread
         self.output_reader_running = False  # Output reader control flag
+        self.controls_visible = True
+        self.daemon_start_retry_count = 0
+        self.daemon_start_max_retries = 5
+        self.show_config_controls = False
         
         # Use centralized config manager
         self.config_manager = ConfigManager()
@@ -383,6 +543,10 @@ class DaemonPage(ttk.Frame):
         title_frame = ttk.Frame(self)
         title_frame.pack(fill=tk.X, padx=10, pady=10)
         ttk.Label(title_frame, text="Daemon Management", font=('Arial', 14, 'bold')).pack(side=tk.LEFT)
+        self.toggle_config_btn = ttk.Button(title_frame, text="Show Config", command=self._toggle_config_controls)
+        self.toggle_config_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        self.toggle_controls_btn = ttk.Button(title_frame, text="Show Controls", command=self._toggle_controls)
+        self.toggle_controls_btn.pack(side=tk.RIGHT)
         
         # Info banner - dynamically show broker port from config
         info_frame = ttk.Frame(self)
@@ -395,8 +559,12 @@ class DaemonPage(ttk.Frame):
         ttk.Label(info_frame, text=f"💡 Daemon自動連接到Mini Broker (localhost:{broker_port})", 
                  font=('Arial', 9), foreground='blue').pack(anchor=tk.W)
         
+        # Top control area (collapsible to reserve more space for output)
+        self.top_controls_frame = ttk.Frame(self)
+        self.top_controls_frame.pack(fill=tk.X, padx=10, pady=5)
+
         # Compact Status Display (side-by-side)
-        status_display_frame = ttk.LabelFrame(self, text="Status", padding=10)
+        status_display_frame = ttk.LabelFrame(self.top_controls_frame, text="Status", padding=10)
         status_display_frame.pack(fill=tk.X, padx=10, pady=5)
         
         # Single line with statuses
@@ -408,8 +576,8 @@ class DaemonPage(ttk.Frame):
         self.broker_status_label = ttk.Label(status_display_frame, text="Mini-Broker: ⚪ Unknown", font=('Arial', 9, 'bold'))
         self.broker_status_label.pack(side=tk.LEFT)
         
-        # Daemon Process Control
-        daemon_control_frame = ttk.LabelFrame(self, text="Daemon Process", padding=10)
+        # Daemon Process + Diagnostics (merged)
+        daemon_control_frame = ttk.LabelFrame(self.top_controls_frame, text="Daemon Process & Diagnostics", padding=10)
         daemon_control_frame.pack(fill=tk.X, padx=10, pady=5)
         
         daemon_btn_frame = ttk.Frame(daemon_control_frame)
@@ -426,12 +594,41 @@ class DaemonPage(ttk.Frame):
         
         self.restart_btn = ttk.Button(daemon_btn_frame, text="🔄 Restart Daemon", command=self._restart_daemon, state=tk.DISABLED)
         self.restart_btn.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Separator(daemon_btn_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
-        
-        ttk.Button(daemon_btn_frame, text="📝 View Config", command=self._view_config).pack(side=tk.LEFT, padx=5)
-        ttk.Button(daemon_btn_frame, text="⚙️ Edit Config", command=self._edit_config).pack(side=tk.LEFT, padx=5)
-        ttk.Button(daemon_btn_frame, text="Reload Config", command=self._reload_config).pack(side=tk.LEFT, padx=5)
+
+        # Config controls (hidden by default, toggled via Show Config button)
+        self.config_controls_frame = ttk.Frame(self.top_controls_frame)
+
+        config_button_row = ttk.Frame(self.config_controls_frame)
+        config_button_row.pack(fill=tk.X, padx=10, pady=(0, 5))
+        ttk.Separator(config_button_row, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+        ttk.Button(config_button_row, text="Reload Config", command=self._reload_config).pack(side=tk.LEFT, padx=5)
+        ttk.Button(config_button_row, text="📝 Advanced...", command=self._view_config).pack(side=tk.LEFT, padx=5)
+
+        self.quick_settings_frame = ttk.LabelFrame(self.config_controls_frame, text="Daemon Quick Settings", padding=10)
+        self.quick_settings_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        row1 = ttk.Frame(self.quick_settings_frame)
+        row1.pack(fill=tk.X, pady=4)
+        ttk.Label(row1, text="Controller ID:", width=14).pack(side=tk.LEFT)
+        self.daemon_controller_id_entry = ttk.Entry(row1, width=42)
+        self.daemon_controller_id_entry.pack(side=tk.LEFT, padx=5)
+
+        row2 = ttk.Frame(self.quick_settings_frame)
+        row2.pack(fill=tk.X, pady=4)
+        ttk.Label(row2, text="IPC Host:", width=14).pack(side=tk.LEFT)
+        self.daemon_ipc_host_entry = ttk.Entry(row2, width=22)
+        self.daemon_ipc_host_entry.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(row2, text="IPC Port:", width=10).pack(side=tk.LEFT)
+        self.daemon_ipc_port_entry = ttk.Entry(row2, width=10)
+        self.daemon_ipc_port_entry.pack(side=tk.LEFT, padx=5)
+
+        row3 = ttk.Frame(self.quick_settings_frame)
+        row3.pack(fill=tk.X, pady=(6, 2))
+        ttk.Button(row3, text="💾 Save Settings", command=self._save_daemon_quick_settings).pack(side=tk.LEFT, padx=5)
+        ttk.Button(row3, text="💾 Save + Reload", command=lambda: self._save_daemon_quick_settings(reload_daemon=True)).pack(side=tk.LEFT, padx=5)
+
+        self._load_daemon_quick_settings()
         
         # Diagnostic tools
         ttk.Separator(daemon_control_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
@@ -444,7 +641,7 @@ class DaemonPage(ttk.Frame):
         ttk.Button(diag_frame, text="📊 Show Status", command=self._show_detailed_status).pack(side=tk.LEFT, padx=5)
         
         # Broker Connection Control
-        broker_control_frame = ttk.LabelFrame(self, text="Mini-Broker Connection Control", padding=10)
+        broker_control_frame = ttk.LabelFrame(self.top_controls_frame, text="Mini-Broker Connection Control", padding=10)
         broker_control_frame.pack(fill=tk.X, padx=10, pady=5)
         
         broker_btn_frame = ttk.Frame(broker_control_frame)
@@ -484,6 +681,36 @@ class DaemonPage(ttk.Frame):
         self._log("  - Use '🔍 Test IPC' to verify daemon connection", 'info')
         self._log("  - Use '📊 Show Status' to see detailed daemon info", 'info')
         self._log("  - Daemon must be running for CLI commands to work", 'info')
+        self._apply_config_controls_visibility()
+        self._apply_controls_visibility()
+
+    def _toggle_controls(self):
+        """Toggle visibility of top control area to maximize output space"""
+        self.controls_visible = not self.controls_visible
+        self._apply_controls_visibility()
+
+    def _toggle_config_controls(self):
+        """Toggle hidden config controls on daemon page."""
+        self.show_config_controls = not self.show_config_controls
+        self._apply_config_controls_visibility()
+
+    def _apply_config_controls_visibility(self):
+        """Apply visibility state of config controls section."""
+        if self.show_config_controls:
+            self.config_controls_frame.pack(fill=tk.X, padx=0, pady=0)
+            self.toggle_config_btn.config(text="Hide Config")
+        else:
+            self.config_controls_frame.pack_forget()
+            self.toggle_config_btn.config(text="Show Config")
+
+    def _apply_controls_visibility(self):
+        """Apply control area visibility state"""
+        if self.controls_visible:
+            self.top_controls_frame.pack(fill=tk.X, padx=10, pady=5, before=self.output_text.master.master)
+            self.toggle_controls_btn.config(text="Hide Controls")
+        else:
+            self.top_controls_frame.pack_forget()
+            self.toggle_controls_btn.config(text="Show Controls")
     
     def _add_output_context_menu(self):
         """Add context menu to output text widget"""
@@ -558,6 +785,7 @@ class DaemonPage(ttk.Frame):
             else:
                 # Success - invalidate config cache
                 self.config_manager.invalidate_cache()
+                self._load_daemon_quick_settings()
                 success_msg = resp.get('msg', 'Config reloaded')
                 messagebox.showinfo("Success", success_msg)
             
@@ -569,6 +797,98 @@ class DaemonPage(ttk.Frame):
             print(f"[!] Reload config error: {e}")
             print(error_details)
             messagebox.showerror("Error", f"Failed to reload config: {e}")
+
+    def _load_daemon_quick_settings(self):
+        """Load daemon quick settings from config"""
+        try:
+            config = self.config_manager.get_config(self.ipc, force_reload=True) or {}
+            usp_cfg = config.get('usp_controller', {})
+            ipc_cfg = config.get('ipc', {})
+
+            endpoint_id = usp_cfg.get('controller_endpoint_id') or config.get('controller_endpoint_id', '')
+            ipc_host = ipc_cfg.get('host', '127.0.0.1')
+            ipc_port = ipc_cfg.get('port', 6001)
+
+            self.daemon_controller_id_entry.delete(0, tk.END)
+            self.daemon_controller_id_entry.insert(0, endpoint_id)
+            self.daemon_ipc_host_entry.delete(0, tk.END)
+            self.daemon_ipc_host_entry.insert(0, str(ipc_host))
+            self.daemon_ipc_port_entry.delete(0, tk.END)
+            self.daemon_ipc_port_entry.insert(0, str(ipc_port))
+            self._apply_ipc_target(ipc_host, ipc_port, log_change=False)
+        except Exception as e:
+            self._log(f"⚠️ Failed to load quick settings: {e}", 'warning')
+
+    def _apply_ipc_target(self, host, port, log_change=True):
+        """Apply IPC host/port to current IPC client."""
+        try:
+            target_host = str(host).strip() if host else '127.0.0.1'
+            target_port = int(port)
+            old_host = self.ipc.host
+            old_port = self.ipc.port
+            self.ipc.host = target_host
+            self.ipc.port = target_port
+
+            if log_change and (old_host != target_host or old_port != target_port):
+                self._log(f"ℹ️ IPC target updated: {target_host}:{target_port}", 'info')
+        except Exception as e:
+            self._log(f"⚠️ Failed to apply IPC target: {e}", 'warning')
+
+    def _save_daemon_quick_settings(self, reload_daemon=False):
+        """Save daemon quick settings directly from page"""
+        endpoint_id = self.daemon_controller_id_entry.get().strip()
+        ipc_host = self.daemon_ipc_host_entry.get().strip() or '127.0.0.1'
+        ipc_port_raw = self.daemon_ipc_port_entry.get().strip()
+
+        if not endpoint_id:
+            messagebox.showerror("Validation Error", "Controller ID cannot be empty")
+            return
+
+        try:
+            ipc_port = int(ipc_port_raw)
+            if not (1 <= ipc_port <= 65535):
+                raise ValueError("out of range")
+        except Exception:
+            messagebox.showerror("Validation Error", "IPC Port must be a valid number between 1 and 65535")
+            return
+
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            config_file = os.path.join(script_dir, 'config.json')
+            full_config = load_config(config_file) or {}
+
+            full_config.setdefault('usp_controller', {})
+            full_config.setdefault('ipc', {})
+
+            suffix = endpoint_id.split('::')[-1]
+            full_config['usp_controller']['controller_endpoint_id'] = endpoint_id
+            full_config['usp_controller']['receive_topic'] = f'/queue/usp.controller.{suffix}'
+
+            full_config['ipc']['host'] = ipc_host
+            full_config['ipc']['port'] = ipc_port
+
+            # Keep top-level mirror for backward compatibility with legacy readers
+            full_config['controller_endpoint_id'] = endpoint_id
+
+            if not save_config(full_config, config_file):
+                messagebox.showerror("Error", "Failed to save config.json")
+                return
+
+            self.config_manager.invalidate_cache()
+            self._apply_ipc_target(ipc_host, ipc_port)
+            self._log(f"✅ Settings saved (Controller ID: {endpoint_id}, IPC: {ipc_host}:{ipc_port})", 'success')
+
+            if reload_daemon:
+                resp = self.ipc.send_command('reload_config')
+                if resp and resp.get('status') == 'ok':
+                    messagebox.showinfo("Success", "Settings saved and daemon reloaded")
+                else:
+                    messagebox.showwarning("Partial Success", "Settings saved, but daemon reload failed (daemon may be offline)")
+            else:
+                messagebox.showinfo("Success", "Settings saved to config.json")
+        except Exception as e:
+            self._log(f"❌ Failed to save quick settings: {e}", 'error')
+            messagebox.showerror("Error", f"Failed to save settings: {e}")
     
     def _connect_broker(self):
         """Connect to broker via IPC"""
@@ -638,12 +958,60 @@ class DaemonPage(ttk.Frame):
     def _view_config(self):
         """View full configuration in a read-only dialog"""
         ConfigViewDialog(self, self.ipc, self.config_manager)
+
+    def _cleanup_existing_daemons_silent(self):
+        """Kill existing usp_controller daemon processes before launching a new one."""
+        try:
+            if sys.platform != 'win32':
+                return
+
+            result = subprocess.run(
+                ['wmic', 'process', 'where', 'CommandLine like "%usp_controller.py%--daemon%"', 'get', 'ProcessId'],
+                capture_output=True,
+                text=True,
+                timeout=8
+            )
+
+            pids = []
+            for line in result.stdout.split('\n'):
+                line = line.strip()
+                if line.isdigit():
+                    pids.append(int(line))
+
+            # Exclude current GUI-launched process object if already known and alive
+            current_pid = self.daemon_process.pid if self.daemon_process else None
+            killed = 0
+            for pid in pids:
+                if current_pid and pid == current_pid:
+                    continue
+                try:
+                    kill_result = subprocess.run(
+                        ['taskkill', '/F', '/PID', str(pid)],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    if kill_result.returncode == 0:
+                        killed += 1
+                except Exception:
+                    pass
+
+            if killed > 0:
+                self._log(f"🧹 Cleaned up {killed} existing daemon process(es)", 'info')
+                # Give OS a short moment to release sockets/handles
+                time.sleep(0.8)
+
+        except Exception as e:
+            self._log(f"⚠️ Pre-cleanup skipped: {e}", 'warning')
     
     def _start_daemon(self):
         """Start daemon process with output capture"""
         try:
             import subprocess
             import os
+
+            # Prevent duplicate daemon instances and IPC port conflicts
+            self._cleanup_existing_daemons_silent()
             
             # Get absolute path to usp_controller.py (same directory as this script)
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -658,7 +1026,7 @@ class DaemonPage(ttk.Frame):
             # Note: On Windows, we don't use CREATE_NEW_CONSOLE to capture output
             # The daemon runs in background and output is redirected to GUI
             self.daemon_process = subprocess.Popen(
-                ['python', '-u', script_path, '--daemon'],
+                ['python', '-u', script_path, '--daemon', '--force'],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -678,6 +1046,7 @@ class DaemonPage(ttk.Frame):
             self.output_reader.start()
             
             self.start_btn.config(state=tk.DISABLED)
+            self.daemon_start_retry_count = 0
             
             # Wait for daemon to start and verify IPC
             self._log("⏳ Waiting for daemon initialization...", 'info')
@@ -691,37 +1060,32 @@ class DaemonPage(ttk.Frame):
     
     def _verify_daemon_started(self):
         """Verify daemon started successfully and IPC is working"""
-        max_retries = 5
-        retry_count = 0
-        
-        def check_ipc():
-            nonlocal retry_count
-            retry_count += 1
-            
-            try:
-                resp = self.ipc.send_command('status')
-                if resp and resp.get('status') == 'ok':
-                    self._log("✅ Daemon started successfully!", 'success')
-                    self._log(f"  - IPC Server: operational", 'success')
-                    self._log(f"  - Broker: {'connected' if resp.get('broker_connected') else 'not connected'}", 
-                             'success' if resp.get('broker_connected') else 'warning')
-                    self._update_status()
-                    return True
-                else:
-                    return False
-            except:
-                return False
-        
-        if check_ipc():
-            return
-        
-        if retry_count < max_retries:
-            self._log(f"  Waiting for IPC server ({retry_count}/{max_retries})...", 'info')
+        try:
+            resp = self.ipc.send_command('status')
+            if resp and resp.get('status') == 'ok':
+                self._log("✅ Daemon started successfully!", 'success')
+                self._log(f"  - IPC Server: operational", 'success')
+                self._log(f"  - Broker: {'connected' if resp.get('broker_connected') else 'not connected'}", 
+                         'success' if resp.get('broker_connected') else 'warning')
+                self._update_status()
+                self.daemon_start_retry_count = 0
+                return
+        except:
+            pass
+
+        self.daemon_start_retry_count += 1
+
+        if self.daemon_start_retry_count < self.daemon_start_max_retries:
+            self._log(
+                f"  Waiting for IPC server ({self.daemon_start_retry_count}/{self.daemon_start_max_retries})...",
+                'info'
+            )
             self.after(1000, self._verify_daemon_started)
         else:
             self._log("⚠️ Daemon started but IPC server not responding", 'warning')
             self._log("ℹ️ Check daemon console for errors", 'info')
             self._update_status()
+            self.daemon_start_retry_count = 0
     
     def _stop_daemon(self):
         """Stop daemon process"""
@@ -985,7 +1349,7 @@ class DaemonPage(ttk.Frame):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(0.5)
-                result = s.connect_ex((IPC_HOST, IPC_PORT))
+                result = s.connect_ex((self.ipc.host, self.ipc.port))
                 if result != 0:  # Connection failed = port is free
                     port_free = True
                     self._log("✅ Port is free, daemon stopped successfully", 'success')
@@ -1018,13 +1382,13 @@ class DaemonPage(ttk.Frame):
             s.settimeout(2.0)
             
             try:
-                s.connect((IPC_HOST, IPC_PORT))
+                s.connect((self.ipc.host, self.ipc.port))
                 s.close()
-                self._log(f"✅ Port {IPC_PORT} is reachable", 'success')
+                self._log(f"✅ Port {self.ipc.port} on {self.ipc.host} is reachable", 'success')
             except ConnectionRefusedError:
-                self._log(f"❌ Port {IPC_PORT} connection refused - Daemon not running", 'error')
+                self._log(f"❌ Port {self.ipc.port} connection refused - Daemon not running", 'error')
                 messagebox.showerror("IPC Test Failed", 
-                                   f"Cannot connect to port {IPC_PORT}\n\n"
+                                   f"Cannot connect to {self.ipc.host}:{self.ipc.port}\n\n"
                                    "Daemon is not running or not listening on this port.")
                 return
             except socket.timeout:
@@ -1103,6 +1467,11 @@ class DaemonPage(ttk.Frame):
                     break
                 # Schedule GUI update in main thread (avoid lambda closure issues)
                 msg = line.rstrip()
+                match = re.search(r"IPC Server listening on\s+([^:]+):(\d+)", msg)
+                if match:
+                    host = match.group(1).strip()
+                    port = int(match.group(2))
+                    self.after(0, self._apply_ipc_target, host, port)
                 self.after(0, self._log_from_thread, msg, 'output')
             except UnicodeDecodeError as e:
                 # Log encoding error but continue reading
@@ -1165,11 +1534,12 @@ class DaemonPage(ttk.Frame):
             # Force reload from daemon/file
             config = self.config_manager.get_config(self.ipc, force_reload=True)
             self._log("📋 Configuration reloaded", 'info')
+            usp_cfg = config.get('usp_controller', {})
             
             # Display key configuration values
-            endpoint_id = config.get('controller_endpoint_id', 'Not set')
-            broker_host = config.get('broker_host', 'Not set')
-            broker_port = config.get('broker_port', 'Not set')
+            endpoint_id = usp_cfg.get('controller_endpoint_id') or config.get('controller_endpoint_id', 'Not set')
+            broker_host = usp_cfg.get('broker_host', config.get('broker_host', 'Not set'))
+            broker_port = usp_cfg.get('broker_port', config.get('broker_port', 'Not set'))
             mini_broker = config.get('mini_broker', {})
             
             self._log("=" * 50, 'info')
@@ -1232,18 +1602,19 @@ class ConfigViewDialog(tk.Toplevel):
         """Load and display configuration"""
         try:
             config = self.config_manager.get_config(self.ipc, force_reload=True)
+            usp_cfg = config.get('usp_controller', {})
             
             self.config_text.delete(1.0, tk.END)
             
             # Format and display config in a readable way
             self._insert_section("CONTROLLER SETTINGS")
-            self._insert_item("Endpoint ID", config.get('controller_endpoint_id', 'Not set'))
+            self._insert_item("Endpoint ID", usp_cfg.get('controller_endpoint_id') or config.get('controller_endpoint_id', 'Not set'))
             
             self._insert_section("\nBROKER CONNECTION")
-            self._insert_item("Host", config.get('broker_host', 'Not set'))
-            self._insert_item("Port", config.get('broker_port', 'Not set'))
-            self._insert_item("Username", config.get('username', 'Not set'))
-            self._insert_item("Password", '****' if config.get('password') else 'Not set')
+            self._insert_item("Host", usp_cfg.get('broker_host', config.get('broker_host', 'Not set')))
+            self._insert_item("Port", usp_cfg.get('broker_port', config.get('broker_port', 'Not set')))
+            self._insert_item("Username", usp_cfg.get('username', config.get('username', 'Not set')))
+            self._insert_item("Password", '****' if (usp_cfg.get('password') or config.get('password')) else 'Not set')
             
             self._insert_section("\nMINI BROKER SETTINGS")
             mini_broker = config.get('mini_broker', {})
@@ -1345,7 +1716,8 @@ class DaemonConfigEditorDialog(tk.Toplevel):
         
         ttk.Label(frame, text="Endpoint ID:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.endpoint_entry = ttk.Entry(frame, width=40)
-        self.endpoint_entry.insert(0, self.config.get('controller_endpoint_id', ''))
+        usp_cfg = self.config.get('usp_controller', {})
+        self.endpoint_entry.insert(0, usp_cfg.get('controller_endpoint_id', self.config.get('controller_endpoint_id', '')))
         self.endpoint_entry.grid(row=0, column=1, sticky=tk.EW, padx=10, pady=5)
         
         ttk.Label(frame, text="Example: proto::controller.my-laptop", 
@@ -1366,10 +1738,10 @@ class DaemonConfigEditorDialog(tk.Toplevel):
         frame.pack(fill=tk.X, pady=5)
         
         settings = [
-            ("Host:", self.config.get('broker_host', '127.0.0.1')),
-            ("Port:", str(self.config.get('broker_port', mini_broker_port))),
-            ("Username:", self.config.get('username', 'guest')),
-            ("Password:", '****' if self.config.get('password') else '')
+            ("Host:", self.config.get('usp_controller', {}).get('broker_host', self.config.get('broker_host', '127.0.0.1'))),
+            ("Port:", str(self.config.get('usp_controller', {}).get('broker_port', self.config.get('broker_port', mini_broker_port)))),
+            ("Username:", self.config.get('usp_controller', {}).get('username', self.config.get('username', 'guest'))),
+            ("Password:", '****' if (self.config.get('usp_controller', {}).get('password') or self.config.get('password')) else '')
         ]
         
         for i, (label, value) in enumerate(settings):
@@ -1461,6 +1833,15 @@ class DaemonConfigEditorDialog(tk.Toplevel):
             
             # Update controller settings
             endpoint_id = self.endpoint_entry.get().strip()
+            if 'usp_controller' not in full_config:
+                full_config['usp_controller'] = {}
+            full_config['usp_controller']['controller_endpoint_id'] = endpoint_id
+
+            # Keep receive_topic in sync with controller id
+            suffix = endpoint_id.split('::')[-1]
+            full_config['usp_controller']['receive_topic'] = f'/queue/usp.controller.{suffix}'
+
+            # Keep top-level mirror for backward compatibility
             full_config['controller_endpoint_id'] = endpoint_id
             
             # Update IPC settings
@@ -1477,6 +1858,10 @@ class DaemonConfigEditorDialog(tk.Toplevel):
             full_config['broker_port'] = broker_port
             full_config['username'] = 'guest'
             full_config['password'] = 'guest'
+            full_config['usp_controller']['broker_host'] = '127.0.0.1'
+            full_config['usp_controller']['broker_port'] = broker_port
+            full_config['usp_controller']['username'] = 'guest'
+            full_config['usp_controller']['password'] = 'guest'
             
             # Save config file
             from usp_core import save_config as save_config_file
@@ -1619,7 +2004,7 @@ class CLIPage(ttk.Frame):
         
         # Welcome message
         self.output_text.insert(tk.END, "="*60 + "\n")
-        self.output_text.insert(tk.END, "  USP Controller CLI - Embedded Mode v3.0\n")
+        self.output_text.insert(tk.END, f"  USP Controller CLI - Embedded Mode v{GUI_VERSION}\n")
         self.output_text.insert(tk.END, "="*60 + "\n\n")
         self.output_text.insert(tk.END, "Type 'help' for available commands\n")
         self.output_text.insert(tk.END, "Use arrow keys to navigate command history\n\n")
@@ -1921,7 +2306,8 @@ class CLIPage(ttk.Frame):
             self._clear_output()
             return
         elif command == 'version':
-            self.output_text.insert(tk.END, "USP Controller GUI V3.0\n", 'info')
+            self.output_text.insert(tk.END, f"USP Controller GUI V{GUI_VERSION}\n", 'info')
+            self.output_text.insert(tk.END, f"Build Version: {FULL_VERSION}\n", 'info')
             self.output_text.insert(tk.END, "Multi-Page Embedded Architecture\n", 'info')
             self.output_text.insert(tk.END, "\n>>> ")
             self.output_text.see(tk.END)
@@ -2273,7 +2659,7 @@ class USPControllerGUI:
     
     def __init__(self, root):
         self.root = root
-        self.root.title("USP Controller V3.0 - Multi-Page")
+        self.root.title(f"USP Controller V{GUI_VERSION} - Multi-Page")
         self.root.geometry("1200x800")
         
         # Create menu
@@ -2296,9 +2682,26 @@ class USPControllerGUI:
         # Status bar
         self.status_bar = ttk.Label(self.root, text="Ready - Daemon: Not checked", relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Auto start mini-broker when GUI opens
+        self.root.after(300, self._auto_start_mini_broker)
         
         # Check daemon status after GUI loads
         self.root.after(500, self._check_daemon_status)
+
+    def _auto_start_mini_broker(self):
+        """Auto-start mini-broker on GUI startup."""
+        try:
+            if getattr(self.broker_page, 'broker_running', False):
+                return
+
+            self.broker_page._log("[AUTO] Starting Mini-Broker on GUI startup...")
+            self.broker_page._start_broker()
+        except Exception as e:
+            try:
+                self.broker_page._log(f"[AUTO] Failed to start Mini-Broker: {e}")
+            except Exception:
+                pass
     
     def _check_daemon_status(self):
         """Check daemon status and update status bar"""
@@ -2351,7 +2754,8 @@ class USPControllerGUI:
         """Show about dialog"""
         messagebox.showinfo(
             "About",
-            "USP Controller V3.0\n\n"
+            f"USP Controller V{GUI_VERSION}\n"
+            f"Build: {FULL_VERSION}\n\n"
             "Multi-Page Embedded Architecture\n"
             "- Broker Management\n"
             "- Daemon Control\n"

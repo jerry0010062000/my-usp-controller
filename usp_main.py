@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-USP Controller v3.0 - 模組化版本
+USP Controller - 模組化版本
 使用新的可擴展架構
 
 使用方法:
@@ -13,6 +13,7 @@ USP Controller v3.0 - 模組化版本
 import sys
 import argparse
 from pathlib import Path
+from usp_version import FULL_VERSION
 
 # 添加模組路徑
 sys.path.insert(0, str(Path(__file__).parent))
@@ -40,7 +41,7 @@ class USPController:
         # 設置調試級別
         set_debug_level(config.debug_level)
         
-        logger.info(f"=== USP Controller v3.0 ===", level=0)
+        logger.info(f"=== USP Controller v{FULL_VERSION} ===", level=0)
         logger.info(f"Controller ID: {config.controller_endpoint_id}", level=0)
     
     def initialize(self) -> bool:
@@ -260,7 +261,7 @@ def interactive_mode(controller: USPController):
 def main():
     """主函數"""
     parser = argparse.ArgumentParser(
-        description="USP Controller v3.0 - Modular Architecture"
+        description=f"USP Controller v{FULL_VERSION} - Modular Architecture"
     )
     parser.add_argument('--daemon', action='store_true',
                        help='Run as daemon with IPC')
