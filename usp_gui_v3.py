@@ -55,6 +55,7 @@ class ConfigManager:
             return self._config_cache
         
         config = None
+        file_config = None
         
         # Try IPC first if client provided
         if ipc_client:
@@ -82,10 +83,27 @@ class ConfigManager:
             except:
                 pass
         
+        # Load file config for fallback and to complete missing fields from IPC shape
+        from usp_core import load_config as load_config_from_file
+        file_config = load_config_from_file() or {}
+
         # Fallback to file if IPC failed
         if not config:
-            from usp_core import load_config as load_config_from_file
-            config = load_config_from_file() or {}
+            config = file_config
+        else:
+            # Merge missing top-level sections from file
+            if isinstance(config, dict) and isinstance(file_config, dict):
+                for key, value in file_config.items():
+                    if key not in config:
+                        config[key] = value
+
+                # Merge nested usp_controller keys
+                ipc_usp = config.get('usp_controller')
+                file_usp = file_config.get('usp_controller')
+                if isinstance(ipc_usp, dict) and isinstance(file_usp, dict):
+                    for key, value in file_usp.items():
+                        if key not in ipc_usp:
+                            ipc_usp[key] = value
         
         # Update cache
         self._config_cache = config
@@ -221,6 +239,7 @@ class BrokerPage(ttk.Frame):
         self.broker = None
         self.broker_thread = None
         self.broker_running = False
+        self.controls_visible = True
         self.debug_auto_refresh = tk.BooleanVar(value=True)
         self._last_subscription_signature = None
         
@@ -236,21 +255,23 @@ class BrokerPage(ttk.Frame):
         title_frame = ttk.Frame(self)
         title_frame.pack(fill=tk.X, padx=10, pady=10)
         ttk.Label(title_frame, text="Mini STOMP Broker (Embedded)", font=('Arial', 14, 'bold')).pack(side=tk.LEFT)
+        self.toggle_controls_btn = ttk.Button(title_frame, text="Hide Controls", command=self._toggle_controls)
+        self.toggle_controls_btn.pack(side=tk.RIGHT)
         
         # Info
-        info_frame = ttk.Frame(self)
-        info_frame.pack(fill=tk.X, padx=10, pady=5)
-        ttk.Label(info_frame, text="💡 Mini Broker用於測試環境，無需外部broker", 
+        self.info_frame = ttk.Frame(self)
+        self.info_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(self.info_frame, text="💡 Mini Broker用於測試環境，無需外部broker", 
                  font=('Arial', 9), foreground='blue').pack(anchor=tk.W)
-        ttk.Label(info_frame, text="💡 支援即時狀態監控與測試訊息注入（debug）", 
+        ttk.Label(self.info_frame, text="💡 支援即時狀態監控與測試訊息注入（debug）", 
              font=('Arial', 9), foreground='#666').pack(anchor=tk.W)
         
         # Configuration
-        config_frame = ttk.LabelFrame(self, text="Mini Broker 設定", padding=10)
-        config_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.config_frame = ttk.LabelFrame(self, text="Mini Broker 設定", padding=10)
+        self.config_frame.pack(fill=tk.X, padx=10, pady=5)
         
         # Host
-        host_row = ttk.Frame(config_frame)
+        host_row = ttk.Frame(self.config_frame)
         host_row.pack(fill=tk.X, pady=5)
         ttk.Label(host_row, text="Listen Host:", width=15).pack(side=tk.LEFT)
         self.host_entry = ttk.Entry(host_row, width=25)
@@ -259,7 +280,7 @@ class BrokerPage(ttk.Frame):
         self.host_entry.pack(side=tk.LEFT, padx=5)
         
         # Port
-        port_row = ttk.Frame(config_frame)
+        port_row = ttk.Frame(self.config_frame)
         port_row.pack(fill=tk.X, pady=5)
         ttk.Label(port_row, text="Listen Port:", width=15).pack(side=tk.LEFT)
         self.port_entry = ttk.Entry(port_row, width=25)
@@ -268,7 +289,7 @@ class BrokerPage(ttk.Frame):
         self.port_entry.pack(side=tk.LEFT, padx=5)
         
         # Control buttons
-        btn_frame = ttk.Frame(config_frame)
+        btn_frame = ttk.Frame(self.config_frame)
         btn_frame.pack(fill=tk.X, pady=10)
         
         self.start_btn = ttk.Button(btn_frame, text="Start Mini Broker", command=self._start_broker)
@@ -283,26 +304,26 @@ class BrokerPage(ttk.Frame):
         ttk.Checkbutton(btn_frame, text="Auto Debug Refresh", variable=self.debug_auto_refresh).pack(side=tk.RIGHT, padx=5)
 
         # Broker runtime status
-        status_frame = ttk.LabelFrame(self, text="Runtime Status", padding=10)
-        status_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.status_frame = ttk.LabelFrame(self, text="Runtime Status", padding=10)
+        self.status_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        self.broker_state_label = ttk.Label(status_frame, text="State: ⚪ Stopped", font=('Arial', 9, 'bold'))
+        self.broker_state_label = ttk.Label(self.status_frame, text="State: ⚪ Stopped", font=('Arial', 9, 'bold'))
         self.broker_state_label.pack(side=tk.LEFT, padx=(0, 15))
 
-        self.clients_label = ttk.Label(status_frame, text="Clients: 0", font=('Arial', 9))
+        self.clients_label = ttk.Label(self.status_frame, text="Clients: 0", font=('Arial', 9))
         self.clients_label.pack(side=tk.LEFT, padx=10)
 
-        self.subscriptions_label = ttk.Label(status_frame, text="Subscriptions: 0", font=('Arial', 9))
+        self.subscriptions_label = ttk.Label(self.status_frame, text="Subscriptions: 0", font=('Arial', 9))
         self.subscriptions_label.pack(side=tk.LEFT, padx=10)
 
-        self.queued_label = ttk.Label(status_frame, text="Queued Msgs: 0", font=('Arial', 9))
+        self.queued_label = ttk.Label(self.status_frame, text="Queued Msgs: 0", font=('Arial', 9))
         self.queued_label.pack(side=tk.LEFT, padx=10)
 
         # Debug tools
-        debug_tools_frame = ttk.LabelFrame(self, text="Debug Tools", padding=10)
-        debug_tools_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.debug_tools_frame = ttk.LabelFrame(self, text="Debug Tools", padding=10)
+        self.debug_tools_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        test_msg_row = ttk.Frame(debug_tools_frame)
+        test_msg_row = ttk.Frame(self.debug_tools_frame)
         test_msg_row.pack(fill=tk.X, pady=2)
         ttk.Label(test_msg_row, text="Destination:", width=12).pack(side=tk.LEFT)
         self.test_destination_entry = ttk.Entry(test_msg_row, width=32)
@@ -318,16 +339,35 @@ class BrokerPage(ttk.Frame):
         ttk.Button(test_msg_row, text="Clear Log", command=self._clear_broker_log).pack(side=tk.LEFT, padx=5)
         
         # Status/Log
-        log_frame = ttk.LabelFrame(self, text="Status & Log", padding=10)
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.log_frame = ttk.LabelFrame(self, text="Status & Log", padding=10)
+        self.log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
-        self.status_text = scrolledtext.ScrolledText(log_frame, height=15, state=tk.DISABLED, 
+        self.status_text = scrolledtext.ScrolledText(self.log_frame, height=15, state=tk.DISABLED, 
                                                       bg='#f0f0f0', font=('Courier', 9))
         self.status_text.pack(fill=tk.BOTH, expand=True)
         
         self._log("Mini Broker ready to start")
         self._log("Note: Agents will connect to this broker instead of external broker")
         self._refresh_broker_status()
+        self._apply_controls_visibility()
+
+    def _toggle_controls(self):
+        """Toggle visibility of control panels to maximize debug log area."""
+        self.controls_visible = not self.controls_visible
+        self._apply_controls_visibility()
+
+    def _apply_controls_visibility(self):
+        """Apply controls visibility state for broker page."""
+        frames = [self.info_frame, self.config_frame, self.status_frame, self.debug_tools_frame]
+        if self.controls_visible:
+            for frame in frames:
+                if not frame.winfo_manager():
+                    frame.pack(fill=tk.X, padx=10, pady=5, before=self.log_frame)
+            self.toggle_controls_btn.config(text="Hide Controls")
+        else:
+            for frame in frames:
+                frame.pack_forget()
+            self.toggle_controls_btn.config(text="Show Controls")
         
     
     def _start_broker(self):
@@ -362,7 +402,7 @@ class BrokerPage(ttk.Frame):
             self._log(f"Starting Mini-Broker on {host}:{port}...")
             self._log(f"Saved Mini-Broker config: {host}:{port}")
             
-            self.broker = EmbeddedBroker(host=host, port=port)
+            self.broker = EmbeddedBroker(host=host, port=port, log_callback=self._on_broker_debug_message)
             
             def run_broker():
                 try:
@@ -526,6 +566,13 @@ class BrokerPage(ttk.Frame):
         self.status_text.delete(1.0, tk.END)
         self.status_text.config(state=tk.DISABLED)
         self._log("Broker log cleared")
+
+    def _on_broker_debug_message(self, message):
+        """Thread-safe bridge for embedded broker debug messages into GUI log."""
+        try:
+            self.after(0, lambda: self._log(f"[BROKER] {message}"))
+        except Exception:
+            pass
 
     def _poll_broker_debug(self):
         """Periodic broker status polling"""
@@ -1654,13 +1701,47 @@ class ConfigViewDialog(tk.Toplevel):
             fg='#000000'
         )
         self.config_text.pack(fill=tk.BOTH, expand=True)
+        self._add_text_context_menu()
+        self.config_text.bind('<Control-c>', lambda _e: self._copy_selected_or_all())
         
         # Buttons
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(pady=10)
         
+        ttk.Button(btn_frame, text="Copy", command=self._copy_selected_or_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Select All", command=self._select_all).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Edit Config", command=self._open_editor).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Close", command=self.destroy).pack(side=tk.LEFT, padx=5)
+
+    def _add_text_context_menu(self):
+        menu = tk.Menu(self.config_text, tearoff=0)
+        menu.add_command(label="Copy", command=self._copy_selected_or_all)
+        menu.add_command(label="Select All", command=self._select_all)
+
+        def show_menu(event):
+            menu.post(event.x_root, event.y_root)
+
+        self.config_text.bind('<Button-3>', show_menu)
+
+    def _select_all(self):
+        self.config_text.focus_set()
+        self.config_text.tag_add(tk.SEL, "1.0", tk.END)
+
+    def _copy_selected_or_all(self):
+        try:
+            content = self.config_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            content = self.config_text.get("1.0", tk.END)
+
+        content = (content or '').strip()
+        if not content:
+            return
+
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(content)
+        except Exception:
+            pass
     
     def _load_and_display(self):
         """Load and display configuration"""
@@ -1981,6 +2062,7 @@ class CLIPage(ttk.Frame):
         self.ipc = IPCClient()  # IPC client for command execution
         self.command_history = self._load_history()
         self.history_index = -1
+        self.command_cooldown_until = 0.0
         
         self._create_widgets()
         self._refresh_history_list()
@@ -2343,6 +2425,20 @@ class CLIPage(ttk.Frame):
         command = self.command_entry.get().strip()
         if not command:
             return 'break'
+
+        now = time.time()
+        remaining = self.command_cooldown_until - now
+        if remaining > 0:
+            delay_ms = int(remaining * 1000)
+            self.output_text.insert(
+                tk.END,
+                f"⚠️ Daemon is still busy. Command delayed for {remaining:.1f}s: {command}\n",
+                'warning'
+            )
+            self.output_text.see(tk.END)
+            self.after(delay_ms, lambda cmd=command: self._execute_command(cmd))
+            self.command_entry.delete(0, tk.END)
+            return 'break'
         
         self._execute_command(command)
         self.command_entry.delete(0, tk.END)
@@ -2493,11 +2589,20 @@ class CLIPage(ttk.Frame):
             self.output_text.insert(tk.END, f"⏱️ {response.get('msg', 'No agent response')}\n", 'warning')
             endpoint = response.get('endpoint')
             path = response.get('path')
+            suggested_timeout = response.get('suggested_timeout')
             if endpoint or path:
                 self.output_text.insert(tk.END, f"   endpoint: {endpoint}\n", 'warning')
                 self.output_text.insert(tk.END, f"   path: {path}\n", 'warning')
             self.output_text.insert(tk.END, "   daemon: reachable\n", 'warning')
             self.output_text.insert(tk.END, "   route: CLI -> Daemon -> Broker (sent) -> Agent (no response)\n", 'warning')
+
+            if suggested_timeout:
+                self.output_text.insert(tk.END, f"   tip: retry with --timeout {suggested_timeout}\n", 'warning')
+
+            # Apply a short cooldown to avoid hammering daemon with consecutive heavy requests.
+            cooldown_seconds = 3.0
+            self.command_cooldown_until = max(self.command_cooldown_until, time.time() + cooldown_seconds)
+            self.output_text.insert(tk.END, f"⚠️ CLI cooldown applied: {cooldown_seconds:.0f}s\n", 'warning')
         else:
             # Error response
             self.output_text.insert(tk.END, f"❌ Error: {response.get('msg', 'Unknown error')}\n", 'error')
@@ -2790,6 +2895,179 @@ DISCOVERY COMMANDS (Require daemon):
         self.polling = False
 
 
+class AgentCommandsPage(ttk.Frame):
+    """Agent Commands Generator Page"""
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.config_manager = ConfigManager()
+        self._create_widgets()
+        self._generate_commands()
+
+    def _create_widgets(self):
+        container = ttk.Frame(self, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        top_row = ttk.Frame(container)
+        top_row.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(top_row, text="Platform:", width=10).pack(side=tk.LEFT)
+        self.platform_combo = ttk.Combobox(top_row, state='readonly', width=20, values=['prpl-opl-poc'])
+        self.platform_combo.current(0)
+        self.platform_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.platform_combo.bind("<<ComboboxSelected>>", lambda _e: self._generate_commands())
+
+        ttk.Button(top_row, text="Generate", command=self._generate_commands).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top_row, text="Select All", command=self._select_all).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top_row, text="Copy", command=self._copy_selected_or_all).pack(side=tk.LEFT, padx=4)
+
+        tip = ttk.Label(
+            container,
+            text="⚠️ 生成出來的code 僅供參考使用，請確認裝置環境調整",
+            foreground='blue',
+            font=('Arial', 9)
+        )
+        tip.pack(anchor=tk.W, pady=(0, 6))
+
+        self.commands_text = scrolledtext.ScrolledText(container, font=('Consolas', 10), wrap=tk.WORD)
+        self.commands_text.pack(fill=tk.BOTH, expand=True)
+        self._add_text_context_menu(self.commands_text)
+        self.commands_text.bind('<Control-c>', lambda _e: self._copy_selected_or_all())
+
+    def _load_current_config(self) -> dict:
+        ipc_client = None
+        try:
+            ipc_client = getattr(getattr(self.app, 'daemon_page', None), 'ipc', None)
+        except Exception:
+            ipc_client = None
+
+        try:
+            return self.config_manager.get_config(ipc_client, force_reload=True) or {}
+        except Exception:
+            return self.config_manager.get_config(force_reload=True) or {}
+
+    def _resolve_local_external_ip(self, config: dict) -> str:
+        """Resolve local external/LAN IP for agent to connect back to controller broker."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                candidate = s.getsockname()[0]
+                if candidate and not candidate.startswith("127."):
+                    return candidate
+        except Exception:
+            pass
+
+        try:
+            hostname_ip = socket.gethostbyname(socket.gethostname())
+            if hostname_ip and not hostname_ip.startswith("127."):
+                return hostname_ip
+        except Exception:
+            pass
+
+        usp_cfg = config.get('usp_controller', {}) if isinstance(config, dict) else {}
+        fallback = usp_cfg.get('broker_host', config.get('broker_host', '127.0.0.1'))
+        if isinstance(fallback, str) and fallback and not fallback.startswith('127.') and fallback != '0.0.0.0':
+            return fallback
+        return '127.0.0.1'
+
+    def _derive_agent_destination(self, config: dict, controller_destination: str) -> str:
+        """Resolve agent destination from config; fallback derives from controller queue name."""
+        usp_cfg = config.get('usp_controller', {}) if isinstance(config, dict) else {}
+
+        explicit = (
+            usp_cfg.get('agent_destination')
+            or usp_cfg.get('agent_receive_topic')
+            or config.get('agent_destination')
+            or config.get('agent_receive_topic')
+        )
+        if explicit:
+            return str(explicit)
+
+        if isinstance(controller_destination, str) and controller_destination:
+            if 'usp.controller.' in controller_destination:
+                return controller_destination.replace('usp.controller.', 'usp.agent.', 1)
+            if 'controller' in controller_destination:
+                return controller_destination.replace('controller', 'agent', 1)
+
+        return '/queue/usp.agent.opl'
+
+    def _commands_for_platform(self, platform_name: str, config: dict) -> str:
+        if platform_name == 'prpl-opl-poc':
+            usp_cfg = config.get('usp_controller', {}) if isinstance(config, dict) else {}
+
+            broker_host = self._resolve_local_external_ip(config)
+            broker_port = usp_cfg.get('broker_port', config.get('broker_port', 61613))
+            username = 'guest'
+            password = 'guest'
+            controller_id = usp_cfg.get('controller_endpoint_id', config.get('controller_endpoint_id', 'proto::controller.default'))
+            controller_destination = usp_cfg.get('receive_topic', config.get('receive_topic', '/queue/usp.controller.default'))
+            agent_destination = self._derive_agent_destination(config, controller_destination)
+
+            return (
+                "# ⚠️ 生成出來的code 僅供參考使用，請確認裝置環境調整\n"
+                f"obuspa -c set Device.STOMP.Connection.1.Host \"{broker_host}\"\n"
+                f"obuspa -c set Device.STOMP.Connection.1.Port {broker_port}\n"
+                f"obuspa -c set Device.STOMP.Connection.1.Username \"{username}\"\n"
+                f"obuspa -c set Device.STOMP.Connection.1.Password \"{password}\"\n"
+                "obuspa -c set Device.STOMP.Connection.1.Enable 1\n"
+                "obuspa -c set Device.STOMP.Connection.1.EnableEncryption 0\n"
+                f"obuspa -c set Device.LocalAgent.MTP.1.STOMP.Destination \"{agent_destination}\"\n"
+                "obuspa -c set Device.LocalAgent.MTP.1.Protocol \"STOMP\"\n"
+                "obuspa -c set Device.LocalAgent.Controller.1.Enable 1\n"
+                "obuspa -c set Device.LocalAgent.Controller.1.AssignedRole \"Device.LocalAgent.ControllerTrust.Role.1\"\n"
+                "obuspa -c set Device.LocalAgent.Controller.1.InheritedRole \"Device.LocalAgent.ControllerTrust.Role.1\"\n"
+                f"obuspa -c set Device.LocalAgent.Controller.1.EndpointID \"{controller_id}\"\n"
+                "obuspa -c set Device.LocalAgent.Controller.1.MTP.1.Enable true\n"
+                "obuspa -c set Device.LocalAgent.Controller.1.MTP.1.Protocol \"STOMP\"\n"
+                f"obuspa -c set Device.LocalAgent.Controller.1.MTP.1.STOMP.Destination \"{controller_destination}\"\n"
+                "obuspa -c set Device.LocalAgent.Controller.1.MTP.1.STOMP.Reference \"Device.STOMP.Connection.1\"\n"
+            )
+
+        return "# Unsupported platform"
+
+    def _generate_commands(self):
+        platform_name = self.platform_combo.get().strip().lower() or 'prpl-opl-poc'
+        config = self._load_current_config()
+        content = self._commands_for_platform(platform_name, config)
+        self.commands_text.delete("1.0", tk.END)
+        self.commands_text.insert("1.0", content)
+
+    def _select_all(self):
+        self.commands_text.focus_set()
+        self.commands_text.tag_add(tk.SEL, "1.0", tk.END)
+
+    def _copy_selected_or_all(self):
+        try:
+            content = self.commands_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            content = self.commands_text.get("1.0", tk.END)
+
+        content = (content or '').strip()
+        if not content:
+            return
+
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(content)
+        except Exception:
+            pass
+
+    def _copy_all(self):
+        self._select_all()
+        self._copy_selected_or_all()
+
+    def _add_text_context_menu(self, text_widget):
+        menu = tk.Menu(text_widget, tearoff=0)
+        menu.add_command(label="Copy", command=self._copy_selected_or_all)
+        menu.add_command(label="Select All", command=self._select_all)
+
+        def show_menu(event):
+            menu.post(event.x_root, event.y_root)
+
+        text_widget.bind('<Button-3>', show_menu)
+
+
 class USPControllerGUI:
     """Main GUI Application"""
     
@@ -2809,11 +3087,13 @@ class USPControllerGUI:
         self.cli_page = CLIPage(self.notebook, self)
         self.broker_page = BrokerPage(self.notebook, self)
         self.daemon_page = DaemonPage(self.notebook, self)
+        self.agent_commands_page = AgentCommandsPage(self.notebook, self)
         
         # Add pages to notebook (CLI is first/default)
         self.notebook.add(self.cli_page, text="💻 CLI Terminal")
         self.notebook.add(self.daemon_page, text="⚙️ Daemon")
         self.notebook.add(self.broker_page, text="🔧 Mini Broker")
+        self.notebook.add(self.agent_commands_page, text="🧾 config gen")
         
         # Status bar
         self.status_bar = ttk.Label(self.root, text="Ready - Daemon: Not checked", relief=tk.SUNKEN, anchor=tk.W)

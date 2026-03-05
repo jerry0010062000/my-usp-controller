@@ -12,6 +12,28 @@ from typing import Optional, Dict, Any
 from pathlib import Path
 
 
+def _create_config_from_example(filepath: str = 'config.json') -> bool:
+    """Create config file from example template on first run."""
+    target_path = Path(filepath)
+    base_dir = target_path.parent if str(target_path.parent) else Path('.')
+
+    candidates = [
+        base_dir / 'config.v3.example.json',
+        base_dir / 'config.example.json',
+    ]
+
+    for example_path in candidates:
+        if example_path.exists():
+            try:
+                with open(example_path, 'r', encoding='utf-8') as src, open(target_path, 'w', encoding='utf-8') as dst:
+                    dst.write(src.read())
+                return True
+            except Exception:
+                return False
+
+    return False
+
+
 @dataclass
 class TransportConfig:
     """傳輸層配置（支援多種協議）"""
@@ -160,7 +182,9 @@ class ControllerConfig:
             )
             
         except FileNotFoundError:
-            raise FileNotFoundError(f"Config file '{filepath}' not found. Please create it from config.example.json")
+            if _create_config_from_example(filepath):
+                return cls.from_json(filepath)
+            raise FileNotFoundError(f"Config file '{filepath}' not found. Please create it from config.v3.example.json or config.example.json")
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON in config file: {e}")
     

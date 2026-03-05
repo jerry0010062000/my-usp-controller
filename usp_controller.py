@@ -31,6 +31,7 @@ from datetime import datetime
 import argparse
 import platform
 import atexit
+from pathlib import Path
 
 # mDNS Service Discovery (optional)
 try:
@@ -68,6 +69,30 @@ except ImportError:
     pass
 
 # --- Load Configuration from config.json ---
+def _create_config_from_example(config_file='config.json'):
+    """Create config file from example template on first run."""
+    target_path = Path(config_file)
+    base_dir = target_path.parent if str(target_path.parent) else Path('.')
+
+    candidates = [
+        base_dir / 'config.v3.example.json',
+        base_dir / 'config.example.json',
+    ]
+
+    for example_path in candidates:
+        if example_path.exists():
+            try:
+                with open(example_path, 'r', encoding='utf-8') as src, open(target_path, 'w', encoding='utf-8') as dst:
+                    dst.write(src.read())
+                print(f"[*] Created '{config_file}' from '{example_path.name}'")
+                return True
+            except Exception as e:
+                print(f"[!] Failed to create '{config_file}' from '{example_path.name}': {e}")
+                return False
+
+    print("[!] No example config found (expected config.v3.example.json or config.example.json)")
+    return False
+
 def load_config(config_file='config.json'):
     """Load configuration from JSON file"""
     try:
@@ -75,7 +100,14 @@ def load_config(config_file='config.json'):
             config = json.load(f)
         return config
     except FileNotFoundError:
-        print(f"[!] Config file '{config_file}' not found. Using defaults.")
+        print(f"[!] Config file '{config_file}' not found. Creating from example...")
+        if _create_config_from_example(config_file):
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"[!] Failed to load newly created config file: {e}")
+        print(f"[!] Falling back to in-memory defaults.")
         return None
     except json.JSONDecodeError as e:
         print(f"[!] Error parsing config file: {e}")
@@ -1122,7 +1154,7 @@ class STOMPManager:
         if reply_to:
             Logger.info(f"  reply-to address: {reply_to}", level=1)
         else:
-            Logger.critical(f"  ⚠ No reply-to-dest header! Cannot reply to this agent.")
+            Logger.info(f"  ℹ No reply-to-dest header, will try to infer from payload", level=1)
         
         # ==================== Step 2: 解析 USP Record 獲取 endpoint ID ====================
         # 如果是 USP 訊息，從 protobuf 中提取 from_id 和訊息內容
@@ -1225,10 +1257,57 @@ class STOMPManager:
             # ==================== 非 USP 訊息 ====================
             content_type = headers.get('content-type', 'unknown')
             Logger.info(f"  ℹ Non-USP message, content-type: {content_type}", level=1)
-            Logger.info(f"  Body preview: {body[:200]}", level=2)
+
+            # 嘗試解析 USP Record 的連線類型訊息（例如 STOMP Connect）
+            parsed_record = False
+            try:
+                if body:
+                    rec = record_pb2.Record()
+                    rec.ParseFromString(body)
+
+                    if rec.from_id:
+                        sender = rec.from_id
+                        Logger.info(f"  Endpoint ID (from_id): {sender}", level=1)
+                        Logger.info(f"  Target (to_id): {rec.to_id}", level=2)
+
+                    if rec.HasField('stomp_connect'):
+                        parsed_record = True
+                        stomp = rec.stomp_connect
+                        Logger.info(f"  ✓ Parsed STOMP Connect record", level=0)
+                        Logger.info(f"    STOMP version: {stomp.version}", level=1)
+                        Logger.info(f"    Subscribed destination: {stomp.subscribed_destination}", level=1)
+
+                        # 優先使用 agent 宣告的 subscribed destination 當回覆地址
+                        if not reply_to and stomp.subscribed_destination:
+                            reply_to = stomp.subscribed_destination
+                            Logger.info(f"  ℹ Using STOMP Connect subscribed destination as reply_to: {reply_to}", level=0)
+
+                    elif rec.HasField('disconnect'):
+                        parsed_record = True
+                        disc = rec.disconnect
+                        Logger.info(f"  ✓ Parsed Disconnect record (reason_code={disc.reason_code})", level=1)
+
+                    elif rec.HasField('mqtt_connect') or rec.HasField('websocket_connect') or rec.HasField('uds_connect'):
+                        parsed_record = True
+                        Logger.info(f"  ✓ Parsed non-STOMP connect/disconnect record", level=1)
+            except Exception:
+                parsed_record = False
+
+            if not parsed_record:
+                Logger.info(f"  Body preview: {body[:200]}", level=2)
         
         # ==================== Step 5: 註冊/更新設備資訊 ====================
-        # 只有同時有 sender 和 reply_to 才能註冊設備
+        # 若缺少 reply-to-dest，嘗試從 endpoint ID 推導預設 queue
+        if sender and not reply_to:
+            try:
+                suffix = sender.split('::')[-1] if '::' in sender else sender
+                inferred_reply_to = f"/queue/usp.agent.{suffix}"
+                reply_to = inferred_reply_to
+                Logger.info(f"  ℹ reply-to-dest missing, inferred reply_to: {reply_to}", level=0)
+            except Exception as e:
+                Logger.critical(f"  ⚠ Failed to infer reply-to from sender '{sender}': {e}")
+
+        # 只要有 sender 且可取得 reply_to 就註冊設備
         if sender and reply_to:
             with self.lock:
                 is_new_device = sender not in self.devices
@@ -1291,19 +1370,18 @@ class STOMPManager:
         if resp.HasField('get_resp'):
             total_params = 0
             result_data = {}
-            Logger.data(f"  === GET Response Start ===")
+            request_paths = []
             for r in resp.get_resp.req_path_results:
-                status = '✓' if r.err_code == 0 else '✗'
-                Logger.data(f"  Path: {r.requested_path} ({status})")
+                request_paths.append(r.requested_path)
                 for res in r.resolved_path_results:
-                    Logger.data(f"    {res.resolved_path}")
                     for p, v in res.result_params.items():
-                        Logger.data(f"      {p} = {v}")
                         # Build full parameter path
                         full_param_path = res.resolved_path + p
                         result_data[full_param_path] = v
                         total_params += 1
-            Logger.data(f"  === Total: {total_params} parameters ===")
+
+            req_hint = (ipc_req or {}).get('path') or (request_paths[0] if request_paths else 'unknown')
+            Logger.info(f"[RESP] GET request='{req_hint}' from {sender}: {total_params} parameter(s)", level=0)
             
             # Cache parameter values for SET testing
             if sender and result_data:
@@ -1324,68 +1402,83 @@ class STOMPManager:
         elif resp.HasField('get_supported_dm_resp'):
             count = 0
             writable_params = {}  # Cache writable parameters
+            requested_objects = []
+            detail_lines = []
             
             for r in resp.get_supported_dm_resp.req_obj_results:
+                req_obj = getattr(r, 'req_obj_path', '') or getattr(r, 'requested_path', '')
+                if req_obj:
+                    requested_objects.append(req_obj)
                 for obj in r.supported_objs:
                     # Object info
                     obj_info = obj.supported_obj_path
-                    if obj.is_multi_instance:
-                        obj_info += " (multi-instance)"
-                    Logger.data(f"    {obj_info}")
                     count += 1
+                    detail_lines.append(f"OBJ  {obj_info}")
                     
                     # Parameters with access rights
                     for p in obj.supported_params:
                         access = msg_pb2.GetSupportedDMResp.ParamAccessType.Name(p.access)
-                        access_short = "RW" if access == "PARAM_READ_WRITE" else "R"
-                        Logger.data(f"      {p.param_name} [{access_short}]")
+                        value_type = msg_pb2.GetSupportedDMResp.ParamValueType.Name(p.value_type) if p.value_type else 'PARAM_UNKNOWN'
                         count += 1
+                        detail_lines.append(f"PAR  {obj.supported_obj_path}{p.param_name} [{access}] ({value_type})")
                         
                         # Cache writable parameters (READ_WRITE or WRITE_ONLY)
                         if access in ["PARAM_READ_WRITE", "PARAM_WRITE_ONLY"]:
                             full_param_path = obj.supported_obj_path + p.param_name
                             writable_params[full_param_path] = {
                                 'access': access,
-                                'type': msg_pb2.GetSupportedDMResp.ParamValueType.Name(p.value_type) if p.value_type else 'unknown'
+                                'type': value_type
                             }
                     
                     # Commands with type
                     for c in obj.supported_commands:
-                        cmd_type = msg_pb2.GetSupportedDMResp.CmdType.Name(c.command_type)
-                        cmd_short = "async" if cmd_type == "CMD_ASYNC" else "sync"
-                        Logger.data(f"      {c.command_name}() [{cmd_short}]")
                         count += 1
+                        try:
+                            command_type = msg_pb2.GetSupportedDMResp.CmdType.Name(c.command_type)
+                        except Exception:
+                            command_type = f"CMD_UNKNOWN({getattr(c, 'command_type', 'n/a')})"
+                        detail_lines.append(f"CMD  {obj.supported_obj_path}{c.command_name}() [{command_type}]")
                     
                     # Events
                     for e in obj.supported_events:
-                        Logger.data(f"      {e.event_name}! [event]")
                         count += 1
-            
-            Logger.data(f"  Total: {count} items")
+                        detail_lines.append(f"EVT  {obj.supported_obj_path}{e.event_name}!")
+
+            req_hint = (ipc_req or {}).get('path') or (requested_objects[0] if requested_objects else 'Device.')
+            Logger.info(f"[RESP] GET_SUPPORTED_DM request='{req_hint}' from {sender}: {count} item(s)", level=0)
             
             # Cache writable parameters for SET testing
             if sender and writable_params:
                 self.writable_params_cache[sender] = writable_params
                 Logger.info(f"[Cache] Stored {len(writable_params)} writable parameters for {sender}", level=1)
+
+            # Return result to IPC caller if waiting
+            if ipc_req and 'result_queue' in ipc_req:
+                if detail_lines:
+                    result_msg = "\n".join(detail_lines)
+                else:
+                    result_msg = f"No supported entries returned for {req_hint}"
+                ipc_req['result_queue'].put({
+                    "status": "ok",
+                    "msg": result_msg,
+                    "items_count": count,
+                    "writable_count": len(writable_params),
+                    "path": req_hint,
+                })
             
         elif resp.HasField('get_instances_resp'):
             total_instances = 0
             instance_paths = []
-            Logger.data(f"  === GET_INSTANCES Response Start ===")
+            request_paths = []
             for r in resp.get_instances_resp.req_path_results:
-                status = '✓' if r.err_code == 0 else '✗'
-                Logger.data(f"  Path: {r.requested_path} ({status})")
-                if r.err_code != 0:
-                    Logger.data(f"    Error: {r.err_msg}")
-                else:
+                request_paths.append(r.requested_path)
+                if r.err_code == 0:
                     for inst in r.curr_insts:
-                        Logger.data(f"    Instance: {inst.instantiated_obj_path}")
                         instance_paths.append(inst.instantiated_obj_path)
-                        if inst.unique_keys:
-                            for key, value in inst.unique_keys.items():
-                                Logger.data(f"      {key} = {value}")
                         total_instances += 1
-            Logger.data(f"  === Total: {total_instances} instances ===")
+
+            req_hint = (ipc_req or {}).get('path') or (request_paths[0] if request_paths else 'unknown')
+            Logger.info(f"[RESP] GET_INSTANCES request='{req_hint}' from {sender}: {total_instances} instance(s)", level=0)
             
             # Return result to IPC caller if waiting
             if ipc_req and 'result_queue' in ipc_req:
@@ -1706,25 +1799,47 @@ class IPCServer(threading.Thread):
                 if len(cmd_parts) >= 2:
                     endpoint = cmd_parts[1]
                     obj_path = cmd_parts[2] if len(cmd_parts) >= 3 else "Device."
+                    timeout = 30.0
                     
                     # Parse optional boolean arguments (default: first_level_only=False, others=True)
                     first_level_only = False
                     return_commands = True
                     return_events = True
                     return_params = True
+
+                    extra_args = cmd_parts[3:]
+                    if "--timeout" in extra_args:
+                        try:
+                            timeout_idx = extra_args.index("--timeout")
+                            if timeout_idx + 1 < len(extra_args):
+                                timeout = float(extra_args[timeout_idx + 1])
+                            extra_args = extra_args[:timeout_idx] + extra_args[timeout_idx + 2:]
+                        except (ValueError, IndexError):
+                            pass
                     
-                    if len(cmd_parts) >= 4:
-                        first_level_only = cmd_parts[3].lower() in ['true', '1', 'yes']
-                    if len(cmd_parts) >= 5:
-                        return_commands = cmd_parts[4].lower() in ['true', '1', 'yes']
-                    if len(cmd_parts) >= 6:
-                        return_events = cmd_parts[5].lower() in ['true', '1', 'yes']
-                    if len(cmd_parts) >= 7:
-                        return_params = cmd_parts[6].lower() in ['true', '1', 'yes']
+                    if len(extra_args) >= 1:
+                        first_level_only = extra_args[0].lower() in ['true', '1', 'yes']
+                    if len(extra_args) >= 2:
+                        return_commands = extra_args[1].lower() in ['true', '1', 'yes']
+                    if len(extra_args) >= 3:
+                        return_events = extra_args[2].lower() in ['true', '1', 'yes']
+                    if len(extra_args) >= 4:
+                        return_params = extra_args[3].lower() in ['true', '1', 'yes']
                     
-                    success = self._send_usp_get_supported_dm(endpoint, obj_path, first_level_only, 
-                                                             return_commands, return_events, return_params)
-                    response = {"status": "ok" if success else "failed", "msg": f"GetSupportedDM sent to {endpoint}"}
+                    result = self._send_usp_get_supported_dm(
+                        endpoint,
+                        obj_path,
+                        first_level_only,
+                        return_commands,
+                        return_events,
+                        return_params,
+                        wait_response=True,
+                        timeout=timeout
+                    )
+                    if result and isinstance(result, dict):
+                        response = result
+                    else:
+                        response = {"status": "failed", "msg": "GetSupportedDM request failed"}
                 else:
                     response = {"status": "error", "msg": "usage: get_supported <endpoint> [obj_path] [first_level_only] [return_commands] [return_events] [return_params]"}
             
@@ -1759,6 +1874,8 @@ class IPCServer(threading.Thread):
 
             elif cmd == "get_config":
                 # Returns current configuration and debug level (normalized schema)
+                mini_broker_from_config = CONFIG.get('mini_broker', {}) if isinstance(CONFIG, dict) else {}
+                ipc_from_config = CONFIG.get('ipc', {}) if isinstance(CONFIG, dict) else {}
                 response = {
                     "status": "ok",
                     "config": {
@@ -1770,19 +1887,35 @@ class IPCServer(threading.Thread):
                         "receive_topic": RECEIVE_TOPIC,
                         "debug_level": DEBUG_LEVEL,
                         "username": USERNAME,
+                        "password": "***" if PASSWORD else "",
                         "ipc_port": IPC_PORT,
+                        "ipc_host": IPC_HOST,
                         # GUI-preferred nested keys
                         "usp_controller": {
+                            "transport_protocol": "stomp",
                             "broker_host": BROKER_HOST,
                             "broker_port": BROKER_PORT,
                             "username": USERNAME,
+                            "password": "***" if PASSWORD else "",
                             "controller_endpoint_id": CONTROLLER_ENDPOINT_ID,
                             "receive_topic": RECEIVE_TOPIC,
+                            "reply_to_queue": REPLY_TO_QUEUE,
                             "devices_file": DEVICES_FILE,
+                            "debug_level": DEBUG_LEVEL,
+                            "enable_mdns_discovery": ENABLE_MDNS_DISCOVERY,
+                            "heartbeat_check_enabled": HEARTBEAT_CHECK_ENABLED,
+                            "heartbeat_check_interval": HEARTBEAT_CHECK_INTERVAL,
                         },
                         "ipc": {
-                            "host": IPC_HOST,
+                            "enabled": ipc_from_config.get('enabled', True),
+                            "host": ipc_from_config.get('host', IPC_HOST),
                             "port": IPC_PORT,
+                            "timeout": ipc_from_config.get('timeout', 30.0),
+                        },
+                        "mini_broker": {
+                            "enable": bool(mini_broker_from_config.get('enable', MINI_BROKER_ENABLED)),
+                            "host": mini_broker_from_config.get('host', '0.0.0.0'),
+                            "port": mini_broker_from_config.get('port', BROKER_PORT if MINI_BROKER_ENABLED else 61613),
                         }
                     }
                 }
@@ -2807,7 +2940,9 @@ class IPCServer(threading.Thread):
                 'command': 'get',
                 'path': path,
                 'result_queue': result_queue,
-                'timestamp': datetime.now()
+                'timestamp': datetime.now(),
+                'requested_timeout': timeout,
+                'near_timeout_notified': False
             }
             self.stomp.pending_requests[request_key] = msg_id
         
@@ -2822,26 +2957,47 @@ class IPCServer(threading.Thread):
         
         # Wait for response if requested
         if wait_response:
+            start_time = time.time()
+            warn_threshold = max(timeout * 0.8, 1.0)
             try:
-                result = result_queue.get(timeout=timeout)
-                # Clean up tracking
-                if request_key in self.stomp.pending_requests:
-                    del self.stomp.pending_requests[request_key]
-                return result
+                while True:
+                    elapsed = time.time() - start_time
+                    remaining = timeout - elapsed
+                    if remaining <= 0:
+                        raise queue.Empty()
+
+                    try:
+                        result = result_queue.get(timeout=min(0.5, remaining))
+                        if request_key in self.stomp.pending_requests:
+                            del self.stomp.pending_requests[request_key]
+                        return result
+                    except queue.Empty:
+                        pending = self.stomp.pending_ipc_requests.get(msg_id)
+                        if pending and not pending.get('near_timeout_notified') and elapsed >= warn_threshold:
+                            pending['near_timeout_notified'] = True
+                            suggested_timeout = max(int(timeout * 2), int(timeout + 30))
+                            Logger.info(
+                                f"[IPC] Request nearing timeout ({elapsed:.1f}/{timeout:.1f}s): "
+                                f"get {endpoint} {path}. Consider --timeout {suggested_timeout}",
+                                level=0
+                            )
+                        continue
             except queue.Empty:
                 # Timeout - clean up
                 if msg_id in self.stomp.pending_ipc_requests:
                     del self.stomp.pending_ipc_requests[msg_id]
                 if request_key in self.stomp.pending_requests:
                     del self.stomp.pending_requests[request_key]
+                suggested_timeout = max(int(timeout * 2), int(timeout + 30))
                 return {
                     "status": "timeout",
-                    "msg": f"Message sent to broker, but no agent response after {timeout}s",
+                    "msg": f"Message sent to broker, but no agent response after {timeout}s. Try --timeout {suggested_timeout}",
                     "sent_to_broker": True,
                     "no_agent_response": True,
                     "daemon_alive": True,
                     "endpoint": endpoint,
                     "path": path,
+                    "suggested_timeout": suggested_timeout,
                 }
         
         return True
@@ -2918,7 +3074,9 @@ class IPCServer(threading.Thread):
                 'command': 'set',
                 'path': path,
                 'result_queue': result_queue,
-                'timestamp': datetime.now()
+                'timestamp': datetime.now(),
+                'requested_timeout': timeout,
+                'near_timeout_notified': False
             }
             self.stomp.pending_requests[request_key] = msg_id
         
@@ -2933,26 +3091,47 @@ class IPCServer(threading.Thread):
         
         # Wait for response if requested
         if wait_response:
+            start_time = time.time()
+            warn_threshold = max(timeout * 0.8, 1.0)
             try:
-                result = result_queue.get(timeout=timeout)
-                # Clean up tracking
-                if request_key in self.stomp.pending_requests:
-                    del self.stomp.pending_requests[request_key]
-                return result
+                while True:
+                    elapsed = time.time() - start_time
+                    remaining = timeout - elapsed
+                    if remaining <= 0:
+                        raise queue.Empty()
+
+                    try:
+                        result = result_queue.get(timeout=min(0.5, remaining))
+                        if request_key in self.stomp.pending_requests:
+                            del self.stomp.pending_requests[request_key]
+                        return result
+                    except queue.Empty:
+                        pending = self.stomp.pending_ipc_requests.get(msg_id)
+                        if pending and not pending.get('near_timeout_notified') and elapsed >= warn_threshold:
+                            pending['near_timeout_notified'] = True
+                            suggested_timeout = max(int(timeout * 2), int(timeout + 30))
+                            Logger.info(
+                                f"[IPC] Request nearing timeout ({elapsed:.1f}/{timeout:.1f}s): "
+                                f"set {endpoint} {path}. Consider --timeout {suggested_timeout}",
+                                level=0
+                            )
+                        continue
             except queue.Empty:
                 # Timeout - clean up
                 if msg_id in self.stomp.pending_ipc_requests:
                     del self.stomp.pending_ipc_requests[msg_id]
                 if request_key in self.stomp.pending_requests:
                     del self.stomp.pending_requests[request_key]
+                suggested_timeout = max(int(timeout * 2), int(timeout + 30))
                 return {
                     "status": "timeout",
-                    "msg": f"Message sent to broker, but no agent response after {timeout}s",
+                    "msg": f"Message sent to broker, but no agent response after {timeout}s. Try --timeout {suggested_timeout}",
                     "sent_to_broker": True,
                     "no_agent_response": True,
                     "daemon_alive": True,
                     "endpoint": endpoint,
                     "path": path,
+                    "suggested_timeout": suggested_timeout,
                 }
         
         return True
@@ -2983,7 +3162,8 @@ class IPCServer(threading.Thread):
     
     def _send_usp_get_supported_dm(self, endpoint, obj_path="Device.", 
                                    first_level_only=False, return_commands=True, 
-                                   return_events=True, return_params=True):
+                                   return_events=True, return_params=True,
+                                   wait_response=False, timeout=30.0):
         """Helper to construct USP GetSupportedDM
         
         Args:
@@ -2993,7 +3173,44 @@ class IPCServer(threading.Thread):
             return_commands: Include commands in response (default: True)
             return_events: Include events in response (default: True)
             return_params: Include parameters in response (default: True)
+            wait_response: If True, wait for and return the response
+            timeout: Timeout in seconds when wait_response=True
         """
+        import queue
+        from datetime import datetime
+
+        def _supersede_pending_request(request_key):
+            existing_msg_id = self.stomp.pending_requests.get(request_key)
+            if not existing_msg_id:
+                return
+
+            previous = self.stomp.pending_ipc_requests.pop(existing_msg_id, None)
+            self.stomp.pending_requests.pop(request_key, None)
+
+            if previous:
+                previous_queue = previous.get('result_queue')
+                if previous_queue:
+                    try:
+                        previous_queue.put_nowait({
+                            "status": "superseded",
+                            "msg": "Request superseded by a newer duplicate request"
+                        })
+                    except Exception:
+                        pass
+                Logger.info(f"[IPC] Superseded pending request: {request_key}", level=1)
+
+        request_key = (
+            endpoint,
+            'get_supported',
+            obj_path,
+            first_level_only,
+            return_commands,
+            return_events,
+            return_params,
+        )
+        if wait_response and request_key in self.stomp.pending_requests:
+            _supersede_pending_request(request_key)
+
         msg_id = str(uuid.uuid4())
         usp_msg = msg_pb2.Msg()
         usp_msg.header.msg_id = msg_id
@@ -3004,8 +3221,73 @@ class IPCServer(threading.Thread):
         usp_msg.body.request.get_supported_dm.return_commands = return_commands
         usp_msg.body.request.get_supported_dm.return_events = return_events
         usp_msg.body.request.get_supported_dm.return_params = return_params
-        
-        return self._send_usp_message(endpoint, usp_msg)
+
+        result_queue = None
+        if wait_response:
+            result_queue = queue.Queue()
+            self.stomp.pending_ipc_requests[msg_id] = {
+                'endpoint': endpoint,
+                'command': 'get_supported',
+                'path': obj_path,
+                'result_queue': result_queue,
+                'timestamp': datetime.now(),
+                'requested_timeout': timeout,
+                'near_timeout_notified': False
+            }
+            self.stomp.pending_requests[request_key] = msg_id
+
+        success = self._send_usp_message(endpoint, usp_msg)
+        if not success:
+            if wait_response and msg_id in self.stomp.pending_ipc_requests:
+                del self.stomp.pending_ipc_requests[msg_id]
+                if request_key in self.stomp.pending_requests:
+                    del self.stomp.pending_requests[request_key]
+            return None if wait_response else False
+
+        if wait_response:
+            start_time = time.time()
+            warn_threshold = max(timeout * 0.8, 1.0)
+            try:
+                while True:
+                    elapsed = time.time() - start_time
+                    remaining = timeout - elapsed
+                    if remaining <= 0:
+                        raise queue.Empty()
+
+                    try:
+                        result = result_queue.get(timeout=min(0.5, remaining))
+                        if request_key in self.stomp.pending_requests:
+                            del self.stomp.pending_requests[request_key]
+                        return result
+                    except queue.Empty:
+                        pending = self.stomp.pending_ipc_requests.get(msg_id)
+                        if pending and not pending.get('near_timeout_notified') and elapsed >= warn_threshold:
+                            pending['near_timeout_notified'] = True
+                            suggested_timeout = max(int(timeout * 2), int(timeout + 30))
+                            Logger.info(
+                                f"[IPC] Request nearing timeout ({elapsed:.1f}/{timeout:.1f}s): "
+                                f"get_supported {endpoint} {obj_path}. Consider --timeout {suggested_timeout}",
+                                level=0
+                            )
+                        continue
+            except queue.Empty:
+                if msg_id in self.stomp.pending_ipc_requests:
+                    del self.stomp.pending_ipc_requests[msg_id]
+                if request_key in self.stomp.pending_requests:
+                    del self.stomp.pending_requests[request_key]
+                suggested_timeout = max(int(timeout * 2), int(timeout + 30))
+                return {
+                    "status": "timeout",
+                    "msg": f"Message sent to broker, but no agent response after {timeout}s. Try --timeout {suggested_timeout}",
+                    "sent_to_broker": True,
+                    "no_agent_response": True,
+                    "daemon_alive": True,
+                    "endpoint": endpoint,
+                    "path": obj_path,
+                    "suggested_timeout": suggested_timeout,
+                }
+
+        return True
     
     def _send_usp_get_instances(self, endpoint, obj_path, wait_response=False, timeout=30.0):
         """Helper to construct USP GetInstances"""
@@ -3054,7 +3336,9 @@ class IPCServer(threading.Thread):
                 'command': 'get_instances',
                 'path': obj_path,
                 'result_queue': result_queue,
-                'timestamp': datetime.now()
+                'timestamp': datetime.now(),
+                'requested_timeout': timeout,
+                'near_timeout_notified': False
             }
             self.stomp.pending_requests[request_key] = msg_id
         
@@ -3069,26 +3353,47 @@ class IPCServer(threading.Thread):
         
         # Wait for response if requested
         if wait_response:
+            start_time = time.time()
+            warn_threshold = max(timeout * 0.8, 1.0)
             try:
-                result = result_queue.get(timeout=timeout)
-                # Clean up tracking
-                if request_key in self.stomp.pending_requests:
-                    del self.stomp.pending_requests[request_key]
-                return result
+                while True:
+                    elapsed = time.time() - start_time
+                    remaining = timeout - elapsed
+                    if remaining <= 0:
+                        raise queue.Empty()
+
+                    try:
+                        result = result_queue.get(timeout=min(0.5, remaining))
+                        if request_key in self.stomp.pending_requests:
+                            del self.stomp.pending_requests[request_key]
+                        return result
+                    except queue.Empty:
+                        pending = self.stomp.pending_ipc_requests.get(msg_id)
+                        if pending and not pending.get('near_timeout_notified') and elapsed >= warn_threshold:
+                            pending['near_timeout_notified'] = True
+                            suggested_timeout = max(int(timeout * 2), int(timeout + 30))
+                            Logger.info(
+                                f"[IPC] Request nearing timeout ({elapsed:.1f}/{timeout:.1f}s): "
+                                f"get_instances {endpoint} {obj_path}. Consider --timeout {suggested_timeout}",
+                                level=0
+                            )
+                        continue
             except queue.Empty:
                 # Timeout - clean up
                 if msg_id in self.stomp.pending_ipc_requests:
                     del self.stomp.pending_ipc_requests[msg_id]
                 if request_key in self.stomp.pending_requests:
                     del self.stomp.pending_requests[request_key]
+                suggested_timeout = max(int(timeout * 2), int(timeout + 30))
                 return {
                     "status": "timeout",
-                    "msg": f"Message sent to broker, but no agent response after {timeout}s",
+                    "msg": f"Message sent to broker, but no agent response after {timeout}s. Try --timeout {suggested_timeout}",
                     "sent_to_broker": True,
                     "no_agent_response": True,
                     "daemon_alive": True,
                     "endpoint": endpoint,
                     "path": obj_path,
+                    "suggested_timeout": suggested_timeout,
                 }
         
         return True

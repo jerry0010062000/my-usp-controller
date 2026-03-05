@@ -9,6 +9,30 @@ import os
 import json
 from pathlib import Path
 
+def _create_config_from_example(config_file='config.json'):
+    """Create config file from example template on first run."""
+    target_path = Path(config_file)
+    base_dir = target_path.parent if str(target_path.parent) else Path('.')
+
+    candidates = [
+        base_dir / 'config.v3.example.json',
+        base_dir / 'config.example.json',
+    ]
+
+    for example_path in candidates:
+        if example_path.exists():
+            try:
+                with open(example_path, 'r', encoding='utf-8') as src, open(target_path, 'w', encoding='utf-8') as dst:
+                    dst.write(src.read())
+                print(f"[*] Created '{config_file}' from '{example_path.name}'")
+                return True
+            except Exception as e:
+                print(f"[!] Failed to create '{config_file}' from '{example_path.name}': {e}")
+                return False
+
+    print("[!] No example config found (expected config.v3.example.json or config.example.json)")
+    return False
+
 # Configuration management functions
 def load_config(config_file='config.json'):
     """Load configuration from JSON file"""
@@ -17,7 +41,14 @@ def load_config(config_file='config.json'):
             config = json.load(f)
         return config
     except FileNotFoundError:
-        print(f"[!] Config file '{config_file}' not found. Using defaults.")
+        print(f"[!] Config file '{config_file}' not found. Creating from example...")
+        if _create_config_from_example(config_file):
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"[!] Failed to load newly created config file: {e}")
+        print(f"[!] Falling back to in-memory defaults.")
         return None
     except json.JSONDecodeError as e:
         print(f"[!] Error parsing config file: {e}")
