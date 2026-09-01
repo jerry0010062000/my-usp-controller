@@ -1,5 +1,6 @@
 @echo off
 @chcp 65001 >nul
+title STOMP Message Broker (Port 61614)
 setlocal
 cd /d "%~dp0"
 set PYTHONIOENCODING=utf-8
@@ -15,14 +16,13 @@ if errorlevel 1 (
     exit /b 1
 )
 
-set PYW_EXE=
-if exist ".venv\Scripts\pythonw.exe" set PYW_EXE=.venv\Scripts\pythonw.exe
-if not exist ".venv\Scripts\pythonw.exe" if exist "venv\Scripts\pythonw.exe" set PYW_EXE=venv\Scripts\pythonw.exe
+echo [INFO] Starting Standalone STOMP Broker on port 61614 with %PY_EXE%...
+%PY_EXE% tools\embedded_broker.py --port 61614
+set EXIT_CODE=%ERRORLEVEL%
 
-if not "%PYW_EXE%"=="" (
-    start "" "%PYW_EXE%" usp_gui.py
-) else (
-    start "" "%PY_EXE%" usp_gui.py
+if %EXIT_CODE% neq 0 (
+    echo.
+    echo [ERROR] Broker exited with code %EXIT_CODE%
+    pause
 )
-
-exit /b 0
+exit /b %EXIT_CODE%

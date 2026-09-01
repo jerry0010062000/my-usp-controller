@@ -2,28 +2,44 @@
 # -*- coding: utf-8 -*-
 """
 CLI Interface Implementation
-跨平台命令行介面實現（Windows/Linux/macOS）
+Cross-platform interactive shell and one-shot execution interface for USP Controller.
 """
 
 import sys
+import os
+import atexit
 import platform
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Any
 from .base import InterfaceBase, InterfaceType, CommandContext, CommandResult
 from .formatter import OutputFormatter, ColoredFormatter, get_formatter, OutputFormat
 from .command_handler import CommandHandler
+from usp_version import FULL_VERSION
+
+# Try to setup readline / pyreadline for command history and navigation
+try:
+    if sys.platform == 'win32':
+        import pyreadline3 as readline
+    else:
+        import readline
+
+    histfile = os.path.join(os.path.expanduser("~"), ".usp_controller_history")
+    try:
+        readline.read_history_file(histfile)
+        readline.set_history_length(1000)
+    except FileNotFoundError:
+        pass
+    atexit.register(readline.write_history_file, histfile)
+    READLINE_AVAILABLE = True
+except Exception:
+    READLINE_AVAILABLE = False
 
 
 class CLIInterface(InterfaceBase):
     """
-    CLI 介面實現
-    
-    特性：
-    - 跨平台支援（Windows/Linux/macOS）
-    - 彩色輸出（自動檢測終端支援）
-    - 命令歷史
-    - 簡潔的輸入提示
+    Standard Interactive CLI & Command Runner
     """
-    
+
     def __init__(
         self,
         prompt: str = "usp> ",
@@ -31,168 +47,167 @@ class CLIInterface(InterfaceBase):
         command_handler: Optional[CommandHandler] = None
     ):
         super().__init__(InterfaceType.CLI)
-        
-        self._prompt = prompt
+        self._base_prompt = prompt
         self._running = False
         self._formatter = formatter or ColoredFormatter()
         self._command_handler = command_handler or CommandHandler()
-        
-        # 平台檢測
+
         self._platform = platform.system()
-        self._is_windows = self._platform == "Windows"
-        
-        # 嘗試啟用 Windows ANSI 支援
+        self._is_windows = (self._platform == "Windows")
+
         if self._is_windows:
             self._enable_windows_ansi()
-    
+
     def _enable_windows_ansi(self):
-        """啟用 Windows 10+ ANSI 顏色支援"""
+        """Enable Windows 10+ Virtual Terminal ANSI support"""
         try:
             import ctypes
             kernel32 = ctypes.windll.kernel32
-            # 啟用虛擬終端處理
             kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-        except:
-            pass  # 失敗則使用普通輸出
-    
+        except Exception:
+            pass
+
     def initialize(self) -> bool:
-        """初始化 CLI 介面"""
+        """Initialize CLI interface and banner"""
         try:
-            # 顯示歡迎訊息
             self._display_banner()
             return True
         except Exception as e:
             print(f"Failed to initialize CLI: {e}")
             return False
-    
+
+    def _get_dynamic_prompt(self) -> str:
+        """Get prompt with active target device context"""
+        ctrl = getattr(self._command_handler, '_controller', None)
+        if ctrl and hasattr(ctrl, 'device_manager'):
+            target = ctrl.device_manager.get_active_device()
+            if target:
+                short_target = target.split('::')[-1] if '::' in target else target
+                return f"usp [{short_target}]> "
+        return self._base_prompt
+
     def _display_banner(self):
-        """顯示歡迎橫幅"""
+        """Display welcome banner"""
+        ctrl = getattr(self._command_handler, '_controller', None)
+        conn_info = "Standalone"
+        if ctrl and hasattr(ctrl, 'config'):
+            conn_info = f"{ctrl.config.transport.protocol.upper()} @ {ctrl.config.transport.host}:{ctrl.config.transport.port}"
+
         banner = f"""
-{self._formatter.format_success("="*60)}
-  USP Controller - Interactive CLI
-  Platform: {self._platform}
-  Type 'help' for available commands, 'quit' to exit
-{self._formatter.format_success("="*60)}
+{self._formatter.format_success('=' * 65)}
+  USP Controller CLI v{FULL_VERSION}
+  Platform:  {self._platform}
+  Transport: {conn_info}
+  Type 'help' for commands, 'devices' for agents, 'quit' to exit
+{self._formatter.format_success('=' * 65)}
 """
         print(banner)
-    
+
     def run(self):
-        """啟動 CLI 主循環"""
+        """Start interactive CLI REPL"""
         self._running = True
-        
+
+        # Setup tab completion if readline is available
+        if READLINE_AVAILABLE:
+            try:
+                def completer(text, state):
+                    names = self._command_handler.get_command_names()
+                    matches = [c for c in names if c.startswith(text.lower())]
+                    return matches[state] if state < len(matches) else None
+
+                readline.set_completer(completer)
+                readline.parse_and_bind('tab: complete')
+            except Exception:
+                pass
+
         while self._running:
             try:
-                # 獲取使用者輸入
-                user_input = self.prompt_input(self._prompt)
-                
+                prompt_str = self._get_dynamic_prompt()
+                user_input = self.prompt_input(prompt_str)
+
                 if not user_input.strip():
                     continue
-                
-                # 解析命令
+
                 context = self._command_handler.parse_command(user_input)
-                
-                # 觸發回調
                 self._emit('on_command', context)
-                
-                # 執行命令
+
                 result = self._command_handler.execute(context)
-                
-                # 顯示結果
                 self.display_output(result)
-                
-                # 觸發回調
                 self._emit('on_result', result)
-                
-                # 檢查是否退出
+
                 if result.metadata.get('action') == 'quit':
                     self._running = False
-                
+
             except KeyboardInterrupt:
-                # Ctrl+C 處理
-                print(f"\n{self._formatter.format_info('Use quit or exit to leave')}")
+                print(f"\n{self._formatter.format_info('Press Ctrl+C again or type quit/exit to leave.')}")
                 continue
             except EOFError:
-                # Ctrl+D (Unix) 或 Ctrl+Z (Windows)
                 print("\n" + self._formatter.format_info("Goodbye!"))
                 break
             except Exception as e:
                 self.display_error(f"Unexpected error: {e}")
-    
+
+    def execute_single(self, cmd_line: str) -> CommandResult:
+        """Execute a single command string directly (for one-shot CLI mode)"""
+        context = self._command_handler.parse_command(cmd_line)
+        result = self._command_handler.execute(context)
+        self.display_output(result)
+        return result
+
     def shutdown(self):
-        """關閉 CLI 介面"""
+        """Shutdown CLI interface"""
         self._running = False
-        print(self._formatter.format_info("CLI shutdown complete"))
-    
+
     def display_output(self, result: CommandResult):
-        """顯示命令執行結果"""
+        """Display command result formatted"""
         if not result.success:
             self.display_error(result.error or "Command failed")
             return
-        
-        # 顯示訊息
+
         if result.message:
             print(result.message)
-        
-        # 顯示數據
+
         if result.data is not None:
-            formatted = self._formatter.format_result(result.data)
-            if formatted:  # Rich formatter 可能返回空字符串
-                print(formatted)
-    
+            # If report or special object, check format
+            from ..scripting import ScriptExecutionReport
+            if isinstance(result.data, ScriptExecutionReport):
+                pass  # Summary message already contains details
+            else:
+                formatted = self._formatter.format_result(result.data)
+                if formatted:
+                    print(formatted)
+
     def display_error(self, error: str):
-        """顯示錯誤訊息"""
+        """Display error message"""
         print(self._formatter.format_error(error))
-    
+
     def display_info(self, message: str):
-        """顯示一般訊息"""
+        """Display informational message"""
         print(self._formatter.format_info(message))
-    
+
     def prompt_input(self, prompt: str = "") -> str:
-        """獲取使用者輸入"""
-        try:
-            return input(prompt)
-        except EOFError:
-            raise
-        except KeyboardInterrupt:
-            raise
-    
+        """Prompt user for input"""
+        return input(prompt)
+
     def confirm_action(self, message: str) -> bool:
-        """請求使用者確認"""
+        """Prompt user for confirmation"""
         try:
-            response = input(f"{message} (y/n): ").strip().lower()
-            return response in ['y', 'yes']
+            res = input(f"{message} [y/N]: ").strip().lower()
+            return res in ('y', 'yes')
         except (EOFError, KeyboardInterrupt):
             return False
-    
-    def set_prompt(self, prompt: str):
-        """設置命令提示符"""
-        self._prompt = prompt
-    
-    def set_formatter(self, formatter: OutputFormatter):
-        """設置格式化器"""
-        self._formatter = formatter
 
 
-# 進階 CLI 實現（使用 prompt_toolkit）
+# Optional Enhanced CLI Interface (using prompt_toolkit)
 try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.completion import WordCompleter
     from prompt_toolkit.history import InMemoryHistory
     from prompt_toolkit.styles import Style
-    
+
     class EnhancedCLIInterface(CLIInterface):
-        """
-        增強型 CLI 介面
-        
-        需要安裝: pip install prompt_toolkit
-        
-        特性：
-        - 命令自動補全（Tab 鍵）
-        - 命令歷史（上下鍵）
-        - 語法高亮
-        - Ctrl+R 反向搜索
-        """
-        
+        """Enhanced CLI Interface with prompt_toolkit"""
+
         def __init__(
             self,
             prompt: str = "usp> ",
@@ -200,83 +215,54 @@ try:
             command_handler: Optional[CommandHandler] = None
         ):
             super().__init__(prompt, formatter, command_handler)
-            
-            # 創建 prompt_toolkit session
             self._history = InMemoryHistory()
             self._session = None
-            
-            # 樣式定義
             self._style = Style.from_dict({
-                'prompt': 'ansigreen bold',
+                'prompt': 'ansicyan bold',
             })
-        
+
         def initialize(self) -> bool:
-            """初始化增強 CLI"""
             if not super().initialize():
                 return False
-            
             try:
-                # 獲取命令列表用於自動補全
                 command_names = self._command_handler.get_command_names()
                 completer = WordCompleter(command_names, ignore_case=True)
-                
-                # 創建 session
                 self._session = PromptSession(
-                    message=self._prompt,
+                    message=self._get_dynamic_prompt,
                     completer=completer,
                     history=self._history,
                     style=self._style
                 )
-                
-                self.display_info("Enhanced CLI mode enabled (Tab for completion, ↑↓ for history)")
                 return True
-            
-            except Exception as e:
-                print(f"[!] Failed to initialize enhanced CLI: {e}")
-                print("[!] Falling back to basic CLI")
-                return True  # 降級到基本模式
-        
+            except Exception:
+                return True
+
         def prompt_input(self, prompt: str = "") -> str:
-            """獲取使用者輸入（增強版）"""
             if self._session:
                 try:
                     return self._session.prompt()
-                except:
-                    # 降級到基本輸入
+                except Exception:
                     return input(prompt)
-            else:
-                return input(prompt)
+            return input(prompt)
 
 except ImportError:
-    # prompt_toolkit 未安裝
     EnhancedCLIInterface = None
 
 
 def create_cli_interface(
-    enhanced: bool = True,
+    enhanced: bool = False,
     prompt: str = "usp> ",
-    output_format: OutputFormat = OutputFormat.COLORED
+    output_format: OutputFormat = OutputFormat.COLORED,
+    command_handler: Optional[CommandHandler] = None
 ) -> CLIInterface:
-    """
-    創建 CLI 介面實例
-    
-    參數:
-        enhanced: 是否使用增強模式（需要 prompt_toolkit）
-        prompt: 命令提示符
-        output_format: 輸出格式
-    
-    返回:
-        CLIInterface 實例
-    """
+    """Create CLI interface instance"""
     formatter = get_formatter(output_format)
-    command_handler = CommandHandler()
-    
-    # 嘗試創建增強版
+    handler = command_handler or CommandHandler()
+
     if enhanced and EnhancedCLIInterface is not None:
         try:
-            return EnhancedCLIInterface(prompt, formatter, command_handler)
-        except:
+            return EnhancedCLIInterface(prompt, formatter, handler)
+        except Exception:
             pass
-    
-    # 降級到基本版
-    return CLIInterface(prompt, formatter, command_handler)
+
+    return CLIInterface(prompt, formatter, handler)

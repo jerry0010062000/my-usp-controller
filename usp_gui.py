@@ -1,2260 +1,1603 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-USP Controller Windows UI (Tkinter)
-Connects to 'usp_controller.py --daemon' via IPC (port 6001)
+TR-369 USP Controller - Professional GUI Control Deck & Server/Port Monitor
+Engineered with WindowsACS-inspired split-panel layout, parameter explorer,
+quick action cards, CDRouter script runner, and live STOMP/USP protocol monitor.
 """
 
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
-import socket
-import json
-import threading
-import time
-import queue
-import os
 import sys
-from datetime import datetime
+import os
+import json
+import time
+import socket
+import threading
+import subprocess
 from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog, scrolledtext
 
-# Add tools directory to path for embedded broker
-sys.path.insert(0, str(Path(__file__).parent / "tools"))
-try:
-    from embedded_broker import EmbeddedBroker
-    BROKER_AVAILABLE = True
-except ImportError:
-    BROKER_AVAILABLE = False
-    print("Warning: Embedded broker not available")
+# Add project root to sys.path
+sys.path.insert(0, str(Path(__file__).parent))
 
-# Hide console window on Windows
-if sys.platform == 'win32':
-    import ctypes
-    ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
+from usp_controller.ipc import IPCClient, check_port_listening
 
-IPC_HOST = '127.0.0.1'
-IPC_PORT = 6001
-HISTORY_FILE = 'command_history.json'
-MAX_HISTORY = 50
 
-class IPCClient:
-    def __init__(self, host=IPC_HOST, port=IPC_PORT):
-        self.host = host
-        self.port = port
-    
-    def send_command(self, cmd):
-        """Send command string and return JSON response. Blocking call."""
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(30.0)  # Extended timeout for GET/GetInstances (30s)
-                s.connect((self.host, self.port))
-                s.sendall(cmd.encode('utf-8'))
-                
-                # Receive data in chunks until complete
-                data_chunks = []
-                while True:
-                    chunk = s.recv(65536)  # 64KB chunks
-                    if not chunk:
-                        break
-                    data_chunks.append(chunk)
-                    # Check if we got complete JSON (ends with })
-                    if chunk.endswith(b'}'):
-                        break
-                
-                if not data_chunks:
-                    return None
-                    
-                data = b''.join(data_chunks).decode('utf-8')
-                return json.loads(data)
-        except socket.timeout:
-            return {"status": "error", "msg": "Connection timeout (30s) - daemon may be busy"}
-        except ConnectionRefusedError:
-            return None
-        except ConnectionResetError:
-            return {"status": "error", "msg": "Connection reset by daemon"}
-        except json.JSONDecodeError as e:
-            return {"status": "error", "msg": f"Invalid response from daemon: {e}"}
-        except Exception as e:
-            return {"status": "error", "msg": str(e)}
+class USPGuiApp:
+    """
+    TR-369 USP Controller GUI Application
+    Modeled after the WindowsACS layout:
+    - Top Dark Header Bar with live Daemon/Broker status and connection controls
+    - Sub-header with Port status, Broker IP/Port, and quick network utilities
+    - Main Paned Split Window:
+        - Left Panel: Agent Devices Explorer with search/filter and status indicators
+        - Right Panel: Selected Device Summary + Tabbed Workspace:
+            1. Parameter Explorer (Get/Set/Add/Delete/DM/Instances Treeview)
+            2. Quick Actions & Direct Command Deck
+            3. CDRouter Test Script Runner
+            4. Server & Port Monitor Dashboard
+            5. Live Protocol & Packet Logs
+    """
 
-class USPControllerGUI:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("USP Controller GUI V2.0 + Embedded Broker")
-        self.root.geometry("1000x750")
-        
-        self.ipc = IPCClient()
+        self.root.title("TR-369 USP Controller 管理主控台")
+        self.root.geometry("1240x820")
+        self.root.minsize(1020, 680)
+
+        # IPC Client & State
+        self.ipc_url_var = tk.StringVar(value="127.0.0.1:6001")
+        self.ipc_client = IPCClient(host="127.0.0.1", port=6001, timeout=5.0)
+
+        self.internal_broker = None
+        self.selected_device_id: Optional[str] = None
+        self.active_device_id: Optional[str] = None
+        self.cached_devices = []
+        self.cached_params: Dict[str, Dict[str, Any]] = {}
         self.last_log_id = -1
-        self.selected_device = None
-        self.polling = True
-        
-        # Queues for thread processing
-        self.log_queue = queue.Queue()
-        self.status_queue = queue.Queue()
-        
-        # Command history
-        self.command_history = self._load_history()
-        
-        # Load mini-broker config
-        self.mini_broker_enabled = False
-        self.mini_broker_host = "0.0.0.0"
-        self.mini_broker_port = 61613
-        self._load_mini_broker_config()
-        
-        # Embedded Broker
-        self.embedded_broker = None
-        self.broker_running = False
-        
-        # Bind cleanup on close
-        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
-        
-        self._setup_ui()
-        
-        # Start background polling thread
-        self.poll_thread = threading.Thread(target=self._background_poller, daemon=True)
+        self.auto_refresh_logs = tk.BooleanVar(value=True)
+        self.polling_running = True
+        self.command_history = []
+        self.history_index = -1
+
+        # Configuration Management Variables
+        self.cfg_broker_host_var = tk.StringVar(value="127.0.0.1")
+        self.cfg_broker_port_var = tk.StringVar(value="61614")
+        self.cfg_broker_user_var = tk.StringVar(value="guest")
+        self.cfg_broker_pass_var = tk.StringVar(value="guest")
+        self.cfg_controller_id_var = tk.StringVar(value="proto::controller.default")
+        self.cfg_rx_topic_var = tk.StringVar(value="/queue/usp.controller.default")
+        self.cfg_ipc_port_var = tk.StringVar(value="6001")
+        self.cfg_debug_level_var = tk.StringVar(value="1 - 雙向 Payload (標準)")
+        self.cfg_auto_register_var = tk.BooleanVar(value=True)
+        self.cfg_mdns_var = tk.BooleanVar(value=True)
+        self._load_config_to_vars()
+
+        self._setup_styles()
+        self._build_ui()
+
+
+        # Clean shutdown handler
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close_window)
+
+        # Start periodic polling
+        self.poll_thread = threading.Thread(target=self._periodic_daemon_polling, daemon=True)
         self.poll_thread.start()
-        
-        # Start checking queues in main thread
-        self.root.after(100, self._process_queues)
-        
-        # Check and warn if mini-broker is enabled but not running
-        if BROKER_AVAILABLE and self.mini_broker_enabled and not self.broker_running:
-            self.root.after(1000, self._show_broker_warning)
 
-    def _setup_ui(self):
-        # Configure grid weight
-        self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(2, weight=1)  # Changed from 1 to 2
-        
-        # --- Top Bar: Connection Status ---
-        top_frame = ttk.Frame(self.root, padding="5")
-        top_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
-        
-        self.lbl_status = ttk.Label(top_frame, text="Checking daemon...", font=("Segoe UI", 10, "bold"))
-        self.lbl_status.pack(side="left")
-        
-        btn_reconnect = ttk.Button(top_frame, text="Force Refresh", command=self._force_refresh)
-        btn_reconnect.pack(side="right")
-        
-        # --- Broker Control Bar (NEW) ---
-        if BROKER_AVAILABLE:
-            broker_frame = ttk.LabelFrame(self.root, text="🔧 Embedded Broker (Development)", padding="5")
-            broker_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=(0, 5))
-            
-            # Broker status
-            self.lbl_broker_status = ttk.Label(broker_frame, text="⚪ Stopped", font=("Segoe UI", 9))
-            self.lbl_broker_status.pack(side="left", padx=(0, 10))
-            
-            # Broker port info
-            broker_info_text = f"Port: {self.mini_broker_port}"
-            if self.mini_broker_enabled:
-                broker_info_text += " (Mini-Broker)"
-            self.lbl_broker_info = ttk.Label(broker_frame, text=broker_info_text, font=("Segoe UI", 9))
-            self.lbl_broker_info.pack(side="left", padx=(0, 10))
-            
-            # Control buttons
-            self.btn_broker_start = ttk.Button(broker_frame, text="▶ Start Broker", command=self._start_broker)
-            self.btn_broker_start.pack(side="left", padx=2)
-            
-            self.btn_broker_stop = ttk.Button(broker_frame, text="⏹ Stop Broker", command=self._stop_broker, state="disabled")
-            self.btn_broker_stop.pack(side="left", padx=2)
-            
-            # Warning label
-            ttk.Label(broker_frame, text="⚠ For development only", 
-                     font=("Segoe UI", 8), foreground="orange").pack(side="right", padx=5)
-        
-        # --- Left Panel: Devices ---
-        left_panel = ttk.LabelFrame(self.root, text="Devices", padding="5")
-        left_panel.grid(row=2, column=0, sticky="ns", padx=5, pady=5)  # Changed row from 1 to 2
-        
-        # Device list with status indicators
-        tree_frame = ttk.Frame(left_panel)
-        tree_frame.pack(fill="both", expand=True)
-        
-        self.tree_devices = ttk.Treeview(tree_frame, columns=("Status",), show="tree", height=15)
-        self.tree_devices.column("#0", width=200)
-        self.tree_devices.column("Status", width=60, anchor="center")
-        self.tree_devices.heading("#0", text="Endpoint ID")
-        self.tree_devices.heading("Status", text="Status")
-        
-        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree_devices.yview)
-        self.tree_devices.configure(yscrollcommand=scrollbar.set)
-        
-        self.tree_devices.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        self.tree_devices.bind('<<TreeviewSelect>>', self._on_device_select)
-        
-        # Device control buttons
-        dev_btn_frame = ttk.Frame(left_panel)
-        dev_btn_frame.pack(fill="x", pady=2)
-        
-        ttk.Button(dev_btn_frame, text="Refresh", command=self._refresh_devices).pack(side="left", fill="x", expand=True, padx=(0, 2))
-        ttk.Button(dev_btn_frame, text="Delete", command=self._delete_device).pack(side="left", fill="x", expand=True, padx=(2, 0))
+    def _setup_styles(self):
+        self.style = ttk.Style()
+        try:
+            self.style.theme_use("clam")
+        except Exception:
+            pass
 
-        # --- Right Panel: Controls & Logs ---
-        right_panel = ttk.Frame(self.root, padding="5")
-        right_panel.grid(row=2, column=1, sticky="nsew", padx=5, pady=5)  # Changed row from 1 to 2
-        right_panel.rowconfigure(0, weight=1)
-        right_panel.columnconfigure(0, weight=1)
+        # WindowsACS Signature Palette
+        bg_dark = "#0f172a"      # Navy / Dark Slate Header
+        accent_cyan = "#38bdf8"  # Title Cyan
+        accent_blue = "#0284c7"  # Primary Action Blue
+        text_muted = "#94a3b8"   # Subtitle Muted
 
-        # Tabs
-        self.tabs = ttk.Notebook(right_panel)
-        self.tabs.grid(row=0, column=0, sticky="nsew")
+        self.root.configure(bg="#f1f5f9")
+        self.style.configure(".", font=("Segoe UI", 9))
 
-        # Tab 1: Operations
-        tab_ops = ttk.Frame(self.tabs, padding=5)
-        self.tabs.add(tab_ops, text="Operations")
-        
-        # Grid for Tab 1
-        tab_ops.columnconfigure(0, weight=3)
-        tab_ops.columnconfigure(1, weight=1)
-        tab_ops.rowconfigure(1, weight=1)
+        # Header Styles
+        self.style.configure("Header.TFrame", background=bg_dark)
+        self.style.configure("HeaderTitle.TLabel", background=bg_dark, foreground=accent_cyan, font=("Segoe UI", 13, "bold"))
+        self.style.configure("HeaderStatus.TLabel", background=bg_dark, foreground=text_muted, font=("Segoe UI", 9))
+        self.style.configure("HeaderBadge.TLabel", background="#1e293b", foreground="#38bdf8", font=("Consolas", 9, "bold"), padding=[6, 2])
 
-        # 1. Command Controls (Left side)
-        cmd_frame = ttk.LabelFrame(tab_ops, text="Command Center", padding="10")
-        cmd_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10), padx=(0, 5))
-        
-        # Row 1: Endpoint
-        ttk.Label(cmd_frame, text="Target Endpoint:").grid(row=0, column=0, sticky="w")
-        ep_row = ttk.Frame(cmd_frame)
-        ep_row.grid(row=0, column=1, columnspan=2, sticky="ew", pady=2)
-        self.cb_endpoint = ttk.Combobox(ep_row, width=37, state="readonly")
-        self.cb_endpoint.pack(side="left", fill="x", expand=True)
-        ttk.Button(ep_row, text="↻", width=3, command=self._refresh_devices).pack(side="left", padx=(2, 0))
-        
-        # Row 2: Operation
-        ttk.Label(cmd_frame, text="Action:").grid(row=1, column=0, sticky="w")
-        self.cb_action = ttk.Combobox(cmd_frame, values=["GET", "SET", "ADD", "DELETE", "OPERATE", "GetSupportedDM", "GetInstances"], state="readonly", width=15)
-        self.cb_action.current(0)
-        self.cb_action.grid(row=1, column=1, sticky="w", pady=2)
-        self.cb_action.bind("<<ComboboxSelected>>", self._on_action_change)
-        
-        # Row 3: Path
-        ttk.Label(cmd_frame, text="Path / Obj:").grid(row=2, column=0, sticky="w")
-        self.ent_path = ttk.Entry(cmd_frame, width=50)
-        self.ent_path.grid(row=2, column=1, columnspan=2, sticky="ew", pady=2)
-        self.ent_path.bind("<Return>", lambda e: self._send_command())
-        
-        # Row 4: Value (Dynamic)
-        self.lbl_value = ttk.Label(cmd_frame, text="Value:")
-        self.lbl_value.grid(row=3, column=0, sticky="w")
-        self.ent_value = ttk.Entry(cmd_frame)
-        self.ent_value.grid(row=3, column=1, columnspan=2, sticky="ew", pady=2)
-        self.ent_value.bind("<Return>", lambda e: self._send_command())
-        
-        # Row 5: Send Button
-        self.btn_send = ttk.Button(cmd_frame, text="Execute Command", command=self._send_command)
-        self.btn_send.grid(row=4, column=1, sticky="e", pady=5)
-        
-        # 1.5. Command History (Right side)
-        history_frame = ttk.LabelFrame(tab_ops, text="Command History", padding="5")
-        history_frame.grid(row=0, column=1, rowspan=1, sticky="nsew", pady=(0, 10))
-        
-        # History list
-        hist_scroll_frame = ttk.Frame(history_frame)
-        hist_scroll_frame.pack(fill="both", expand=True)
-        
-        hist_scrollbar = ttk.Scrollbar(hist_scroll_frame, orient="vertical")
-        self.lst_history = tk.Listbox(hist_scroll_frame, yscrollcommand=hist_scrollbar.set, font=("Consolas", 8))
-        hist_scrollbar.config(command=self.lst_history.yview)
-        
-        self.lst_history.pack(side="left", fill="both", expand=True)
-        hist_scrollbar.pack(side="right", fill="y")
-        
-        # Bind events
-        self.lst_history.bind('<Double-Button-1>', self._history_double_click)
-        self.lst_history.bind('<Button-3>', self._history_right_click)
-        
-        # History controls
-        hist_btn_frame = ttk.Frame(history_frame)
-        hist_btn_frame.pack(fill="x", pady=(5, 0))
-        
-        ttk.Button(hist_btn_frame, text="Load", command=self._history_load, width=7).pack(side="left", padx=2)
-        ttk.Button(hist_btn_frame, text="Execute", command=self._history_execute, width=7).pack(side="left", padx=2)
-        ttk.Button(hist_btn_frame, text="Delete", command=self._history_delete_selected, width=7).pack(side="left", padx=2)
-        ttk.Button(hist_btn_frame, text="Clear", command=self._history_clear, width=7).pack(side="left", padx=2)
-        
-        # Load history into listbox
-        self._refresh_history_list()
-        
-        # 2. Log Area (Inside Tab 1)
-        log_frame = ttk.LabelFrame(tab_ops, text="Controller Logs & Responses", padding="5")
-        log_frame.grid(row=1, column=0, columnspan=2, sticky="nsew")
-        
-        # Log Controls (at top of log frame)
-        log_ctrl_frame = ttk.Frame(log_frame)
-        log_ctrl_frame.pack(fill="x", side="top", pady=(0, 5))
-        
-        self.var_autoscroll = tk.BooleanVar(value=True)
-        ttk.Checkbutton(log_ctrl_frame, text="Auto-scroll", variable=self.var_autoscroll).pack(side="left")
-        ttk.Button(log_ctrl_frame, text="Clear Logs", command=self._clear_logs).pack(side="left", padx=5)
-        
-        # Text widget
-        self.txt_log = scrolledtext.ScrolledText(log_frame, state='disabled', font=("Consolas", 9))
-        self.txt_log.pack(fill="both", expand=True, side="bottom")
-        self._add_text_context_menu(self.txt_log)
+        # Treeview Styles
+        self.style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"), background="#e2e8f0", foreground="#0f172a")
+        self.style.configure("Treeview", rowheight=26, background="#ffffff", fieldbackground="#ffffff")
+        self.style.map("Treeview", background=[("selected", "#e0f2fe")], foreground=[("selected", "#0369a1")])
+
+        # Button Styles
+        self.style.configure("Action.TButton", font=("Segoe UI", 9, "bold"), padding=[10, 5])
+        self.style.configure("Primary.TButton", background=accent_blue, foreground="white", font=("Segoe UI", 9, "bold"), padding=[12, 6])
+        self.style.map("Primary.TButton", background=[("active", "#0369a1"), ("pressed", "#075985")])
+
+        self.style.configure("Launch.TButton", background="#059669", foreground="white", font=("Segoe UI", 9, "bold"), padding=[10, 5])
+        self.style.map("Launch.TButton", background=[("active", "#047857"), ("pressed", "#065f46")])
+
+        self.style.configure("Danger.TButton", background="#dc2626", foreground="white", font=("Segoe UI", 9, "bold"), padding=[10, 5])
+        self.style.map("Danger.TButton", background=[("active", "#b91c1c"), ("pressed", "#991b1b")])
 
 
-        # Tab 2: Settings & Debug
-        tab_settings = ttk.Frame(self.tabs, padding=20)
-        self.tabs.add(tab_settings, text="Settings & Debug")
-        
-        # Tab 3: mDNS Debug
-        tab_mdns = ttk.Frame(self.tabs, padding=10)
-        self.tabs.add(tab_mdns, text="mDNS Debug")
-        
-        # Tab 4: Test Scripts
-        tab_scripts = ttk.Frame(self.tabs, padding=10)
-        self.tabs.add(tab_scripts, text="Test Scripts")
-        
-        # Test Scripts Tab Layout
-        tab_scripts.columnconfigure(0, weight=1)
-        tab_scripts.rowconfigure(1, weight=1)
-        
-        # Script Controls
-        script_ctrl_frame = ttk.LabelFrame(tab_scripts, text="Test Script Runner", padding=10)
-        script_ctrl_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        
-        # Script selection
-        script_select_frame = ttk.Frame(script_ctrl_frame)
-        script_select_frame.pack(fill="x", pady=(0, 5))
-        
-        ttk.Label(script_select_frame, text="Select Script:").pack(side="left", padx=(0, 5))
-        self.cb_script = ttk.Combobox(script_select_frame, state="readonly", width=40)
-        self.cb_script.pack(side="left", padx=(0, 5))
-        ttk.Button(script_select_frame, text="🔄 Refresh", command=self._refresh_script_list).pack(side="left")
-        
-        # Target endpoint selection
-        endpoint_select_frame = ttk.Frame(script_ctrl_frame)
-        endpoint_select_frame.pack(fill="x", pady=(0, 10))
-        
-        ttk.Label(endpoint_select_frame, text="Target Device:").pack(side="left", padx=(0, 5))
-        self.cb_script_endpoint = ttk.Combobox(endpoint_select_frame, state="readonly", width=40)
-        self.cb_script_endpoint.pack(side="left", padx=(0, 5))
-        ttk.Button(endpoint_select_frame, text="🔄 Refresh", command=self._refresh_devices).pack(side="left")
-        
-        # Script controls
-        script_btn_frame = ttk.Frame(script_ctrl_frame)
-        script_btn_frame.pack(fill="x", pady=(0, 10))
-        
-        self.btn_run_script = ttk.Button(script_btn_frame, text="▶ Run Script", command=self._run_script, width=15)
-        self.btn_run_script.pack(side="left", padx=2)
-        
-        self.btn_stop_script = ttk.Button(script_btn_frame, text="■ Stop", command=self._stop_script, width=15, state='disabled')
-        self.btn_stop_script.pack(side="left", padx=2)
-        
-        ttk.Button(script_btn_frame, text="📂 Open Folder", command=self._open_script_folder, width=15).pack(side="left", padx=2)
-        ttk.Button(script_btn_frame, text="🗑 Clear Log", command=self._clear_script_log, width=15).pack(side="left", padx=2)
-        
-        # Progress bar
-        self.script_progress = ttk.Progressbar(script_ctrl_frame, mode='indeterminate')
-        self.script_progress.pack(fill="x", pady=(0, 5))
-        
-        # Status label
-        self.lbl_script_status = ttk.Label(script_ctrl_frame, text="Ready", font=("Segoe UI", 9))
-        self.lbl_script_status.pack(anchor="w")
-        
-        # Script output log
-        log_frame = ttk.LabelFrame(tab_scripts, text="Script Output", padding=5)
-        log_frame.grid(row=1, column=0, sticky="nsew")
-        
-        self.txt_script_log = scrolledtext.ScrolledText(log_frame, state='disabled', font=("Consolas", 9), height=20)
-        self.txt_script_log.pack(fill="both", expand=True)
-        self._add_text_context_menu(self.txt_script_log)
-        
-        # Configure log tags
-        self.txt_script_log.tag_config('success', foreground='green')
-        self.txt_script_log.tag_config('error', foreground='red', font=("Consolas", 9, "bold"))
-        self.txt_script_log.tag_config('command', foreground='blue')
-        self.txt_script_log.tag_config('comment', foreground='gray')
-        self.txt_script_log.tag_config('info', foreground='black')
-        
-        # Script runner state
-        self.script_running = False
-        self.script_thread = None
-        self.script_variables = {}  # Store variables for substitution
-        
-        # mDNS Debug Tab Layout
-        tab_mdns.columnconfigure(0, weight=1)
-        tab_mdns.rowconfigure(2, weight=1)
-        
-        # Status and Controls
-        mdns_ctrl_frame = ttk.LabelFrame(tab_mdns, text="mDNS Discovery Control", padding=10)
-        mdns_ctrl_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        
-        self.lbl_mdns_status_debug = ttk.Label(mdns_ctrl_frame, text="Status: Checking...", font=("Segoe UI", 10, "bold"))
-        self.lbl_mdns_status_debug.pack(anchor="w", pady=(0, 10))
-        
-        mdns_debug_btn_frame = ttk.Frame(mdns_ctrl_frame)
-        mdns_debug_btn_frame.pack(fill="x")
-        
-        self.btn_mdns_start_debug = ttk.Button(mdns_debug_btn_frame, text="▶ Start Listener", command=self._mdns_start, width=15)
-        self.btn_mdns_start_debug.pack(side="left", padx=2)
-        
-        self.btn_mdns_stop_debug = ttk.Button(mdns_debug_btn_frame, text="■ Stop Listener", command=self._mdns_stop, width=15)
-        self.btn_mdns_stop_debug.pack(side="left", padx=2)
-        
-        self.btn_mdns_scan_debug = ttk.Button(mdns_debug_btn_frame, text="🔍 Scan Now", command=self._mdns_scan_debug, width=15)
-        self.btn_mdns_scan_debug.pack(side="left", padx=2)
-        
-        self.btn_mdns_refresh_debug = ttk.Button(mdns_debug_btn_frame, text="🔄 Refresh Status", command=self._mdns_refresh_debug, width=15)
-        self.btn_mdns_refresh_debug.pack(side="left", padx=2)
-        
-        ttk.Button(mdns_debug_btn_frame, text="🗑 Clear Logs", command=self._mdns_clear_logs, width=15).pack(side="left", padx=2)
-        
-        # Discovered Services Table
-        services_frame = ttk.LabelFrame(tab_mdns, text="Discovered Services", padding=5)
-        services_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        
-        # Treeview for services
-        services_tree_frame = ttk.Frame(services_frame)
-        services_tree_frame.pack(fill="both", expand=True)
-        
-        self.tree_mdns_services = ttk.Treeview(services_tree_frame, 
-                                                columns=("Address", "Port", "Path", "Status"), 
-                                                show="tree headings", height=6)
-        self.tree_mdns_services.column("#0", width=250)
-        self.tree_mdns_services.column("Address", width=120, anchor="center")
-        self.tree_mdns_services.column("Port", width=60, anchor="center")
-        self.tree_mdns_services.column("Path", width=80, anchor="center")
-        self.tree_mdns_services.column("Status", width=80, anchor="center")
-        
-        self.tree_mdns_services.heading("#0", text="Endpoint ID")
-        self.tree_mdns_services.heading("Address", text="Address")
-        self.tree_mdns_services.heading("Port", text="Port")
-        self.tree_mdns_services.heading("Path", text="Path")
-        self.tree_mdns_services.heading("Status", text="Status")
-        
-        services_scrollbar = ttk.Scrollbar(services_tree_frame, orient="vertical", command=self.tree_mdns_services.yview)
-        self.tree_mdns_services.configure(yscrollcommand=services_scrollbar.set)
-        
-        self.tree_mdns_services.pack(side="left", fill="both", expand=True)
-        services_scrollbar.pack(side="right", fill="y")
-        
-        # Bind selection to show details
-        self.tree_mdns_services.bind('<<TreeviewSelect>>', self._mdns_service_selected)
-        
-        # Discovery Logs
-        logs_frame = ttk.LabelFrame(tab_mdns, text="Discovery Logs & Events", padding=5)
-        logs_frame.grid(row=2, column=0, sticky="nsew")
-        
-        # Log controls
-        log_ctrl = ttk.Frame(logs_frame)
-        log_ctrl.pack(fill="x", pady=(0, 5))
-        
-        self.var_mdns_autoscroll = tk.BooleanVar(value=True)
-        ttk.Checkbutton(log_ctrl, text="Auto-scroll", variable=self.var_mdns_autoscroll).pack(side="left")
-        
-        ttk.Label(log_ctrl, text="Filter:").pack(side="left", padx=(20, 5))
-        self.cb_mdns_filter = ttk.Combobox(log_ctrl, values=["All", "Discovered", "Updated", "Removed", "Errors"], 
-                                           state="readonly", width=12)
-        self.cb_mdns_filter.current(0)
-        self.cb_mdns_filter.pack(side="left")
-        
-        # Log text widget
-        self.txt_mdns_log = scrolledtext.ScrolledText(logs_frame, state='disabled', font=("Consolas", 9), height=12)
-        self.txt_mdns_log.pack(fill="both", expand=True)
-        self._add_text_context_menu(self.txt_mdns_log)
-        
-        # Configure log tags
-        self.txt_mdns_log.tag_config('discovered', foreground='green')
-        self.txt_mdns_log.tag_config('updated', foreground='blue')
-        self.txt_mdns_log.tag_config('removed', foreground='red')
-        self.txt_mdns_log.tag_config('error', foreground='red', font=("Consolas", 9, "bold"))
-        self.txt_mdns_log.tag_config('info', foreground='black')
-        self.txt_mdns_log.tag_config('timestamp', foreground='gray')
-        
-        # Make tab_settings scrollable
-        canvas = tk.Canvas(tab_settings)
-        scrollbar_settings = ttk.Scrollbar(tab_settings, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    def _build_ui(self):
+        # 1. Top Header Bar (WindowsACS Header style)
+        self._build_top_header()
+
+        # 1.5 Sub-header: Network, Broker & Port Monitor Bar
+        self._build_network_sub_bar()
+
+        # 2. Main Paned Window Layout (Left: Device Explorer, Right: Notebook Workspace)
+        self.main_paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self.main_paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=(6, 10))
+
+        # Left Panel: Device Explorer
+        self._build_device_panel()
+
+        # Right Panel: Main Workspace Notebook
+        self._build_notebook_panel()
+
+        # Bottom Status Bar
+        self.status_bar = tk.Label(
+            self.root,
+            text="系統就緒。正在連接 USP Controller 後台守護進程 (127.0.0.1:6001)...",
+            bg="#e2e8f0",
+            fg="#475569",
+            anchor="w",
+            font=("Segoe UI", 9),
+            padx=12,
+            pady=4
         )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar_settings.set)
-        
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar_settings.pack(side="right", fill="y")
-        
-        # Config Editor (Editable)
-        conf_frame = ttk.LabelFrame(scrollable_frame, text="Configuration Editor", padding=10)
-        conf_frame.pack(fill="x", pady=10)
-        
-        # Subscription Status (Read-only, above config editor)
-        sub_frame = ttk.LabelFrame(scrollable_frame, text="Active STOMP Subscriptions", padding=10)
-        sub_frame.pack(fill="x", pady=(0, 10))
-        
-        sub_info = ttk.Frame(sub_frame)
-        sub_info.pack(fill="x")
-        
-        ttk.Label(sub_info, text="Subscribed Queues:", font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        self.lbl_subscriptions = ttk.Label(sub_info, text="Loading...", font=("Consolas", 9), foreground="blue")
-        self.lbl_subscriptions.pack(anchor="w", pady=(5, 0))
-        
-        ttk.Button(sub_info, text="🔄 Refresh Subscriptions", command=self._refresh_subscriptions).pack(anchor="w", pady=(5, 0))
-        
-        # Inner frame for grid layout
-        conf_grid = ttk.Frame(conf_frame)
-        conf_grid.pack(fill="x", expand=True)
-        
-        ttk.Label(conf_grid, text="⚠ Changes require daemon restart to take effect", foreground="orange").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        
-        # Broker Host
-        row = 1
-        ttk.Label(conf_grid, text="Broker Host:").grid(row=row, column=0, sticky="w", pady=5)
-        self.ent_broker_host = ttk.Entry(conf_grid, width=30)
-        self.ent_broker_host.grid(row=row, column=1, sticky="ew", pady=5, padx=5)
-        
-        # Broker Port
-        row += 1
-        ttk.Label(conf_grid, text="Broker Port:").grid(row=row, column=0, sticky="w", pady=5)
-        self.ent_broker_port = ttk.Entry(conf_grid, width=30)
-        self.ent_broker_port.grid(row=row, column=1, sticky="ew", pady=5, padx=5)
-        
-        # Username
-        row += 1
-        ttk.Label(conf_grid, text="Username:").grid(row=row, column=0, sticky="w", pady=5)
-        self.ent_username = ttk.Entry(conf_grid, width=30)
-        self.ent_username.grid(row=row, column=1, sticky="ew", pady=5, padx=5)
-        
-        # Password
-        row += 1
-        ttk.Label(conf_grid, text="Password:").grid(row=row, column=0, sticky="w", pady=5)
-        self.ent_password = ttk.Entry(conf_grid, width=30, show="*")
-        self.ent_password.grid(row=row, column=1, sticky="ew", pady=5, padx=5)
-        
-        # Controller ID
-        row += 1
-        ttk.Label(conf_grid, text="Controller ID:").grid(row=row, column=0, sticky="w", pady=5)
-        self.ent_ctrl_id = ttk.Entry(conf_grid, width=30)
-        self.ent_ctrl_id.grid(row=row, column=1, sticky="ew", pady=5, padx=5)
-        
-        # Receive Topic
-        row += 1
-        ttk.Label(conf_grid, text="Receive Topic:").grid(row=row, column=0, sticky="w", pady=5)
-        self.ent_topic = ttk.Entry(conf_grid, width=30)
-        self.ent_topic.grid(row=row, column=1, sticky="ew", pady=5, padx=5)
-        
-        # IPC Port
-        row += 1
-        ttk.Label(conf_grid, text="IPC Port:").grid(row=row, column=0, sticky="w", pady=5)
-        self.ent_ipc_port = ttk.Entry(conf_grid, width=30)
-        self.ent_ipc_port.grid(row=row, column=1, sticky="ew", pady=5, padx=5)
-        
-        conf_grid.columnconfigure(1, weight=1)
-        
-        # Buttons
-        btn_frame = ttk.Frame(conf_frame)
-        btn_frame.pack(pady=10)
-        ttk.Button(btn_frame, text="Load from Daemon", command=self._refresh_config).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="Save Configuration", command=self._save_config).pack(side="left", padx=5)
+        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
-        # Broker Status Section
-        broker_status_frame = ttk.LabelFrame(scrollable_frame, text="STOMP Broker Status", padding=10)
-        broker_status_frame.pack(fill="x", pady=10)
-        
-        self.lbl_broker_conn = ttk.Label(broker_status_frame, text="Connection: Checking...", font=("Segoe UI", 9))
-        self.lbl_broker_conn.pack(anchor="w", pady=2)
-        
-        self.lbl_broker_addr = ttk.Label(broker_status_frame, text="Address: N/A", font=("Segoe UI", 9))
-        self.lbl_broker_addr.pack(anchor="w", pady=2)
-        
-        self.lbl_broker_user = ttk.Label(broker_status_frame, text="Username: N/A", font=("Segoe UI", 9))
-        self.lbl_broker_user.pack(anchor="w", pady=2)
-        
-        self.txt_broker_log = tk.Text(broker_status_frame, height=4, state='disabled', font=("Consolas", 8), bg="#f0f0f0")
-        self.txt_broker_log.pack(fill="x", pady=(5, 0))
-        
-        ttk.Label(broker_status_frame, text="Recent connection messages", font=("Segoe UI", 8), foreground="gray").pack(anchor="w")
+    # ==========================================
+    # 1. Top Header & Network Sub-Bar
+    # ==========================================
 
-        # Debug Control
-        dbg_frame = ttk.LabelFrame(scrollable_frame, text="Runtime Debug Control", padding=10)
-        dbg_frame.pack(fill="x", pady=10)
-        
-        ttk.Label(dbg_frame, text="Debug Level:").pack(anchor="w")
-        self.var_debug = tk.IntVar(value=-1)
-        
-        ttk.Radiobutton(dbg_frame, text="Level 0: Agent Response Only (Quiet)", variable=self.var_debug, value=0, command=self._set_debug_level).pack(anchor="w", padx=20)
-        ttk.Radiobutton(dbg_frame, text="Level 1: USP Messages (Standard)", variable=self.var_debug, value=1, command=self._set_debug_level).pack(anchor="w", padx=20)
-        ttk.Radiobutton(dbg_frame, text="Level 2: Full STOMP Frames (Verbose)", variable=self.var_debug, value=2, command=self._set_debug_level).pack(anchor="w", padx=20)
-        
-        # Connection Control
-        conn_frame = ttk.LabelFrame(scrollable_frame, text="Connection Management", padding=10)
-        conn_frame.pack(fill="x", pady=10)
-        
-        ttk.Label(conn_frame, text="If broker connection is lost, you can attempt reconnection here:").pack(anchor="w")
-        ttk.Button(conn_frame, text="Reconnect to STOMP Broker", command=self._reconnect_stomp).pack(anchor="w", pady=5)
-        
-        # mDNS Discovery Control
-        mdns_frame = ttk.LabelFrame(scrollable_frame, text="mDNS Agent Discovery", padding=10)
-        mdns_frame.pack(fill="x", pady=10)
-        
-        ttk.Label(mdns_frame, text="Automatically discover USP agents on the local network using mDNS/Zeroconf").pack(anchor="w", pady=(0, 5))
-        
-        self.lbl_mdns_status = ttk.Label(mdns_frame, text="Status: Checking...", font=("Segoe UI", 9))
-        self.lbl_mdns_status.pack(anchor="w", pady=2)
-        
-        mdns_btn_frame = ttk.Frame(mdns_frame)
-        mdns_btn_frame.pack(anchor="w", pady=5)
-        
-        ttk.Button(mdns_btn_frame, text="Start Discovery", command=self._mdns_start).pack(side="left", padx=(0, 5))
-        ttk.Button(mdns_btn_frame, text="Stop Discovery", command=self._mdns_stop).pack(side="left", padx=5)
-        ttk.Button(mdns_btn_frame, text="Scan Now", command=self._mdns_scan).pack(side="left", padx=5)
-        ttk.Button(mdns_btn_frame, text="Check Status", command=self._mdns_check_status).pack(side="left", padx=5)
-        
-        # Scan results display
-        ttk.Label(mdns_frame, text="Last scan results:", font=("Segoe UI", 8)).pack(anchor="w", pady=(10, 2))
-        self.txt_mdns_results = tk.Text(mdns_frame, height=4, state='disabled', font=("Consolas", 8), bg="#f0f0f0")
-        self.txt_mdns_results.pack(fill="x")
-        self._add_text_context_menu(self.txt_mdns_results)
+    def _build_top_header(self):
+        top_bar = ttk.Frame(self.root, style="Header.TFrame", padding=(16, 10))
+        top_bar.pack(side=tk.TOP, fill=tk.X)
 
-        # Initial config load
-        self.root.after(2000, self._refresh_config)
-        self.root.after(3000, self._mdns_check_status)
-        self.root.after(1000, self._refresh_script_list)
-        self.root.after(500, self._refresh_devices)
-        self.root.after(600, self._sync_script_endpoint)
+        # Title & Status
+        title_frame = ttk.Frame(top_bar, style="Header.TFrame")
+        title_frame.pack(side=tk.LEFT, fill=tk.Y)
 
-    def _refresh_devices(self):
-        """Refresh list of available devices from devices.json"""
-        devices_file = os.path.join(os.path.dirname(__file__), 'devices.json')
-        if not os.path.exists(devices_file):
-            self.cb_endpoint['values'] = []
-            if hasattr(self, 'cb_script_endpoint'):
-                self.cb_script_endpoint['values'] = []
-            return
-        
+        title_lbl = ttk.Label(title_frame, text="TR-369 USP Controller 控制主控台", style="HeaderTitle.TLabel")
+        title_lbl.pack(anchor=tk.W)
+
+        self.lbl_header_status = ttk.Label(
+            title_frame,
+            text="Daemon: 檢查中... | STOMP Broker: 127.0.0.1:61614 | IPC: 127.0.0.1:6001",
+            style="HeaderStatus.TLabel"
+        )
+        self.lbl_header_status.pack(anchor=tk.W, pady=(2, 0))
+
+        # Top Right Controls
+        ctrl_frame = ttk.Frame(top_bar, style="Header.TFrame")
+        ctrl_frame.pack(side=tk.RIGHT, fill=tk.Y)
+
+        ttk.Label(ctrl_frame, text="IPC 位址:", style="HeaderStatus.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ipc_entry = ttk.Entry(ctrl_frame, textvariable=self.ipc_url_var, width=16)
+        ipc_entry.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.btn_refresh_connect = ttk.Button(ctrl_frame, text="連線 / 刷新", command=self.on_refresh_connect_clicked)
+        self.btn_refresh_connect.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.btn_broker_toggle = ttk.Button(
+            ctrl_frame,
+            text="啟動 Broker 黑窗",
+            style="Launch.TButton",
+            command=self.launch_broker_black_window
+        )
+        self.btn_broker_toggle.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.btn_daemon_toggle = ttk.Button(
+            ctrl_frame,
+            text="啟動 Controller 黑窗",
+            style="Launch.TButton",
+            command=self.launch_daemon_black_window
+        )
+        self.btn_daemon_toggle.pack(side=tk.LEFT)
+
+
+    def _build_network_sub_bar(self):
+        sub_bar = ttk.Frame(self.root, padding=(16, 6))
+        sub_bar.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(sub_bar, text="STOMP Broker:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        self.lbl_sub_broker_port = ttk.Label(sub_bar, text="61614 (CLOSED)", foreground="#dc2626", font=("Segoe UI", 9, "bold"))
+        self.lbl_sub_broker_port.pack(side=tk.LEFT, padx=(0, 14))
+
+        ttk.Label(sub_bar, text="Controller Daemon:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        self.lbl_sub_ipc = ttk.Label(sub_bar, text="6001 (OFFLINE)", foreground="#dc2626", font=("Segoe UI", 9, "bold"))
+        self.lbl_sub_ipc.pack(side=tk.LEFT, padx=(0, 14))
+
+        ttk.Label(sub_bar, text="Controller <-> Broker:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        self.lbl_sub_broker_conn = ttk.Label(sub_bar, text="OFFLINE", foreground="#94a3b8", font=("Segoe UI", 9, "bold"))
+        self.lbl_sub_broker_conn.pack(side=tk.LEFT, padx=(0, 14))
+
+        ttk.Label(sub_bar, text="當前目標:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        self.lbl_sub_target = ttk.Label(sub_bar, text="(未選擇)", foreground="#d97706", font=("Segoe UI", 9, "bold"))
+        self.lbl_sub_target.pack(side=tk.LEFT, padx=(0, 14))
+
+
+        # Quick utility buttons on the right
+        btn_box = ttk.Frame(sub_bar)
+        btn_box.pack(side=tk.RIGHT)
+
+        ttk.Button(btn_box, text="💡 DUT 設定指南", command=self.on_show_dut_guide_clicked).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_box, text="🔍 掃描 mDNS Agent", command=lambda: self.send_ipc_cmd_async("scan")).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_box, text="⚡ Ping 伺服器", command=self.on_ping_clicked).pack(side=tk.LEFT, padx=3)
+
+
+
+    # ==========================================
+    # 2. Left Panel: Device Explorer
+    # ==========================================
+
+    def _build_device_panel(self):
+        left_frame = ttk.LabelFrame(self.main_paned, text=" USP Agent 設備清單 ", padding=8)
+        self.main_paned.add(left_frame, weight=1)
+
+        # Search / Filter
+        filter_frame = ttk.Frame(left_frame)
+        filter_frame.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(filter_frame, text="搜尋:").pack(side=tk.LEFT, padx=(0, 4))
+        self.dev_filter_var = tk.StringVar()
+        self.dev_filter_var.trace_add("write", lambda *args: self._filter_devices())
+        dev_search_entry = ttk.Entry(filter_frame, textvariable=self.dev_filter_var)
+        dev_search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Auto-refresh notice / count
+        info_row = ttk.Frame(left_frame)
+        info_row.pack(fill=tk.X, pady=(0, 6))
+        self.lbl_dev_count = ttk.Label(info_row, text="已發現 0 個設備 (自動刷新中)", foreground="#64748b", font=("Segoe UI", 8))
+        self.lbl_dev_count.pack(side=tk.LEFT)
+
+        # Device Treeview Table
+        cols = ("status", "endpoint", "ip", "proto")
+        self.dev_tree = ttk.Treeview(left_frame, columns=cols, show="headings", selectmode="browse")
+        self.dev_tree.heading("status", text="狀態")
+        self.dev_tree.heading("endpoint", text="Agent Endpoint ID")
+        self.dev_tree.heading("ip", text="IP / 通道")
+        self.dev_tree.heading("proto", text="協議")
+
+        self.dev_tree.column("status", width=55, anchor=tk.CENTER)
+        self.dev_tree.column("endpoint", width=190, anchor=tk.W)
+        self.dev_tree.column("ip", width=95, anchor=tk.W)
+        self.dev_tree.column("proto", width=65, anchor=tk.CENTER)
+
+        dev_scroll = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.dev_tree.yview)
+        self.dev_tree.configure(yscrollcommand=dev_scroll.set)
+
+        self.dev_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        dev_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.dev_tree.bind("<<TreeviewSelect>>", self.on_device_selected)
+
+        # Bottom Buttons (Vertical Stack)
+        btn_frame = ttk.Frame(left_frame)
+        btn_frame.pack(fill=tk.X, pady=(8, 0), side=tk.BOTTOM)
+        ttk.Button(btn_frame, text="設為操作目標", style="Primary.TButton", command=self.on_set_active_target).pack(side=tk.TOP, fill=tk.X, expand=True, pady=(0, 4))
+        ttk.Button(btn_frame, text="探測 / 連線", command=self.on_probe_agent_clicked).pack(side=tk.TOP, fill=tk.X, expand=True, pady=(0, 4))
+
+        del_frame = ttk.Frame(btn_frame)
+        del_frame.pack(side=tk.TOP, fill=tk.X, expand=True)
+        ttk.Button(del_frame, text="清除離線", command=self.on_clear_offline_clicked).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        ttk.Button(del_frame, text="移除選中", command=self.on_remove_selected_device_clicked).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+
+
+
+
+
+    # ==========================================
+    # 3. Right Panel: Workspace Notebook Tabs
+    # ==========================================
+
+    def _build_notebook_panel(self):
+        right_frame = ttk.Frame(self.main_paned)
+        self.main_paned.add(right_frame, weight=3)
+
+        # Selected Device Summary Header (WindowsACS style)
+        self.dev_summary_frame = ttk.Frame(right_frame, padding=(6, 4))
+        self.dev_summary_frame.pack(fill=tk.X)
+
+        self.lbl_selected_title = ttk.Label(
+            self.dev_summary_frame,
+            text="請由左側選擇 USP Agent 設備",
+            font=("Segoe UI", 11, "bold"),
+            foreground="#0369a1"
+        )
+        self.lbl_selected_title.pack(anchor=tk.W)
+
+        self.lbl_selected_detail = ttk.Label(
+            self.dev_summary_frame,
+            text="狀態: - | 通訊協議: STOMP | 回應佇列: /queue/usp-agent-response",
+            foreground="#64748b"
+        )
+        self.lbl_selected_detail.pack(anchor=tk.W)
+
+        # Main Notebook
+        self.notebook = ttk.Notebook(right_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+
+        # Tab 1: Parameter Data Model Explorer
+        self.tab_params = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(self.tab_params, text=" 參數檢視與修改 (Parameters) ")
+        self._build_param_tab()
+
+        # Tab 2: Quick Actions & Command Deck
+        self.tab_actions = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(self.tab_actions, text=" 快捷控制與指令台 (Actions & CMD) ")
+        self._build_actions_tab()
+
+        # Tab 3: CDRouter Test Scripts
+        self.tab_scripts = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(self.tab_scripts, text=" CDRouter 測試腳本 (Test Scripts) ")
+        self._build_scripts_tab()
+
+        # Tab 4: Server & Port Monitor Dashboard
+        self.tab_monitor = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(self.tab_monitor, text=" 伺服器與通訊埠監控 (Port Monitor) ")
+        self._build_monitor_tab()
+
+        # Tab 5: Live Protocol & STOMP Logs
+        self.tab_logs = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(self.tab_logs, text=" 即時日誌與封包檢視 (Live Logs) ")
+        self._build_logs_tab()
+
+        # Tab 6: System & Network Configuration
+        self.tab_config = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(self.tab_config, text=" 系統與連線設定 (Settings) ")
+        self._build_config_tab()
+
+
+    # ------------------------------------------
+    # Tab 1: Parameter Data Model Explorer
+    # ------------------------------------------
+
+    def _build_param_tab(self):
+        # Row 1: Parameter Path Entry (Full Width Standalone Row)
+        p_path_row = ttk.Frame(self.tab_params)
+        p_path_row.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(p_path_row, text="參數路徑:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+        self.param_path_var = tk.StringVar(value="Device.DeviceInfo.")
+        p_entry = ttk.Entry(p_path_row, textvariable=self.param_path_var)
+        p_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Row 2: Action Buttons Row (Standalone Row)
+        p_btn_row = ttk.Frame(self.tab_params)
+        p_btn_row.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Button(p_btn_row, text="查詢 (Get)", style="Primary.TButton", command=self.on_param_get_clicked).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(p_btn_row, text="修改 (Set)", command=self.on_param_set_clicked).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(p_btn_row, text="新增實例 (Add)", command=self.on_param_add_clicked).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(p_btn_row, text="刪除實例 (Del)", command=self.on_param_delete_clicked).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(p_btn_row, text="查詢架構 (GetDM)", command=self.on_param_get_dm_clicked).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(p_btn_row, text="實例清單 (GetInst)", command=self.on_param_get_inst_clicked).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(p_btn_row, text="清空清單", command=self.on_clear_param_tree_clicked).pack(side=tk.RIGHT)
+
+        # Row 3: Parameter Filter & Search Bar (Real-time Filter)
+        p_filter_row = ttk.Frame(self.tab_params)
+        p_filter_row.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(p_filter_row, text="過濾條件:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+        self.param_filter_var = tk.StringVar()
+        self.param_filter_var.trace_add("write", lambda *args: self._filter_params())
+        p_filter_entry = ttk.Entry(p_filter_row, textvariable=self.param_filter_var)
+        p_filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        self.lbl_param_count = ttk.Label(p_filter_row, text="顯示: 0 / 0 筆", foreground="#64748b", font=("Segoe UI", 9))
+        self.lbl_param_count.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(p_filter_row, text="清除過濾 (X)", command=self._clear_param_filter).pack(side=tk.RIGHT)
+
+        # Param Treeview Table
+        p_cols = ("path", "value", "type", "updated")
+        self.param_tree = ttk.Treeview(self.tab_params, columns=p_cols, show="headings")
+        self.param_tree.heading("path", text="參數路徑 (Parameter Path)")
+        self.param_tree.heading("value", text="參數值 (Value)")
+        self.param_tree.heading("type", text="型別 (Type)")
+        self.param_tree.heading("updated", text="最後更新時間")
+
+        self.param_tree.column("path", width=380, anchor=tk.W)
+        self.param_tree.column("value", width=240, anchor=tk.W)
+        self.param_tree.column("type", width=90, anchor=tk.W)
+        self.param_tree.column("updated", width=140, anchor=tk.W)
+
+        p_scroll_y = ttk.Scrollbar(self.tab_params, orient=tk.VERTICAL, command=self.param_tree.yview)
+        self.param_tree.configure(yscrollcommand=p_scroll_y.set)
+
+        self.param_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        p_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.param_tree.bind("<<TreeviewSelect>>", self._on_param_row_clicked)
+        self.param_tree.bind("<Double-1>", self._on_param_double_clicked)
+
+
+
+
+    # ------------------------------------------
+    # Tab 2: Quick Actions & Command Deck
+    # ------------------------------------------
+    def _build_actions_tab(self):
+        grid_frame = ttk.Frame(self.tab_actions)
+        grid_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Card 1: Device Information Query
+        c1 = ttk.LabelFrame(grid_frame, text=" ℹ️ 系統與設備資訊 (DeviceInfo) ", padding=12)
+        c1.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        ttk.Label(c1, text="查詢 Agent 軟體版本、序號、製造商、運行時間等基礎系統資訊。", wraplength=260).pack(anchor=tk.W, pady=(0, 10))
+        ttk.Button(c1, text="查詢 DeviceInfo", style="Primary.TButton", command=lambda: self.send_ipc_cmd_async("get Device.DeviceInfo.")).pack(anchor=tk.W)
+
+        # Card 2: WiFi & Network Radios
+        c2 = ttk.LabelFrame(grid_frame, text=" 📶 WiFi 無線網路管理 (WiFi.Radio) ", padding=12)
+        c2.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
+        ttk.Label(c2, text="檢視 2.4G / 5G / 6G Radio 頻段狀態、SSID 與頻道設定。", wraplength=260).pack(anchor=tk.W, pady=(0, 10))
+        ttk.Button(c2, text="查詢 WiFi Radios", style="Action.TButton", command=lambda: self.send_ipc_cmd_async("get Device.WiFi.Radio.")).pack(anchor=tk.W)
+
+        # Card 3: DHCP Server & Pools
+        c3 = ttk.LabelFrame(grid_frame, text=" 🌐 DHCP 伺服器與位址池 (DHCPv4) ", padding=12)
+        c3.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
+        ttk.Label(c3, text="管理 DHCPv4 Server Pool 配置，新增/刪除位址發放範圍。", wraplength=260).pack(anchor=tk.W, pady=(0, 10))
+        ttk.Button(c3, text="查詢 DHCP Pools", style="Action.TButton", command=lambda: self.send_ipc_cmd_async("get Device.DHCPv4.Server.Pool.")).pack(anchor=tk.W)
+
+        # Card 4: IP Diagnostics / Ping RPC
+        c4 = ttk.LabelFrame(grid_frame, text=" ⚡ 遠端診斷與 RPC 操作 (Operate) ", padding=12)
+        c4.grid(row=1, column=1, sticky="nsew", padx=8, pady=8)
+        ttk.Label(c4, text="發送遠端 RPC 指令或觸發 IPPing 診斷流程。", wraplength=260).pack(anchor=tk.W, pady=(0, 10))
+        ttk.Button(c4, text="查詢 IP.Interface", style="Action.TButton", command=lambda: self.send_ipc_cmd_async("get Device.IP.Interface.")).pack(anchor=tk.W)
+
+        grid_frame.columnconfigure(0, weight=1)
+        grid_frame.columnconfigure(1, weight=1)
+
+        # Bottom Direct CMD Input Bar
+        cmd_box = ttk.LabelFrame(self.tab_actions, text=" 💻 直接指令發送列 (Direct CMD Execution) ", padding=10)
+        cmd_box.pack(fill=tk.X, pady=(12, 0))
+
+        c_inner = ttk.Frame(cmd_box)
+        c_inner.pack(fill=tk.X)
+
+        ttk.Label(c_inner, text="usp >", font=("Consolas", 11, "bold"), foreground="#0284c7").pack(side=tk.LEFT, padx=(0, 6))
+        self.action_cmd_entry = tk.Entry(c_inner, font=("Consolas", 11), bg="#ffffff", fg="#0f172a", relief="solid", bd=1)
+        self.action_cmd_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), ipady=4)
+        self.action_cmd_entry.bind("<Return>", lambda e: self.on_action_cmd_enter())
+
+        ttk.Button(c_inner, text="發送指令 (Enter)", style="Primary.TButton", command=self.on_action_cmd_enter).pack(side=tk.LEFT)
+
+    # ------------------------------------------
+    # Tab 3: CDRouter Test Scripts
+    # ------------------------------------------
+    def _build_scripts_tab(self):
+        s_top = ttk.Frame(self.tab_scripts)
+        s_top.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(s_top, text="測試腳本:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+        self.combo_scripts = ttk.Combobox(s_top, width=38, state="readonly")
+        self.combo_scripts.pack(side=tk.LEFT, padx=(0, 8))
+        self._reload_scripts_dropdown()
+
+        ttk.Button(s_top, text="🔄 重新載入", command=self._reload_scripts_dropdown).pack(side=tk.LEFT, padx=3)
+        self.btn_run_script = ttk.Button(s_top, text="▶ 執行測試腳本", style="Primary.TButton", command=self.on_run_script_clicked)
+        self.btn_run_script.pack(side=tk.LEFT, padx=8)
+
+        # Metrics Banner
+        self.lbl_script_metrics = ttk.Label(
+            self.tab_scripts,
+            text="尚未執行腳本。請由上方下拉選單選擇測試腳本並點擊「執行測試腳本」。",
+            font=("Segoe UI", 9, "bold"),
+            foreground="#64748b"
+        )
+        self.lbl_script_metrics.pack(anchor=tk.W, pady=(0, 8))
+
+        # Progress Table
+        cols = ("line", "cmd", "path", "status", "elapsed", "details")
+        self.script_tree = ttk.Treeview(self.tab_scripts, columns=cols, show="headings")
+        self.script_tree.heading("line", text="行號")
+        self.script_tree.heading("cmd", text="指令")
+        self.script_tree.heading("path", text="參數路徑 / 內容")
+        self.script_tree.heading("status", text="狀態")
+        self.script_tree.heading("elapsed", text="耗時")
+        self.script_tree.heading("details", text="斷言與執行結果")
+
+        self.script_tree.column("line", width=60, anchor=tk.CENTER)
+        self.script_tree.column("cmd", width=95)
+        self.script_tree.column("path", width=300)
+        self.script_tree.column("status", width=85, anchor=tk.CENTER)
+        self.script_tree.column("elapsed", width=75, anchor=tk.CENTER)
+        self.script_tree.column("details", width=360)
+
+        s_scroll_y = ttk.Scrollbar(self.tab_scripts, orient=tk.VERTICAL, command=self.script_tree.yview)
+        self.script_tree.configure(yscrollcommand=s_scroll_y.set)
+
+        self.script_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        s_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+    # ------------------------------------------
+    # Tab 4: Server & Port Monitor Dashboard
+    # ------------------------------------------
+    def _build_monitor_tab(self):
+        m_container = ttk.Frame(self.tab_monitor)
+        m_container.pack(fill=tk.BOTH, expand=True)
+
+        # Card 1: Daemon Process
+        c1 = ttk.LabelFrame(m_container, text=" 🛡️ Daemon 後台守護行程狀態 ", padding=14)
+        c1.pack(fill=tk.X, pady=(0, 10))
+
+        self.lbl_mon_daemon = tk.Label(
+            c1,
+            text="Daemon 狀態:  檢查中...\n行程 PID:      -\n運行時間:      -\nIPC 通訊埠:    127.0.0.1:6001 (LISTENING)\n活躍執行緒:    -",
+            font=("Consolas", 10),
+            justify=tk.LEFT,
+            bg="#ffffff",
+            fg="#0f172a"
+        )
+        self.lbl_mon_daemon.pack(anchor=tk.W)
+
+        # Card 2: Network & Port Monitor
+        c2 = ttk.LabelFrame(m_container, text=" 🔌 通訊埠 (Ports) 監聽與佔用檢測 ", padding=14)
+        c2.pack(fill=tk.X, pady=(0, 10))
+
+        self.lbl_mon_ports = tk.Label(
+            c2,
+            text="Port 61614 (STOMP Broker):  檢測中...\nPort 6001  (IPC Server):    檢測中...\nPort 5353  (mDNS Discovery): READY",
+            font=("Consolas", 10),
+            justify=tk.LEFT,
+            bg="#ffffff",
+            fg="#0f172a"
+        )
+        self.lbl_mon_ports.pack(anchor=tk.W)
+
+        # Card 3: STOMP Protocol & Queues
+        c3 = ttk.LabelFrame(m_container, text=" 🌐 STOMP 協議與佇列配置 ", padding=14)
+        c3.pack(fill=tk.BOTH, expand=True)
+
+        self.lbl_mon_broker = tk.Label(
+            c3,
+            text="通訊協議:        STOMP 1.2\nBroker 位址:     127.0.0.1:61614\nController ID:   proto::controller.default\n接收佇列:        /queue/usp.controller.default\n已知 Agent 總數: 0",
+            font=("Consolas", 10),
+            justify=tk.LEFT,
+            bg="#ffffff",
+            fg="#0f172a"
+        )
+        self.lbl_mon_broker.pack(anchor=tk.W)
+
+    # ------------------------------------------
+    # Tab 5: Live Protocol & STOMP Logs
+    # ------------------------------------------
+    def _build_logs_tab(self):
+        l_paned = ttk.PanedWindow(self.tab_logs, orient=tk.VERTICAL)
+        l_paned.pack(fill=tk.BOTH, expand=True)
+
+        # Upper: Log Table
+        l_top = ttk.Frame(l_paned)
+        l_paned.add(l_top, weight=1)
+
+        l_bar = ttk.Frame(l_top)
+        l_bar.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(l_bar, text="🔄 刷新日誌", command=self.refresh_logs).pack(side=tk.LEFT)
+        ttk.Button(l_bar, text="🧹 清空日誌", command=self.on_clear_logs_clicked).pack(side=tk.LEFT, padx=6)
+        ttk.Checkbutton(l_bar, text="自動更新 (每 1.5 秒)", variable=self.auto_refresh_logs).pack(side=tk.RIGHT)
+
+        cols = ("id", "time", "type", "msg")
+        self.log_tree = ttk.Treeview(l_top, columns=cols, show="headings", selectmode="browse")
+        self.log_tree.heading("id", text="ID")
+        self.log_tree.heading("time", text="時間戳記")
+        self.log_tree.heading("type", text="類型")
+        self.log_tree.heading("msg", text="訊息內容")
+
+        self.log_tree.column("id", width=50, anchor=tk.CENTER)
+        self.log_tree.column("time", width=140, anchor=tk.W)
+        self.log_tree.column("type", width=85, anchor=tk.CENTER)
+        self.log_tree.column("msg", width=620, anchor=tk.W)
+
+        l_scroll = ttk.Scrollbar(l_top, orient=tk.VERTICAL, command=self.log_tree.yview)
+        self.log_tree.configure(yscrollcommand=l_scroll.set)
+
+        self.log_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        l_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_tree.bind("<<TreeviewSelect>>", self.on_log_row_selected)
+
+        # Lower: Raw Frame / Log Details Viewer
+        l_bottom = ttk.LabelFrame(l_paned, text=" 封包與日誌詳細內容檢視 (Raw Packet / Frame Details) ", padding=6)
+        l_paned.add(l_bottom, weight=1)
+
+        self.log_detail_text = scrolledtext.ScrolledText(
+            l_bottom,
+            wrap=tk.WORD,
+            font=("Consolas", 10),
+            background="#0f172a",
+            foreground="#f8fafc",
+            relief="flat",
+            padx=10,
+            pady=10
+        )
+        self.log_detail_text.pack(fill=tk.BOTH, expand=True)
+
+    # ------------------------------------------
+    # Tab 6: System & Network Configuration
+    # ------------------------------------------
+    def _build_config_tab(self):
+        container = ttk.Frame(self.tab_config)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        # 2 Column layout
+        # Left column: STOMP Broker & Network Settings
+        left_col = ttk.LabelFrame(container, text=" 🌐 STOMP Message Broker 連線設定 (支援外部/雲端/本機站點) ", padding=14)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+
+        # Field: Broker Host
+        row0 = ttk.Frame(left_col)
+        row0.pack(fill=tk.X, pady=6)
+        ttk.Label(row0, text="Broker 主機 / IP:", width=20, anchor=tk.W, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+        ttk.Entry(row0, textvariable=self.cfg_broker_host_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Field: Broker Port
+        row1 = ttk.Frame(left_col)
+        row1.pack(fill=tk.X, pady=6)
+        ttk.Label(row1, text="Broker 通訊埠 (Port):", width=20, anchor=tk.W, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+        ttk.Entry(row1, textvariable=self.cfg_broker_port_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Field: Username
+        row2 = ttk.Frame(left_col)
+        row2.pack(fill=tk.X, pady=6)
+        ttk.Label(row2, text="STOMP 帳號 (Username):", width=20, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Entry(row2, textvariable=self.cfg_broker_user_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Field: Password
+        row3 = ttk.Frame(left_col)
+        row3.pack(fill=tk.X, pady=6)
+        ttk.Label(row3, text="STOMP 密碼 (Password):", width=20, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Entry(row3, textvariable=self.cfg_broker_pass_var, show="*").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Test Broker Connection Button
+        btn_test = ttk.Button(left_col, text="⚡ 測試外部 Broker 連線 (TCP Ping)", style="Action.TButton", command=self.on_test_broker_conn_clicked)
+        btn_test.pack(fill=tk.X, pady=(16, 6))
+        self.lbl_broker_test_result = ttk.Label(left_col, text="點擊上方按鈕測試目標 Broker IP / Port 是否通暢可達", foreground="#64748b", font=("Segoe UI", 9))
+        self.lbl_broker_test_result.pack(anchor=tk.W)
+
+        # Right column: Controller & System Settings
+        right_col = ttk.LabelFrame(container, text=" 🛡️ USP Controller 主機與系統參數設定 ", padding=14)
+        right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(8, 0))
+
+        # Field: Controller ID
+        rrow0 = ttk.Frame(right_col)
+        rrow0.pack(fill=tk.X, pady=6)
+        ttk.Label(rrow0, text="Controller Endpoint ID:", width=22, anchor=tk.W, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+        ttk.Entry(rrow0, textvariable=self.cfg_controller_id_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Field: Receive Topic
+        rrow1 = ttk.Frame(right_col)
+        rrow1.pack(fill=tk.X, pady=6)
+        ttk.Label(rrow1, text="接收監聽佇列 (Topic):", width=22, anchor=tk.W, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+        ttk.Entry(rrow1, textvariable=self.cfg_rx_topic_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Field: IPC Port
+        rrow2 = ttk.Frame(right_col)
+        rrow2.pack(fill=tk.X, pady=6)
+        ttk.Label(rrow2, text="IPC API 通訊埠 (Port):", width=22, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Entry(rrow2, textvariable=self.cfg_ipc_port_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Field: Debug Level
+        rrow3 = ttk.Frame(right_col)
+        rrow3.pack(fill=tk.X, pady=6)
+        ttk.Label(rrow3, text="日誌調試級別 (Debug):", width=22, anchor=tk.W).pack(side=tk.LEFT)
+        debug_cb = ttk.Combobox(rrow3, textvariable=self.cfg_debug_level_var, values=["0 - 僅 Agent (簡潔)", "1 - 雙向 Payload (標準)", "2 - 完整 STOMP 幀與細節 (除錯)"], state="readonly")
+        debug_cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Checkboxes
+        ttk.Checkbutton(right_col, text="自動註冊與記錄新連線的 USP Agent", variable=self.cfg_auto_register_var).pack(anchor=tk.W, pady=(10, 4))
+        ttk.Checkbutton(right_col, text="啟用 mDNS 區域網路 Agent 自動廣播發現 (Port 5353)", variable=self.cfg_mdns_var).pack(anchor=tk.W, pady=4)
+
+        # Status Label Row
+        status_row = ttk.Frame(self.tab_config, padding=(0, 6, 0, 0))
+        status_row.pack(fill=tk.X, side=tk.BOTTOM)
+        self.lbl_cfg_save_status = ttk.Label(status_row, text="", font=("Segoe UI", 9, "bold"))
+        self.lbl_cfg_save_status.pack(side=tk.LEFT)
+
+        # Bottom Action Bar
+        action_bar = ttk.Frame(self.tab_config, padding=(0, 14, 0, 0))
+        action_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+        ttk.Button(action_bar, text="💾 儲存設定至 config.json", style="Primary.TButton", command=self.on_save_config_clicked).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(action_bar, text="🔄 重新載入 config.json", command=self._load_config_to_vars).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(action_bar, text="💡 產生 DUT 設定指南", style="Action.TButton", command=self.on_show_dut_guide_clicked).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(action_bar, text="🚀 重啟 Controller 套用新設定", style="Launch.TButton", command=self.on_restart_controller_clicked).pack(side=tk.RIGHT)
+
+    def _load_config_to_vars(self):
+        """Load configuration from config.json into Tk variables"""
         try:
-            with open(devices_file, 'r', encoding='utf-8') as f:
-                devices = json.load(f)
-            
-            device_list = list(devices.keys())
-            self.cb_endpoint['values'] = device_list
-            if hasattr(self, 'cb_script_endpoint'):
-                self.cb_script_endpoint['values'] = device_list
-            
-            # Auto-select first device if nothing is selected
-            if device_list and not self.cb_endpoint.get():
-                self.cb_endpoint.current(0)
-            if hasattr(self, 'cb_script_endpoint') and device_list and not self.cb_script_endpoint.get():
-                self.cb_script_endpoint.current(0)
+            cfg_path = Path(__file__).parent / "config.json"
+            if cfg_path.exists():
+                with open(cfg_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                usp = data.get("usp_controller", {})
+                self.cfg_broker_host_var.set(usp.get("broker_host", "127.0.0.1"))
+                self.cfg_broker_port_var.set(str(usp.get("broker_port", 61614)))
+                self.cfg_broker_user_var.set(usp.get("username", "guest"))
+                self.cfg_broker_pass_var.set(usp.get("password", "guest"))
+                self.cfg_controller_id_var.set(usp.get("controller_endpoint_id", "proto::controller.default"))
+                self.cfg_rx_topic_var.set(usp.get("receive_topic", "/queue/usp.controller.default"))
+
+                ipc = data.get("ipc", {})
+                self.cfg_ipc_port_var.set(str(ipc.get("port", 6001)))
+
+                dbg = usp.get("debug_level", 1)
+                dbg_map = {0: "0 - 僅 Agent (簡潔)", 1: "1 - 雙向 Payload (標準)", 2: "2 - 完整 STOMP 幀與細節 (除錯)"}
+                self.cfg_debug_level_var.set(dbg_map.get(dbg, "1 - 雙向 Payload (標準)"))
+
+                self.cfg_auto_register_var.set(usp.get("auto_register_devices", True))
+                self.cfg_mdns_var.set(usp.get("enable_mdns_discovery", True))
+                if hasattr(self, 'lbl_cfg_save_status'):
+                    self.lbl_cfg_save_status.config(text="🔄 已成功從 config.json 重新載入設定！", foreground="#0284c7")
         except Exception as e:
-            self.cb_endpoint['values'] = []
-            if hasattr(self, 'cb_script_endpoint'):
-                self.cb_script_endpoint['values'] = []
-    
-    def _sync_script_endpoint(self):
-        """Sync script endpoint with main endpoint selector"""
-        if hasattr(self, 'cb_script_endpoint') and self.cb_endpoint.get() and not self.cb_script_endpoint.get():
-            endpoint = self.cb_endpoint.get()
-            if endpoint in self.cb_script_endpoint['values']:
-                self.cb_script_endpoint.set(endpoint)
-    
-    def _refresh_script_list(self):
-        """Refresh list of available test scripts"""
-        import os
-        script_dir = os.path.join(os.path.dirname(__file__), 'scripts')
-        if not os.path.exists(script_dir):
+            print(f"[GUI] Error loading config: {e}")
+
+    def on_save_config_clicked(self):
+        """Save form variables into config.json"""
+        host = self.cfg_broker_host_var.get().strip()
+        port_str = self.cfg_broker_port_var.get().strip()
+        user = self.cfg_broker_user_var.get().strip()
+        pwd = self.cfg_broker_pass_var.get().strip()
+        ctrl_id = self.cfg_controller_id_var.get().strip()
+        rx_topic = self.cfg_rx_topic_var.get().strip()
+        ipc_port_str = self.cfg_ipc_port_var.get().strip()
+
+        if not host or not port_str:
+            if hasattr(self, 'lbl_cfg_save_status'):
+                self.lbl_cfg_save_status.config(text="⚠️ STOMP Broker 主機與通訊埠不可為空！", foreground="#dc2626")
             return
-        
+
         try:
-            scripts = [f for f in os.listdir(script_dir) if f.endswith('.txt')]
-            self.cb_script['values'] = scripts
-            if scripts and not self.cb_script.get():
-                self.cb_script.current(0)
-        except Exception as e:
-            pass
-    
-    def _open_script_folder(self):
-        """Open scripts folder in file explorer"""
-        import os
-        import subprocess
-        script_dir = os.path.join(os.path.dirname(__file__), 'scripts')
-        if os.path.exists(script_dir):
-            if sys.platform == 'win32':
-                os.startfile(script_dir)
-            else:
-                subprocess.run(['xdg-open', script_dir])
-    
-    def _clear_script_log(self):
-        """Clear script output log"""
-        self.txt_script_log.configure(state='normal')
-        self.txt_script_log.delete(1.0, tk.END)
-        self.txt_script_log.configure(state='disabled')
-    
-    def _run_script(self):
-        """Run selected test script"""
-        # Check if mini-broker is enabled and running
-        if not self._check_broker_ready():
+            port = int(port_str)
+            ipc_port = int(ipc_port_str)
+        except ValueError:
+            if hasattr(self, 'lbl_cfg_save_status'):
+                self.lbl_cfg_save_status.config(text="⚠️ 通訊埠必須為數字格式！", foreground="#dc2626")
             return
-        
-        script_name = self.cb_script.get()
-        if not script_name:
-            messagebox.showwarning("No Script", "Please select a script to run")
-            return
-        
-        endpoint = self.cb_script_endpoint.get()
-        if not endpoint:
-            messagebox.showwarning("No Device", "Please select a target device")
-            return
-        
-        if self.script_running:
-            messagebox.showinfo("Script Running", "A script is already running")
-            return
-        
-        self.script_running = True
-        self.btn_run_script.configure(state='disabled')
-        self.btn_stop_script.configure(state='normal')
-        self.script_progress.start(10)
-        
-        self._clear_script_log()
-        self._script_log(f"Starting script: {script_name}\n", 'info')
-        self._script_log(f"Target device: {endpoint}\n\n", 'info')
-        
-        # Reset script variables
-        self.script_variables = {}
-        
-        self.script_thread = threading.Thread(target=self._run_script_thread, args=(script_name, endpoint), daemon=True)
-        self.script_thread.start()
-    
-    def _stop_script(self):
-        """Stop running script"""
-        self.script_running = False
-        self._script_log("\n[STOPPED] Script execution stopped by user\n", 'error')
-    
-    def _run_script_thread(self, script_name, endpoint):
-        """Execute script in background thread"""
-        import os
-        script_path = os.path.join(os.path.dirname(__file__), 'scripts', script_name)
-        
-        try:
-            with open(script_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            executed = 0
-            failed = 0
-            
-            for i, line in enumerate(lines, 1):
-                if not self.script_running:
-                    break
-                
-                line = line.strip()
-                
-                # Print comments
-                if line.startswith('#'):
-                    self._script_log(f"{line}\n", 'comment')
-                    continue
-                
-                # Skip empty lines
-                if not line:
-                    continue
-                
-                # Check for discover_bridge_port command (before variable replacement)
-                if line.strip().startswith('discover_bridge_port'):
-                    parts = line.strip().split()
-                    if len(parts) >= 3:
-                        bridge_alias = parts[1]
-                        port_alias = parts[2]
-                        self._script_log(f"[{i}] Special Command: discover_bridge_port {bridge_alias} {port_alias}\n", 'command')
-                        success = self._discover_bridge_port_inline(endpoint, bridge_alias, port_alias)
-                        if success:
-                            executed += 1
-                        else:
-                            failed += 1
-                    else:
-                        self._script_log(f"[{i}] [ERROR] Invalid discover_bridge_port syntax\n", 'error')
-                        self._script_log("    Usage: discover_bridge_port <bridge_alias> <port_alias>\n", 'info')
-                        failed += 1
-                    time.sleep(0.5)
-                    continue
-                
-                # Replace endpoint variable
-                line = line.replace('{ENDPOINT}', endpoint)
-                
-                # Replace other variables
-                for var_name, var_value in self.script_variables.items():
-                    line = line.replace(f'{{{var_name}}}', str(var_value))
-                
-                # Parse and execute command
-                result = self._parse_script_line(line)
-                if not result:
-                    continue
-                
-                # Unpack command and expected value
-                if isinstance(result, tuple):
-                    cmd, expected_value = result
-                else:
-                    cmd = result
-                    expected_value = None
-                
-                self._script_log(f"[{i}] {cmd}\n", 'command')
-                if expected_value:
-                    self._script_log(f"    Expected: {expected_value}\n", 'info')
-                self.lbl_script_status.config(text=f"Executing command {i}...")
-                
-                try:
-                    resp = self.ipc.send_command(cmd)
-                    
-                    # Handle connection errors
-                    if resp is None:
-                        self._script_log(f"    ✗ CONNECTION ERROR: Cannot connect to daemon\n", 'error')
-                        failed += 1
-                        # Give daemon a moment to recover
-                        time.sleep(1.0)
-                        continue
-                    
-                    # Handle duplicate request errors (skip to next command)
-                    if resp.get('status') == 'error' and 'Duplicate request' in resp.get('msg', ''):
-                        self._script_log(f"    ⚠ SKIPPED: {resp.get('msg')}\n", 'error')
-                        time.sleep(0.5)
-                        continue
-                    
-                    if resp and resp.get('status') == 'ok':
-                        actual_value = resp.get('msg', 'OK')
-                        
-                        # Special handling for export_cache command (async)
-                        if 'export_cache' in cmd.lower():
-                            self._script_log(f"    ✓ SUCCESS: {actual_value}\n", 'success')
-                            if resp.get('async'):
-                                self._script_log(f"       ⏳ Export running in background - check logs for completion\n", 'info')
-                                self._script_log(f"       📊 {resp.get('writable_count', 0)} writable templates, {resp.get('values_count', 0)} values\n", 'data')
-                            else:
-                                files = resp.get('files', [])
-                                if files:
-                                    self._script_log(f"\n    📁 Exported Files:\n", 'info')
-                                    for f in files:
-                                        self._script_log(f"       • {f}\n", 'data')
-                                    self._script_log(f"\n", 'info')
-                        
-                        # Special handling for test_set_all command (async with progress)
-                        elif 'test_set_all' in cmd.lower():
-                            self._script_log(f"    ✓ SUCCESS: {actual_value}\n", 'success')
-                            if resp.get('async'):
-                                # Show test info
-                                total_params = resp.get('total_params', 0)
-                                rate_limit = resp.get('rate_limit', 'N/A')
-                                est_minutes = resp.get('estimated_minutes', 0)
-                                
-                                self._script_log(f"       ⏳ Batch SET test running in background\n", 'info')
-                                self._script_log(f"       📊 Total: {total_params} parameters, Rate: {rate_limit}, ETA: {est_minutes:.1f} min\n", 'data')
-                                self._script_log(f"       🔄 Polling for progress (this may take a while)...\n\n", 'info')
-                                
-                                # Poll logs for progress
-                                self._poll_test_progress()
-                        else:
-                            self._script_log(f"    ✓ SUCCESS: {actual_value}\n", 'success')
-                        
-                        # Try to extract instance number for ADD or GetInstances commands
-                        if 'add' in cmd.lower() or 'get_instances' in cmd.lower():
-                            # Try to extract from response dict first
-                            instance_num = self._extract_instance_number(resp, cmd)
-                            if instance_num:
-                                self.script_variables['INSTANCE'] = instance_num
-                                self._script_log(f"    → Saved INSTANCE={instance_num}\n", 'info')
-                        
-                        # Check expected value if specified
-                        if expected_value:
-                            actual_str = str(actual_value).strip()
-                            expected_str = expected_value.strip()
-                            
-                            if expected_str.lower() in actual_str.lower():
-                                self._script_log(f"    ✓ ASSERTION PASSED\n", 'success')
-                                executed += 1
-                            else:
-                                self._script_log(f"    ✗ ASSERTION FAILED\n", 'error')
-                                self._script_log(f"      Expected: {expected_str}\n", 'error')
-                                self._script_log(f"      Got: {actual_str}\n", 'error')
-                                failed += 1
-                        else:
-                            executed += 1
-                    else:
-                        error_msg = resp.get('msg', 'Unknown error') if resp else 'No response'
-                        self._script_log(f"    ✗ FAILED: {error_msg}\n", 'error')
-                        failed += 1
-                except Exception as e:
-                    self._script_log(f"    ✗ ERROR: {e}\n", 'error')
-                    failed += 1
-                
-                time.sleep(0.5)  # Delay between commands
-            
-            # Summary
-            self._script_log(f"\n{'='*60}\n", 'info')
-            self._script_log(f"[SUMMARY]\n", 'info')
-            self._script_log(f"  Executed: {executed}\n", 'success')
-            self._script_log(f"  Failed:   {failed}\n", 'error' if failed > 0 else 'info')
-            self._script_log(f"{'='*60}\n", 'info')
-            
-            self.lbl_script_status.config(text=f"Completed: {executed} success, {failed} failed")
-            
-        except Exception as e:
-            self._script_log(f"\n[ERROR] Failed to run script: {e}\n", 'error')
-            self.lbl_script_status.config(text="Error occurred")
-        finally:
-            # Clean up temporary files
+
+        dbg_str = self.cfg_debug_level_var.get().split()[0]
+        dbg_val = int(dbg_str) if dbg_str.isdigit() else 1
+
+        cfg_path = Path(__file__).parent / "config.json"
+        data = {}
+        if cfg_path.exists():
             try:
-                self._script_log(f"\n[Cleanup] Clearing temporary files...\n", 'info')
-                cleanup_resp = self.ipc.send_command("clear_temp")
-                if cleanup_resp and cleanup_resp.get('status') == 'ok':
-                    self._script_log(f"    ✓ {cleanup_resp.get('msg', 'Temp files cleared')}\n", 'success')
-                else:
-                    self._script_log(f"    ⚠ {cleanup_resp.get('msg', 'Failed to clear temp files')}\n", 'error')
-            except Exception as cleanup_error:
-                self._script_log(f"    ⚠ Cleanup error: {cleanup_error}\n", 'error')
-            
-            self.script_running = False
-            self.btn_run_script.configure(state='normal')
-            self.btn_stop_script.configure(state='disabled')
-            self.script_progress.stop()
-    
-    def _extract_instance_number(self, response, cmd):
-        """Extract instance number from add/get_instances response"""
-        import re
-        
-        # For response dict with 'instances' key (from GetInstances)
-        if isinstance(response, dict) and 'instances' in response:
-            instances = response.get('instances', [])
-            if instances:
-                # Return the last instance (usually the most recently created)
-                return instances[-1]
-        
-        # For response text
-        response_msg = response.get('msg', '') if isinstance(response, dict) else str(response)
-        
-        # For ADD responses, look for "created instance X"
-        if 'instance' in response_msg.lower():
-            match = re.search(r'instance[:\s]+(\d+)', response_msg, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        
-        # Extract path from command to look for instance numbers
-        cmd_parts = cmd.split()
-        if len(cmd_parts) >= 3:
-            path = cmd_parts[2]
-            # For GetInstances, try to find instance number in response
-            # Look for pattern like "Pool.2." in the response
-            if path.endswith('.'):
-                base_obj = path.rstrip('.')
-                pattern = re.escape(base_obj) + r'\.(\d+)\.'
-                match = re.search(pattern, response_msg)
-                if match:
-                    return match.group(1)
-        
-        return None
-    
-    def _discover_bridge_port_inline(self, endpoint, bridge_alias, port_alias):
-        """Discover Bridge/Port and save to script variables"""
-        import re
-        
-        self._script_log(f"    [DISCOVER] Finding Bridge (Alias='{bridge_alias}') and Port (Alias='{port_alias}')...\n", 'info')
-        
-        # Find Bridge
-        bridge_inst = self._find_bridge_inst(endpoint, bridge_alias)
-        if not bridge_inst:
-            self._script_log(f"    [FAILED] Could not find Bridge with Alias='{bridge_alias}'\n", 'error')
-            return False
-        
-        # Find Port
-        port_inst = self._find_port_inst(endpoint, bridge_inst, port_alias)
-        if not port_inst:
-            self._script_log(f"    [FAILED] Could not find Port with Alias='{port_alias}'\n", 'error')
-            return False
-        
-        # Save to variables
-        self.script_variables['BRIDGE_INST'] = bridge_inst
-        self.script_variables['PORT_INST'] = port_inst
-        
-        self._script_log(f"    [SUCCESS] Discovery completed:\n", 'success')
-        self._script_log(f"      BRIDGE_INST = {bridge_inst}\n", 'info')
-        self._script_log(f"      PORT_INST = {port_inst}\n", 'info')
-        self._script_log(f"      Full path: Device.Bridging.Bridge.{bridge_inst}.Port.{port_inst}.\n", 'info')
-        
-        return True
-    
-    def _find_bridge_inst(self, endpoint, target_alias):
-        """Find Bridge instance by Alias"""
-        import re
-        
-        # Try Search Path
-        cmd = f'get {endpoint} Device.Bridging.Bridge.[Alias="{target_alias}"].'
-        resp = self.ipc.send_command(cmd)
-        if resp and resp.get('status') == 'ok' and resp.get('msg'):
-            msg = resp.get('msg', '')
-            match = re.search(r'Device\.Bridging\.Bridge\.(\d+)\.', msg)
-            if match:
-                return match.group(1)
-        
-        # Fallback: Get all instances
-        cmd = f'get_instances {endpoint} Device.Bridging.Bridge.'
-        resp = self.ipc.send_command(cmd)
-        if not resp or resp.get('status') != 'ok':
-            return None
-        
-        instances = re.findall(r'Device\.Bridging\.Bridge\.(\d+)\.', resp.get('msg', ''))
-        
-        for inst in instances:
-            cmd = f'get {endpoint} Device.Bridging.Bridge.{inst}.Alias'
-            resp = self.ipc.send_command(cmd)
-            if resp and resp.get('status') == 'ok':
-                msg = resp.get('msg', '')
-                if f'={target_alias}' in msg or f'= {target_alias}' in msg:
-                    return inst
-        
-        return None
-    
-    def _find_port_inst(self, endpoint, bridge_inst, target_alias):
-        """Find Port instance by Alias"""
-        import re
-        
-        # Try Search Path
-        cmd = f'get {endpoint} Device.Bridging.Bridge.{bridge_inst}.Port.[Alias="{target_alias}"].'
-        resp = self.ipc.send_command(cmd)
-        if resp and resp.get('status') == 'ok' and resp.get('msg'):
-            msg = resp.get('msg', '')
-            match = re.search(r'\.Port\.(\d+)\.', msg)
-            if match:
-                return match.group(1)
-        
-        # Fallback: Get all instances
-        cmd = f'get_instances {endpoint} Device.Bridging.Bridge.{bridge_inst}.Port.'
-        resp = self.ipc.send_command(cmd)
-        if not resp or resp.get('status') != 'ok':
-            return None
-        
-        instances = re.findall(r'\.Port\.(\d+)\.', resp.get('msg', ''))
-        
-        for inst in instances:
-            cmd = f'get {endpoint} Device.Bridging.Bridge.{bridge_inst}.Port.{inst}.Alias'
-            resp = self.ipc.send_command(cmd)
-            if resp and resp.get('status') == 'ok':
-                msg = resp.get('msg', '')
-                if f'={target_alias}' in msg or f'= {target_alias}' in msg:
-                    return inst
-        
-        return None
-    
-    def _parse_script_line(self, line):
-        """Parse script line into IPC command"""
-        # Check for expected value assertion
-        expected_value = None
-        if '# expect:' in line or '# EXPECT:' in line:
-            parts_split = line.split('#')
-            line = parts_split[0].strip()
-            expect_part = parts_split[1].strip()
-            if expect_part.lower().startswith('expect:'):
-                expected_value = expect_part[7:].strip()
-        
-        # Check for new cache-based test commands and special parameters
-        parts = line.split(maxsplit=1)
-        if len(parts) >= 1:
-            cmd = parts[0].lower()
-            
-            # Commands that work directly with the full line
-            if cmd in ['list_writable', 'clear_cache', 'test_set', 'test_set_all', 'export_cache']:
-                # These commands are passed directly to IPC
-                return (line, expected_value)
-            
-            # Commands with special parameters
-            if cmd in ['get', 'get_instances'] and '--timeout' in line:
-                return (line, expected_value)
-            
-            if cmd == 'get_supported' and ('false' in line.lower() or 'true' in line.lower()):
-                return (line, expected_value)
-        
-        # Parse standard command format
-        parts = line.split(maxsplit=3)
-        if len(parts) < 3:
-            return None
-        
-        cmd = parts[0].lower()
-        endpoint = parts[1]
-        path = parts[2]
-        value = parts[3] if len(parts) > 3 else ""
-        
-        if cmd in ['get', 'get_supported', 'get_instances', 'add', 'delete']:
-            return (f"{cmd} {endpoint} {path}", expected_value)
-        elif cmd == 'set':
-            # SET command requires a value
-            if len(parts) < 4 or not value.strip():
-                self._script_log(f"    [WARNING] SET command missing value\n", 'error')
-                return None
-            return (f"{cmd} {endpoint} {path} {value}", expected_value)
-        else:
-            self._script_log(f"    [WARNING] Unknown command: {cmd}\n", 'error')
-            return None
-    
-    def _script_log(self, text, tag='info'):
-        """Append text to script log with tag"""
-        self.txt_script_log.configure(state='normal')
-        self.txt_script_log.insert(tk.END, text, tag)
-        self.txt_script_log.see(tk.END)
-        self.txt_script_log.configure(state='disabled')
-
-    def _poll_test_progress(self):
-        """Poll daemon logs for test_set_all progress and display in script log"""
-        import time
-        
-        completed = False
-        last_id = self.last_log_id
-        poll_count = 0
-        max_polls = 7200  # Max 1 hour (7200 * 0.5s = 3600s)
-        
-        while not completed and poll_count < max_polls and self.script_running:
-            poll_count += 1
-            
-            try:
-                # Poll logs from daemon
-                resp = self.ipc.send_command(f"poll_logs {last_id}")
-                
-                if resp and resp.get("status") == "ok":
-                    logs = resp.get("logs", [])
-                    new_last_id = resp.get("last_id", last_id)
-                    
-                    # Process each log entry
-                    for log in logs:
-                        msg = log.get('msg', '')
-                        log_id = log.get('id', 0)
-                        
-                        # Check for test-related messages
-                        is_test_msg = (
-                            '[Test]' in msg or 
-                            '[Progress]' in msg or 
-                            '[TestSetAll]' in msg or
-                            (msg.strip().startswith('✓') and '[' in msg and '/' in msg) or
-                            (msg.strip().startswith('✗') and '[' in msg and '/' in msg)
-                        )
-                        
-                        if is_test_msg:
-                            # Display in script log
-                            if '[Test]' in msg and 'completed' in msg:
-                                self._script_log(f"       {msg}\n", 'success')
-                                completed = True
-                            elif '[Test]' in msg and 'Results:' in msg:
-                                self._script_log(f"       {msg}\n", 'data')
-                            elif '[Progress]' in msg:
-                                self._script_log(f"       {msg}\n", 'info')
-                            elif msg.strip().startswith('✓'):
-                                self._script_log(f"       {msg}\n", 'success')
-                            elif msg.strip().startswith('✗'):
-                                self._script_log(f"       {msg}\n", 'error')
-                            else:
-                                self._script_log(f"       {msg}\n", 'info')
-                        
-                        # Update last processed log id
-                        if log_id > last_id:
-                            last_id = log_id
-                    
-                    # Update global last_log_id
-                    if new_last_id > self.last_log_id:
-                        self.last_log_id = new_last_id
-                
-            except Exception as e:
-                # Continue polling even on error
-                pass
-            
-            # Sleep before next poll
-            time.sleep(0.5)
-        
-        # Final check if we timed out
-        if not completed and poll_count >= max_polls:
-            self._script_log(f"       ⚠ Timeout waiting for test completion (1 hour limit)\n", 'error')
-        elif not completed and not self.script_running:
-            self._script_log(f"       ⚠ Test interrupted by user\n", 'error')
-        else:
-            self._script_log(f"\n", 'info')
-
-    def _get_tag_for_type(self, log_type):
-        """Return color tag for log type"""
-        if log_type == 'error' or log_type == 'critical': return 'error'
-        if log_type == 'usp': return 'usp'
-        if log_type == 'data': return 'data'
-        if log_type == 'success': return 'success'
-        if log_type == 'detail': return 'detail'
-        return 'info'
-
-    def _setup_log_tags(self):
-        self.txt_log.tag_config('error', foreground='red')
-        self.txt_log.tag_config('usp', foreground='blue')
-        self.txt_log.tag_config('data', foreground='darkgreen')
-        self.txt_log.tag_config('success', foreground='green')
-        self.txt_log.tag_config('detail', foreground='gray')
-        self.txt_log.tag_config('info', foreground='black')
-
-    def _append_log(self, time_str, log_type, msg):
-        self.txt_log.configure(state='normal')
-        tag = self._get_tag_for_type(log_type)
-        self.txt_log.insert(tk.END, f"[{time_str}] ", 'info')
-        self.txt_log.insert(tk.END, f"{msg}\n", tag)
-        if self.var_autoscroll.get():
-            self.txt_log.see(tk.END)
-        self.txt_log.configure(state='disabled')
-        
-        # Also update broker log if it's broker-related message
-        if 'broker' in msg.lower() or 'stomp' in msg.lower() or 'connect' in msg.lower():
-            try:
-                self.txt_broker_log.configure(state='normal')
-                self.txt_broker_log.insert(tk.END, f"[{time_str}] {msg}\n")
-                # Keep only last 4 lines
-                line_count = int(self.txt_broker_log.index('end-1c').split('.')[0])
-                if line_count > 4:
-                    self.txt_broker_log.delete('1.0', f'{line_count-4}.0')
-                self.txt_broker_log.see(tk.END)
-                self.txt_broker_log.configure(state='disabled')
-            except:
+                with open(cfg_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception:
                 pass
 
-    def _clear_logs(self):
-        self.txt_log.configure(state='normal')
-        self.txt_log.delete(1.0, tk.END)
-        self.txt_log.configure(state='disabled')
+        if "usp_controller" not in data:
+            data["usp_controller"] = {}
 
-    def _on_action_change(self, event):
-        action = self.cb_action.get()
-        if action in ["GET", "ADD", "DELETE", "GetSupportedDM", "GetInstances"]:
-            self.ent_value.configure(state='disabled')
-        else:
-            self.ent_value.configure(state='normal')
+        data["usp_controller"]["broker_host"] = host
+        data["usp_controller"]["broker_port"] = port
+        data["usp_controller"]["username"] = user
+        data["usp_controller"]["password"] = pwd
+        data["usp_controller"]["controller_endpoint_id"] = ctrl_id
+        data["usp_controller"]["receive_topic"] = rx_topic
+        data["usp_controller"]["debug_level"] = dbg_val
+        data["usp_controller"]["auto_register_devices"] = self.cfg_auto_register_var.get()
+        data["usp_controller"]["enable_mdns_discovery"] = self.cfg_mdns_var.get()
 
-    def _on_device_select(self, event):
-        selection = self.tree_devices.selection()
-        if selection:
-            item_id = selection[0]
-            # Get the endpoint ID from the item
-            ep_id = self.tree_devices.item(item_id, "text")
-            # Set endpoint from device list
-            if ep_id in self.cb_endpoint['values']:
-                self.cb_endpoint.set(ep_id)
-            else:
-                # If not in list, refresh and try again
-                self._refresh_devices()
-                if ep_id in self.cb_endpoint['values']:
-                    self.cb_endpoint.set(ep_id)
+        if "ipc" not in data:
+            data["ipc"] = {}
+        data["ipc"]["port"] = ipc_port
 
-    def _poll_status_loop(self):
-        # Legacy: handled by background thread now
-        pass
+        try:
+            with open(cfg_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            if hasattr(self, 'lbl_cfg_save_status'):
+                self.lbl_cfg_save_status.config(text=f"✅ 已成功儲存設定至 config.json (目標 Broker: {host}:{port})", foreground="#059669")
+        except Exception as e:
+            if hasattr(self, 'lbl_cfg_save_status'):
+                self.lbl_cfg_save_status.config(text=f"❌ 儲存失敗: {e}", foreground="#dc2626")
 
-    def _poll_logs_loop(self):
-        # Legacy: handled by background thread now
-        pass
-    
-    def _background_poller(self):
-        """Thread that handles all network IO"""
-        last_status_time = 0
-        
-        while self.polling:
-            now = time.time()
-            
-            # 1. Poll Status every 5 seconds
-            if now - last_status_time > 5:
-                try:
-                    resp = self.ipc.send_command("status")
-                    if resp and resp.get("status") == "ok":
-                        # Also fetch devices if connected
-                        dev_resp = self.ipc.send_command("devices")
-                        if dev_resp and dev_resp.get("status") == "ok":
-                            resp['devices'] = dev_resp.get('devices')
-                    self.status_queue.put(resp)
-                except Exception as e:
-                    self.status_queue.put(None)
-                last_status_time = now
-            
-            # 2. Poll Logs every 0.5 seconds
+    def on_test_broker_conn_clicked(self):
+        """Test TCP connection to the specified Broker host and port"""
+        host = self.cfg_broker_host_var.get().strip()
+        port_str = self.cfg_broker_port_var.get().strip()
+        try:
+            port = int(port_str)
+        except ValueError:
+            self.lbl_broker_test_result.config(text="⚠️ 通訊埠必須為數字。", foreground="#dc2626")
+            return
+
+        self.lbl_broker_test_result.config(text=f"正在測試連線至 {host}:{port} ...", foreground="#0284c7")
+        self.root.update_idletasks()
+
+        def do_test():
+            t0 = time.time()
             try:
-                resp = self.ipc.send_command(f"poll_logs {self.last_log_id}")
-                if resp and resp.get("status") == "ok":
-                    self.log_queue.put(resp)
-            except:
-                pass
-                
-            time.sleep(0.5)
-
-    def _process_queues(self):
-        """Main thread function to update UI from queues"""
-        
-        # Handle Logs (limit processing per cycle to keep UI responsive)
-        logs_processed = 0
-        max_logs_per_cycle = 50  # Process max 50 logs per cycle
-        try:
-            while logs_processed < max_logs_per_cycle:
-                # Get all available log updates without blocking
-                log_data = self.log_queue.get_nowait()
-                logs = log_data.get("logs", [])
-                last_id = log_data.get("last_id", -1)
-                
-                if logs:
-                    self._setup_log_tags()
-                    for log in logs:
-                        self._append_log(log['time'], log['type'], log['msg'])
-                        if log['id'] > self.last_log_id:
-                            self.last_log_id = log['id']
-                        logs_processed += 1
-                        if logs_processed >= max_logs_per_cycle:
-                            break
-                elif last_id > self.last_log_id:
-                    self.last_log_id = last_id
-        except queue.Empty:
-            pass
-            
-        # Handle Status
-        try:
-            status_data = self.status_queue.get_nowait()
-            self._update_status_ui(status_data)
-        except queue.Empty:
-            pass
-            
-        # Schedule next check
-        self.root.after(100, self._process_queues)
-
-    def _update_status_ui(self, resp):
-        if resp and resp.get("status") == "ok":
-            connected = resp.get("connected", False)
-            cnt = resp.get("devices_count", 0)
-            status_text = f"Connected to Daemon | Broker: {'UP' if connected else 'DOWN'} | Devices: {cnt}"
-            self.lbl_status.config(text=status_text, foreground="green")
-            
-            # Update subscriptions display
-            subscriptions = resp.get("subscriptions", [])
-            if subscriptions:
-                subs_text = "\n".join(f"  • {sub}" for sub in subscriptions)
-                self.lbl_subscriptions.config(text=subs_text)
-            else:
-                self.lbl_subscriptions.config(text="  (No active subscriptions)", foreground="gray")
-            
-            # Update broker status labels
-            broker_status = "🟢 Connected" if connected else "🔴 Disconnected"
-            self.lbl_broker_conn.config(text=f"Connection: {broker_status}", 
-                                       foreground="green" if connected else "red")
-            
-            # Update device list with status
-            devices = resp.get("devices", {})
-            
-            # Get current items
-            current_items = {self.tree_devices.item(item, "text"): item for item in self.tree_devices.get_children()}
-            
-            # Save current selection
-            selected = None
-            cur_sel = self.tree_devices.selection()
-            if cur_sel:
-                selected = self.tree_devices.item(cur_sel[0], "text")
-            
-            # Update or add devices
-            for ep_id, info in devices.items():
-                status = info.get('status', 'unknown')
-                status_text = status.upper()
-                
-                if ep_id in current_items:
-                    # Update existing item
-                    item_id = current_items[ep_id]
-                    self.tree_devices.item(item_id, values=(status_text,))
-                else:
-                    # Add new item
-                    self.tree_devices.insert("", "end", text=ep_id, values=(status_text,))
-            
-            # Remove devices that no longer exist
-            for ep_id, item_id in current_items.items():
-                if ep_id not in devices:
-                    self.tree_devices.delete(item_id)
-            
-            # Restore selection if still exists
-            if selected:
-                for item in self.tree_devices.get_children():
-                    if self.tree_devices.item(item, "text") == selected:
-                        self.tree_devices.selection_set(item)
-                        break
-        else:
-            self.lbl_status.config(text="Daemon Disconnected (Is it running?)", foreground="red")
-    
-    def _force_refresh(self):
-        # Only triggers an immediate status poll in the next thread loop
-        # For now, just a placeholder as the thread loops automatically
-        pass
-    
-    # ===== Embedded Broker Controls =====
-    
-    def _start_broker(self):
-        """Start embedded STOMP broker"""
-        if not BROKER_AVAILABLE:
-            messagebox.showerror("Error", "Embedded broker module not found!")
-            return
-        
-        if self.broker_running:
-            messagebox.showinfo("Info", "Broker is already running")
-            return
-        
-        # 检查端口是否可用
-        if hasattr(EmbeddedBroker, 'is_port_available'):
-            if not EmbeddedBroker.is_port_available(self.mini_broker_port, self.mini_broker_host):
-                # 查找占用进程
-                process_info = "未知进程"
-                if hasattr(EmbeddedBroker, 'find_process_on_port'):
-                    process_info = EmbeddedBroker.find_process_on_port(self.mini_broker_port)
-                
-                error_msg = (
-                    f"端口 {self.mini_broker_port} 已被占用！\n\n"
-                    f"占用进程: {process_info}\n\n"
-                    f"解决方案：\n"
-                    f"1. 打开命令提示符（管理员）\n"
-                    f"2. 查找占用进程：\n"
-                    f"   netstat -ano | findstr :{self.mini_broker_port}\n"
-                    f"3. 终止进程：\n"
-                    f"   taskkill /PID <PID> /F\n\n"
-                    f"或使用其他端口启动 broker"
-                )
-                
-                messagebox.showerror("端口被占用", error_msg)
-                return
-        
-        try:
-            # Confirm action
-            if not messagebox.askyesno("Start Broker", 
-                                       f"Start embedded STOMP broker on {self.mini_broker_host}:{self.mini_broker_port}?\n\n"
-                                       "⚠ This is for development/testing only!\n"
-                                       "Use ActiveMQ/RabbitMQ for production."):
-                return
-            
-            # Create and start broker
-            self.embedded_broker = EmbeddedBroker(host=self.mini_broker_host, port=self.mini_broker_port)
-            
-            # Start in background thread
-            def start_broker_thread():
-                try:
-                    self.embedded_broker.start()
-                    self.broker_running = True
-                    
-                    # Update UI
-                    self.root.after(0, self._update_broker_ui_running)
-                    
-                    # 成功消息
-                    self.root.after(0, lambda: messagebox.showinfo(
-                        "Broker Started", 
-                        f"Embedded broker started on {self.mini_broker_host}:{self.mini_broker_port}\n\n"
-                        f"Connect string: stomp://127.0.0.1:{self.mini_broker_port}\n\n"
-                        f"Now start the daemon:\n"
-                        f"python usp_controller.py --daemon"
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(3.0)
+                res = s.connect_ex((host, port))
+                s.close()
+                elapsed = round((time.time() - t0) * 1000, 1)
+                if res == 0:
+                    self.root.after(0, lambda: self.lbl_broker_test_result.config(
+                        text=f"✅ 連線成功！{host}:{port} 可正常通訊 (延遲: {elapsed} ms)",
+                        foreground="#059669"
                     ))
-                    
-                except PermissionError as e:
-                    self.broker_running = False
-                    error_msg = (
-                        "权限错误 (WinError 10013)\n\n"
-                        f"无法绑定端口 {self.mini_broker_port}\n\n"
-                        "解决方案：\n"
-                        "1. 以管理员身份运行程序\n"
-                        "2. 使用大于 1024 的端口\n"
-                        "3. 检查防火墙设置\n\n"
-                        f"详细错误: {str(e)}"
-                    )
-                    self.root.after(0, lambda: messagebox.showerror("权限错误", error_msg))
-                
-                except OSError as e:
-                    self.broker_running = False
-                    if '10013' in str(e) or 'WinError 10013' in str(e):
-                        error_msg = (
-                            "端口访问被拒绝 (WinError 10013)\n\n"
-                            f"端口 {self.mini_broker_port} 可能被占用或受限\n\n"
-                            "解决方案：\n"
-                            "1. 以管理员身份运行\n"
-                            "2. 检查是否有其他程序占用端口\n"
-                            "3. 尝试使用其他端口（如 61614）\n"
-                            "4. 检查防火墙设置\n\n"
-                            "快速检查端口占用：\n"
-                            f"netstat -ano | findstr :{self.mini_broker_port}\n\n"
-                            f"详细错误: {str(e)}"
-                        )
-                    else:
-                        error_msg = f"Failed to start broker:\n\n{str(e)}"
-                    
-                    self.root.after(0, lambda: messagebox.showerror("Broker Error", error_msg))
-                
-                except Exception as e:
-                    self.broker_running = False
-                    self.root.after(0, lambda: messagebox.showerror("Broker Error", f"Unexpected error:\n{str(e)}"))
-            
-            threading.Thread(target=start_broker_thread, daemon=True).start()
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to create broker:\n{e}")
-    
-    def _stop_broker(self):
-        """Stop embedded STOMP broker"""
-        if not self.broker_running or not self.embedded_broker:
-            messagebox.showinfo("Info", "Broker is not running")
-            return
-        
+                else:
+                    self.root.after(0, lambda: self.lbl_broker_test_result.config(
+                        text=f"❌ 連線失敗！無法連接 {host}:{port} (錯誤代碼: {res})",
+                        foreground="#dc2626"
+                    ))
+            except Exception as e:
+                self.root.after(0, lambda: self.lbl_broker_test_result.config(
+                    text=f"❌ 連線異常: {e}",
+                    foreground="#dc2626"
+                ))
+
+        threading.Thread(target=do_test, daemon=True).start()
+
+    def on_restart_controller_clicked(self):
+        """Restart Controller daemon process to apply new config.json"""
+        if hasattr(self, 'lbl_cfg_save_status'):
+            self.lbl_cfg_save_status.config(text="🚀 正在重新啟動 Controller 守護進程...", foreground="#7c3aed")
         try:
-            # Confirm action
-            if not messagebox.askyesno("Stop Broker", "Stop embedded broker?"):
-                return
-            
-            # Stop broker
-            self.embedded_broker.stop()
-            self.broker_running = False
-            self.embedded_broker = None
-            
-            # Update UI
-            self._update_broker_ui_stopped()
-            
-            messagebox.showinfo("Broker Stopped", "Embedded broker has been stopped")
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to stop broker:\n{e}")
-    
-    def _update_broker_ui_running(self):
-        """Update UI when broker is running"""
-        if hasattr(self, 'lbl_broker_status'):
-            self.lbl_broker_status.config(text="🟢 Running", foreground="green")
-            self.btn_broker_start.config(state="disabled")
-            self.btn_broker_stop.config(state="normal")
-    
-    def _update_broker_ui_stopped(self):
-        """Update UI when broker is stopped"""
-        if hasattr(self, 'lbl_broker_status'):
-            self.lbl_broker_status.config(text="⚪ Stopped", foreground="gray")
-            self.btn_broker_start.config(state="normal")
-            self.btn_broker_stop.config(state="disabled")
-    
-    def _show_broker_warning(self):
-        """Show warning if mini-broker is enabled but not running"""
-        result = messagebox.showwarning(
-            "Mini-Broker 未运行",
-            f"检测到 Mini-Broker 已启用但未运行！\n\n"
-            f"Broker 地址: {self.mini_broker_host}:{self.mini_broker_port}\n\n"
-            f"在发送 USP 命令前，需要先启动 Mini-Broker。\n"
-            f"请点击界面上方的 '▶ Start Broker' 按钮。\n\n"
-            f"注意：Daemon 也需要使用相同的 broker 配置。",
-            icon='warning'
+            self.ipc_client.shutdown_daemon()
+        except Exception:
+            pass
+        time.sleep(0.6)
+        self.launch_daemon_black_window()
+        if hasattr(self, 'lbl_cfg_save_status'):
+            self.lbl_cfg_save_status.config(text="🚀 已啟動 Controller 黑窗！將自動連線至目標 Broker", foreground="#059669")
+
+
+    def on_show_dut_guide_clicked(self):
+        """Open a dedicated dialog presenting DUT TR-181 DataModel setup recommendations"""
+        from usp_controller.device.dut_generator import DUTConfigGenerator, get_host_lan_ip
+        from usp_controller.config import ConfigManager
+
+        top = tk.Toplevel(self.root)
+        top.title("📖 DUT (USP Agent) TR-181 DataModel 連線設定方向指南")
+        top.geometry("860x640")
+        top.minsize(700, 500)
+        top.configure(bg="#f8fafc")
+
+        # Top Bar
+        header = ttk.Frame(top, padding=12)
+        header.pack(fill=tk.X)
+
+        ttk.Label(header, text="💡 DUT 連線設定指南生成器", font=("Segoe UI", 12, "bold"), foreground="#0369a1").pack(anchor=tk.W)
+        ttk.Label(header, text="協助測試工程師快速了解外部 DUT 應設定哪些 TR-181 參數與建議數值以連上 Controller 與 Broker (Broker IP 預設自動帶入本機對外實體 LAN IP)", foreground="#64748b").pack(anchor=tk.W)
+
+        # Controls Row
+        ctrl_row = ttk.Frame(top, padding=(12, 4))
+        ctrl_row.pack(fill=tk.X)
+
+        default_agent = self.active_device_id or "proto::agent.001"
+        agent_id_var = tk.StringVar(value=default_agent)
+        fmt_var = tk.StringVar(value="📖 完整方向指南與參數說明")
+
+        # Resolve initial broker host (auto-resolve loopback to LAN IP)
+        init_cfg = None
+        try:
+            init_cfg = ConfigManager.load_config("config.json")
+        except Exception:
+            pass
+
+        cfg_b_host = getattr(getattr(init_cfg, 'transport', None), 'host', '127.0.0.1') if init_cfg else '127.0.0.1'
+        if cfg_b_host in ['127.0.0.1', 'localhost', '0.0.0.0', '::1', '']:
+            default_broker_host = get_host_lan_ip()
+        else:
+            default_broker_host = cfg_b_host
+
+        broker_host_var = tk.StringVar(value=default_broker_host)
+
+        ttk.Label(ctrl_row, text="DUT Agent ID:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        ent_agent = ttk.Entry(ctrl_row, textvariable=agent_id_var, width=18)
+        ent_agent.pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Label(ctrl_row, text="Broker 對外 IP:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        ent_broker = ttk.Entry(ctrl_row, textvariable=broker_host_var, width=16)
+        ent_broker.pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Label(ctrl_row, text="展示格式:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        cb_fmt = ttk.Combobox(
+            ctrl_row,
+            textvariable=fmt_var,
+            values=[
+                "📖 完整方向指南與參數說明",
+                "📜 TR-181 原生參數清單 (快速複製)",
+                "🌐 OpenWrt / prplOS (UCI 指令)",
+                "⚡ 一鍵 Shell 腳本 (setup_dut.sh)",
+                "🐧 Broadband Forum (OB-USP-Agent)",
+                "📄 JSON DataModel Profile"
+            ],
+            state="readonly",
+            width=28
         )
-    
-    def _on_closing(self):
-        """Handle window close event"""
-        # Stop broker if running
-        if self.broker_running and self.embedded_broker:
+        cb_fmt.pack(side=tk.LEFT, padx=(0, 8))
+
+        # Text Display Area
+        txt_frame = ttk.Frame(top, padding=12)
+        txt_frame.pack(fill=tk.BOTH, expand=True)
+
+        txt_guide = scrolledtext.ScrolledText(
+            txt_frame,
+            wrap=tk.WORD,
+            font=("Consolas", 10),
+            background="#0f172a",
+            foreground="#f8fafc",
+            relief="flat",
+            padx=10,
+            pady=10
+        )
+        txt_guide.pack(fill=tk.BOTH, expand=True)
+
+        def update_content(*args):
+            dut_id = agent_id_var.get().strip() or "proto::agent.001"
+            selected_fmt = fmt_var.get()
+            custom_b_host = broker_host_var.get().strip() or None
+
+            # Load latest config
+            cfg = None
             try:
-                print("Stopping embedded broker...")
-                self.embedded_broker.stop()
-            except:
+                cfg = ConfigManager.load_config("config.json")
+            except Exception:
                 pass
-        
-        # Stop polling
-        self.polling = False
-        
-        # Destroy window
+
+            if "完整方向指南" in selected_fmt:
+                text = DUTConfigGenerator.generate_guide(cfg, dut_endpoint_id=dut_id, broker_host=custom_b_host)
+            elif "TR-181" in selected_fmt:
+                text = DUTConfigGenerator.generate_tr181_commands(cfg, dut_endpoint_id=dut_id, broker_host=custom_b_host)
+            elif "OpenWrt" in selected_fmt:
+                text = DUTConfigGenerator.generate_openwrt_uci(cfg, dut_endpoint_id=dut_id, broker_host=custom_b_host)
+            elif "Shell" in selected_fmt:
+                text = DUTConfigGenerator.generate_shell_script(cfg, dut_endpoint_id=dut_id, broker_host=custom_b_host)
+            elif "OB-USP-Agent" in selected_fmt:
+                text = DUTConfigGenerator.generate_obuspa_config(cfg, dut_endpoint_id=dut_id, broker_host=custom_b_host)
+            elif "JSON" in selected_fmt:
+                text = DUTConfigGenerator.generate_json_profile(cfg, dut_endpoint_id=dut_id, broker_host=custom_b_host)
+            else:
+                text = DUTConfigGenerator.generate_guide(cfg, dut_endpoint_id=dut_id, broker_host=custom_b_host)
+
+            txt_guide.delete("1.0", tk.END)
+            txt_guide.insert(tk.END, text)
+
+        agent_id_var.trace_add("write", update_content)
+        broker_host_var.trace_add("write", update_content)
+        fmt_var.trace_add("write", update_content)
+        update_content()
+
+
+        # Bottom Buttons
+        btn_bar = ttk.Frame(top, padding=(12, 10))
+        btn_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+        def copy_to_clipboard():
+            content = txt_guide.get("1.0", tk.END).strip()
+            top.clipboard_clear()
+            top.clipboard_append(content)
+            messagebox.showinfo("已複製", "✅ 設定指南已成功複製至剪貼簿！", parent=top)
+
+        def save_to_file():
+            from tkinter import filedialog
+            content = txt_guide.get("1.0", tk.END).strip()
+            fpath = filedialog.asksaveasfilename(
+                title="另存設定指南檔案",
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("Shell Scripts", "*.sh"), ("All files", "*.*")],
+                parent=top
+            )
+            if fpath:
+                try:
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    messagebox.showinfo("成功", f"✅ 已成功儲存至: {fpath}", parent=top)
+                except Exception as ex:
+                    messagebox.showerror("錯誤", f"儲存檔案失敗: {ex}", parent=top)
+
+        ttk.Button(btn_bar, text="📋 複製到剪貼簿", style="Primary.TButton", command=copy_to_clipboard).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_bar, text="💾 另存為檔案...", command=save_to_file).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_bar, text="關閉", command=top.destroy).pack(side=tk.RIGHT)
+
+    # ==========================================
+    # Event Handlers & IPC Logic
+    # ==========================================
+
+
+    def _periodic_daemon_polling(self):
+        """Periodic background status & log polling"""
+        while self.polling_running:
+            try:
+
+                alive = self.ipc_client.is_daemon_alive(timeout=0.3)
+                if alive:
+                    st = self.ipc_client.get_status()
+                    devs, active = self.ipc_client.get_devices()
+                    logs = self.ipc_client.get_logs(since_id=self.last_log_id, max_count=25) if self.auto_refresh_logs.get() else []
+                    self.root.after(0, lambda s=st, d=devs, a=active, l=logs: self._update_gui_from_poll(s, d, a, l))
+                else:
+                    self.root.after(0, self._update_gui_offline)
+            except Exception:
+                pass
+            time.sleep(1.5)
+
+    def _update_gui_from_poll(self, status: dict, devices: list, active: str, logs: list):
+        self.cached_devices = devices
+        self.active_device_id = active
+
+        d_info = status.get("daemon", {})
+        pid = d_info.get("pid", "-")
+        uptime = d_info.get("uptime", 0)
+
+        b_info = status.get("broker", {})
+        b_conn = b_info.get("connected", False)
+        b_state = b_info.get("state", "CONNECTED" if b_conn else "DISCONNECTED")
+        b_info = status.get("broker", {})
+        b_conn = b_info.get("connected", False)
+        b_state = b_info.get("state", "CONNECTED" if b_conn else "DISCONNECTED")
+        b_host = b_info.get("host", "127.0.0.1")
+        b_port = b_info.get("port", 61614)
+        rx_topic = b_info.get("receive_topic", "/queue/usp.controller.default")
+        reply_q = b_info.get("reply_to_queue", "/queue/proto::controller.default")
+        subs = b_info.get("subscriptions", [])
+
+        p_info = status.get("ports", {})
+        b_listening = check_port_listening(b_host, b_port, timeout=0.1)
+
+        # Update Top Header
+        conn_str = f"🟢 {b_state}" if b_conn else f"🔴 {b_state}"
+        self.lbl_header_status.config(
+            text=f"Controller: 🟢 RUNNING (PID {pid}, Uptime {uptime}s) | Broker Port: {'🟢 61614' if b_listening else '🔴 CLOSED'} | Controller ↔ Broker: {conn_str}"
+        )
+        self.btn_daemon_toggle.config(
+            text="🛑 關閉 Controller",
+            style="Danger.TButton",
+            state="normal",
+            command=self.on_stop_daemon_clicked
+        )
+
+        # Update Sub Bar
+        if b_listening:
+            self.lbl_sub_broker_port.config(text=f"{b_port} (LISTENING)", foreground="#059669")
+            self.btn_broker_toggle.config(text="🛑 關閉 Broker", style="Danger.TButton", command=self.stop_broker_process)
+        else:
+            self.lbl_sub_broker_port.config(text=f"{b_port} (CLOSED)", foreground="#dc2626")
+            self.btn_broker_toggle.config(text="⚡ 啟動 Broker 黑窗", style="Launch.TButton", command=self.launch_broker_black_window)
+
+        self.lbl_sub_broker_conn.config(
+            text=f"🟢 {b_state}" if b_conn else f"🔴 {b_state}",
+            foreground="#059669" if b_conn else "#dc2626"
+        )
+        self.lbl_sub_ipc.config(text=f"6001 (LISTENING, PID {pid})", foreground="#059669")
+        self.lbl_sub_target.config(text=active or "(未設定)", foreground="#0284c7" if active else "#d97706")
+
+        # Update Monitor Tab Cards
+        self.lbl_mon_daemon.config(
+            text=f"Controller 狀態: 🟢 RUNNING (正常運行中)\n行程 PID:        {pid}\n運行時間:        {uptime} 秒\nIPC 通訊埠:      127.0.0.1:6001 (LISTENING)\n活躍執行緒:      {d_info.get('active_threads', '-')}"
+        )
+        self.lbl_mon_ports.config(
+            text=f"Port {b_port} (STOMP Broker):  {'● LISTENING (已監聽)' if b_listening else '○ CLOSED (未開啟)'}\nPort 6001  (IPC Server):    ● LISTENING (IPC API Ready)\nPort 5353  (mDNS Discovery): ● READY"
+        )
+        self.lbl_mon_broker.config(
+            text=f"Controller ↔ Broker: {'🟢 CONNECTED (正常連線通訊中)' if b_conn else '🔴 DISCONNECTED (尚未連線/等待 Broker 啟動)'}\n連線狀態 (State):   {b_state}\n通訊協議:          STOMP 1.2\nBroker 終端:       {b_host}:{b_port} ({'● LISTENING 已監聽' if b_listening else '○ CLOSED 未開啟'})\nController ID:     proto::controller.default\n接收監聽佇列:      {rx_topic}\n回覆回應佇列:      {reply_q}\n已訂閱主題:        {subs or [rx_topic]}\n已知 Agent 總數:   {len(devices)}"
+        )
+
+        # Update Device List
+        self._render_devices_tree(devices)
+
+        # Append Logs
+        if logs:
+            for entry in logs:
+                entry_id = entry.get("id", -1)
+                if entry_id > self.last_log_id:
+                    self.last_log_id = entry_id
+                    t_str = str(entry.get("time") or entry.get("timestamp") or time.strftime("%H:%M:%S"))
+                    l_type = str(entry.get("type", "INFO")).upper()
+                    msg = str(entry.get("msg") or entry.get("message") or "")
+                    self.log_tree.insert("", 0, values=(entry_id, t_str, l_type, msg))
+
+
+        self.status_bar.config(text=f"Controller 已連線 (PID {pid}) | Broker: {'已監聽' if b_listening else '未開啟'} | Controller↔Broker: {b_state}")
+
+    def _update_gui_offline(self):
+        b_listening = check_port_listening("127.0.0.1", 61614, timeout=0.1)
+        self.lbl_header_status.config(
+            text=f"Controller: 🔴 OFFLINE | STOMP Broker: {'🟢 61614 (LISTENING)' if b_listening else '🔴 61614 (CLOSED)'} | IPC: 🔴 6001 (CLOSED)"
+        )
+        self.btn_daemon_toggle.config(
+            text="🚀 啟動 Controller 黑窗",
+            style="Launch.TButton",
+            state="normal",
+            command=self.launch_daemon_black_window
+        )
+
+        if b_listening:
+            self.lbl_sub_broker_port.config(text="61614 (LISTENING)", foreground="#059669")
+            self.btn_broker_toggle.config(text="🛑 關閉 Broker", style="Danger.TButton", command=self.stop_broker_process)
+        else:
+            self.lbl_sub_broker_port.config(text="61614 (CLOSED)", foreground="#dc2626")
+            self.btn_broker_toggle.config(text="⚡ 啟動 Broker 黑窗", style="Launch.TButton", command=self.launch_broker_black_window)
+
+        self.lbl_sub_broker_conn.config(text="⚪ OFFLINE (Controller 離線)", foreground="#94a3b8")
+        self.lbl_sub_ipc.config(text="6001 (OFFLINE)", foreground="#dc2626")
+
+        self.lbl_mon_daemon.config(text="Controller 狀態: 🔴 OFFLINE (未啟動)\n行程 PID:        -\n運行時間:        -\nIPC 通訊埠:      127.0.0.1:6001 (CLOSED)\n活躍執行緒:      -")
+        self.lbl_mon_ports.config(
+            text=f"Port 61614 (STOMP Broker):  {'● LISTENING (已監聽)' if b_listening else '○ CLOSED (未開啟)'}\nPort 6001  (IPC Server):    ○ CLOSED (Controller 未啟動)\nPort 5353  (mDNS Discovery): ● READY"
+        )
+        self.lbl_mon_broker.config(
+            text=f"Controller ↔ Broker: ⚪ OFFLINE (Controller 未啟動)\n通訊協議:          STOMP 1.2\nBroker 位址:       127.0.0.1:61614 ({'● LISTENING 已監聽' if b_listening else '○ CLOSED 未開啟'})\nController ID:     proto::controller.default\n接收佇列:          /queue/usp.controller.default\n已知 Agent 總數:   0"
+        )
+        self.status_bar.config(text="Controller 未啟動。可分別啟動 Broker 黑窗與 Controller 黑窗。")
+
+
+
+
+
+    def _filter_devices(self):
+        self._render_devices_tree(self.cached_devices)
+
+    def _render_devices_tree(self, devices: list):
+        self.cached_devices = devices or []
+        filter_text = self.dev_filter_var.get().strip().lower()
+
+        filtered = []
+        for d in self.cached_devices:
+            ep = d.get("endpoint_id", "")
+            if filter_text and filter_text not in ep.lower():
+                continue
+            filtered.append(d)
+
+        self.lbl_dev_count.config(text=f"已發現 {len(filtered)} 個設備 (每 1.5 秒自動更新)")
+
+        # Remember currently selected endpoint before clearing
+        current_sel = self.dev_tree.selection()
+        selected_ep = self.dev_tree.item(current_sel[0])["values"][1] if current_sel and len(self.dev_tree.item(current_sel[0])["values"]) > 1 else self.active_device_id
+
+        self.dev_tree.delete(*self.dev_tree.get_children())
+        for d in filtered:
+            ep = d.get("endpoint_id", "")
+            st_text = "[ON]" if d.get("status") == "online" else "[OFF]"
+            ip = d.get("ip_address", d.get("reply_to", "STOMP"))
+            proto = d.get("protocol", "STOMP").upper()
+
+            item_id = self.dev_tree.insert("", tk.END, values=(st_text, ep, ip, proto))
+            if ep == selected_ep or (not selected_ep and ep == self.active_device_id):
+                self.dev_tree.selection_set(item_id)
+                self.selected_device_id = ep
+
+    def on_device_selected(self, event=None):
+        selected = self.dev_tree.selection()
+        if not selected:
+            return
+        vals = self.dev_tree.item(selected[0])["values"]
+        ep = vals[1]
+        self.selected_device_id = ep
+        self.lbl_selected_title.config(text=f"當前選中設備: {ep}")
+        st_label = "在線" if "[ON]" in str(vals[0]) else "離線"
+        self.lbl_selected_detail.config(text=f"通道: {vals[2]} | 通訊協議: {vals[3]} | 狀態: {st_label}")
+
+
+    def on_set_active_target(self):
+        if not self.selected_device_id:
+            messagebox.showinfo("提示", "請先在左側清單中選擇一個 Agent 設備。")
+            return
+        ok = self.ipc_client.set_target(self.selected_device_id)
+        if ok:
+            self.active_device_id = self.selected_device_id
+            self.lbl_sub_target.config(text=self.active_device_id, foreground="#0284c7")
+            messagebox.showinfo("成功", f"已將主控目標切換為: {self.selected_device_id}")
+        else:
+            messagebox.showerror("失敗", "切換目標設備失敗，請確認 Daemon 運行狀態。")
+
+    def on_probe_agent_clicked(self):
+        """Prompt user for Agent Endpoint ID and proactively probe/discover it"""
+        ep = simpledialog.askstring("探測 / 新增 Agent", "請輸入欲連線與探測的 Agent Endpoint ID:\n(例如: proto::agent.001)", parent=self.root)
+        if not ep or not ep.strip():
+            return
+        ep = ep.strip()
+        self.status_bar.config(text=f"正在向 {ep} 發送 USP 探測請求 (Get Device.DeviceInfo.) ...")
+        self.root.update_idletasks()
+
+        def do_probe():
+            res = self.ipc_client.exec_cmd(f"get {ep} Device.DeviceInfo.", timeout=8.0)
+            def on_done():
+                if res.success:
+                    self.ipc_client.set_target(ep)
+                    self.refresh_devices()
+                    self.status_bar.config(text=f"已成功探測並連線至 Agent: {ep}")
+                    messagebox.showinfo("探測成功", f"已成功收到來自 {ep} 的回應，並已自動註冊至設備清單！")
+                else:
+                    self.status_bar.config(text=f"探測 {ep} 未收到回應: {res.error}")
+                    messagebox.showwarning("探測未回應", f"向 {ep} 發送請求未收到回應。\n\n可能原因:\n1. DUT 尚未啟動或尚未連上 STOMP Broker\n2. DUT 的 Controller 白名單未設定本機 Controller ID\n3. DUT 的接收 Topic 與設定不一致\n\n詳細錯誤: {res.error}")
+            self.root.after(0, on_done)
+
+        threading.Thread(target=do_probe, daemon=True).start()
+
+    def on_remove_selected_device_clicked(self):
+        if not self.selected_device_id:
+            messagebox.showinfo("提示", "請先在左側清單中選擇欲移除的設備。")
+            return
+        if messagebox.askyesno("確認移除", f"確定要從設備清單中移除「{self.selected_device_id}」嗎？"):
+            ok = self.ipc_client.remove_device(self.selected_device_id)
+            if ok:
+                self.selected_device_id = None
+                self.refresh_devices()
+                self.status_bar.config(text="已移除指定設備。")
+            else:
+                messagebox.showerror("錯誤", "移除設備失敗。")
+
+    def on_clear_offline_clicked(self):
+        count = self.ipc_client.clear_offline_devices()
+        self.refresh_devices()
+        self.status_bar.config(text=f"已清理 {count} 個離線設備。")
+        messagebox.showinfo("清理完成", f"已成功清除 {count} 個離線設備！")
+
+    def on_refresh_connect_clicked(self):
+        self.refresh_devices()
+
+
+    def launch_broker_black_window(self):
+        """Launch standalone STOMP Broker in its own dedicated black window"""
+        try:
+            if sys.platform == 'win32':
+                subprocess.Popen(
+                    [sys.executable, "tools/embedded_broker.py", "--port", "61614"],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                    cwd=str(Path(__file__).parent)
+                )
+            else:
+                subprocess.Popen([sys.executable, "tools/embedded_broker.py", "--port", "61614"], cwd=str(Path(__file__).parent))
+        except Exception as e:
+            messagebox.showerror("啟動錯誤", f"無法啟動 STOMP Broker: {e}")
+
+    def stop_broker_process(self):
+        """Stop standalone STOMP Broker process and close port 61614"""
+        try:
+            from tools.embedded_broker import kill_process_on_port
+            kill_process_on_port(61614)
+            if self.internal_broker:
+                try:
+                    self.internal_broker.stop()
+                except Exception:
+                    pass
+                self.internal_broker = None
+            time.sleep(0.3)
+            self._update_gui_offline()
+        except Exception as e:
+            messagebox.showerror("錯誤", f"關閉 STOMP Broker 失敗: {e}")
+
+    def launch_daemon_black_window(self):
+        """Launch USP Controller Daemon in its own dedicated black console window"""
+        try:
+            if sys.platform == 'win32':
+                subprocess.Popen(
+                    [sys.executable, "tools/usp_daemon.py"],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                    cwd=str(Path(__file__).parent)
+                )
+            else:
+                subprocess.Popen([sys.executable, "tools/usp_daemon.py"], cwd=str(Path(__file__).parent))
+        except Exception as e:
+            messagebox.showerror("啟動錯誤", f"無法啟動 Controller: {e}")
+
+    def on_stop_daemon_clicked(self):
+        """Ask Controller Daemon to shut down and close its console window"""
+        ok = self.ipc_client.shutdown_daemon()
+        self._update_gui_offline()
+
+
+
+    def on_ping_clicked(self):
+
+        t0 = time.time()
+        ok = self.ipc_client.ping()
+        elapsed = round((time.time() - t0) * 1000, 2)
+        if ok:
+            messagebox.showinfo("Ping 測試", f"Daemon 伺服器連線正常！(延遲: {elapsed} ms)")
+        else:
+            messagebox.showerror("Ping 測試", "無法連接 Daemon 伺服器 (127.0.0.1:6001)。")
+
+    # ------------------------------------------
+    # Parameter Operations
+    # ------------------------------------------
+    def _get_target_prefix(self) -> str:
+        target = self.selected_device_id or self.active_device_id
+        return f"{target} " if target else ""
+
+    def _on_param_row_clicked(self, event=None):
+        selected = self.param_tree.selection()
+        if not selected:
+            return
+        vals = self.param_tree.item(selected[0])["values"]
+        if vals and len(vals) > 0:
+            self.param_path_var.set(vals[0])
+
+    def _on_param_double_clicked(self, event=None):
+        """Quickly fill the double-clicked parameter path into the top path entry"""
+        selected = self.param_tree.selection()
+        if not selected:
+            return
+        vals = self.param_tree.item(selected[0])["values"]
+        if vals and len(vals) > 0:
+            path = vals[0]
+            self.param_path_var.set(path)
+            self.status_bar.config(text=f"已帶入參數路徑: {path}")
+
+    def on_clear_param_tree_clicked(self):
+        """Clear all parameter rows in the table"""
+        self.cached_params.clear()
+        self.param_tree.delete(*self.param_tree.get_children())
+        if hasattr(self, 'lbl_param_count'):
+            self.lbl_param_count.config(text="顯示: 0 / 0 筆")
+        self.status_bar.config(text="已清空參數檢視表。")
+
+
+
+    def on_param_get_clicked(self):
+        path = self.param_path_var.get().strip()
+        if not path:
+            messagebox.showwarning("警告", "請輸入欲查詢的參數路徑。")
+            return
+
+        cmd = f"get {self._get_target_prefix()}{path}"
+        self._execute_param_cmd_and_render(cmd)
+
+    def on_param_set_clicked(self):
+        path = self.param_path_var.get().strip()
+        val = simpledialog.askstring("修改參數值 (Set)", f"請輸入參數 '{path}' 的新數值:")
+        if val is None:
+            return
+
+        cmd = f"set {self._get_target_prefix()}{path} {val}"
+        self._execute_param_cmd_and_render(cmd)
+
+    def on_param_add_clicked(self):
+        path = self.param_path_var.get().strip()
+        if not path.endswith("."):
+            path += "."
+        cmd = f"add {self._get_target_prefix()}{path}"
+        self._execute_param_cmd_and_render(cmd)
+
+    def on_param_delete_clicked(self):
+        path = self.param_path_var.get().strip()
+        if not messagebox.askyesno("確認刪除", f"確定要刪除實例物件 '{path}' 嗎？"):
+            return
+        cmd = f"delete {self._get_target_prefix()}{path}"
+        self._execute_param_cmd_and_render(cmd)
+
+    def on_param_get_dm_clicked(self):
+        path = self.param_path_var.get().strip()
+        cmd = f"get_supported_dm {self._get_target_prefix()}{path}"
+        self._execute_param_cmd_and_render(cmd)
+
+    def on_param_get_inst_clicked(self):
+        path = self.param_path_var.get().strip()
+        cmd = f"get_instances {self._get_target_prefix()}{path}"
+        self._execute_param_cmd_and_render(cmd)
+
+    def _execute_param_cmd_and_render(self, cmd_line: str):
+
+        def run():
+            res = self.ipc_client.exec_cmd(cmd_line, timeout=10.0)
+            self.root.after(0, lambda r=res: self._handle_param_result(r))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _handle_param_result(self, res):
+        if not res.success:
+            messagebox.showerror("操作失敗", res.error or "指令執行未成功")
+            return
+
+        now_str = time.strftime("%H:%M:%S")
+        updated_count = 0
+
+        if isinstance(res.data, list):
+            for item in res.data:
+                if isinstance(item, dict):
+                    # Format: {"Parameter": "...", "Value": "..."} or {"path": "...", "value": "..."}
+                    p = item.get("Parameter") or item.get("path") or item.get("param") or item.get("instantiated_path")
+                    v = item.get("Value") if "Value" in item else item.get("value", "")
+                    ptype = item.get("Type") or item.get("type") or (type(v).__name__ if v != "" else "String")
+                    if p:
+                        self._upsert_param_row(str(p), str(v), str(ptype), now_str)
+                        updated_count += 1
+                elif isinstance(item, str):
+                    # Format: list of instance paths e.g. "Device.IP.Interface.1."
+                    self._upsert_param_row(str(item), "(Instance / Object)", "Object", now_str)
+                    updated_count += 1
+
+        elif isinstance(res.data, dict):
+            params = res.data.get("parameters", res.data)
+            if isinstance(params, dict):
+                for p, v in params.items():
+                    ptype = type(v).__name__
+                    self._upsert_param_row(str(p), str(v), ptype, now_str)
+                    updated_count += 1
+            elif isinstance(params, list):
+                for item in params:
+                    if isinstance(item, dict):
+                        p = item.get("Parameter") or item.get("path") or item.get("param")
+                        v = item.get("Value", item.get("value", ""))
+                        if p:
+                            self._upsert_param_row(str(p), str(v), "String", now_str)
+                            updated_count += 1
+                    else:
+                        self._upsert_param_row(str(item), "(Instance / Object)", "Object", now_str)
+                        updated_count += 1
+
+        if updated_count > 0:
+            self._filter_params()
+            self.status_bar.config(text=f"已成功更新 {updated_count} 筆參數至檢視表 ({now_str})")
+        elif res.message:
+            self.status_bar.config(text=res.message)
+            messagebox.showinfo("成功", res.message)
+
+    def _clear_param_filter(self):
+        """Clear filter entry and show all parameters"""
+        self.param_filter_var.set("")
+        self._filter_params()
+
+    def _filter_params(self):
+        """Filter parameters by path, value, or type in real time"""
+        filter_text = self.param_filter_var.get().strip().lower()
+        self.param_tree.delete(*self.param_tree.get_children())
+
+        displayed = 0
+        total = len(self.cached_params)
+
+        for path, item in sorted(self.cached_params.items()):
+            val = str(item.get("value", ""))
+            ptype = str(item.get("type", ""))
+            updated = str(item.get("updated", ""))
+
+            # Filter matches path, value, or type
+            if filter_text:
+                if filter_text not in path.lower() and filter_text not in val.lower() and filter_text not in ptype.lower():
+                    continue
+
+            self.param_tree.insert("", tk.END, values=(path, val, ptype, updated))
+            displayed += 1
+
+        self.lbl_param_count.config(text=f"顯示: {displayed} / {total} 筆")
+
+    def _upsert_param_row(self, path: str, val: str, ptype: str, now_str: str):
+        """Store into cache dict (Treeview will be rendered via _filter_params)"""
+        self.cached_params[path] = {
+            "path": path,
+            "value": val,
+            "type": ptype,
+            "updated": now_str
+        }
+
+
+
+    # ------------------------------------------
+    # Direct CMD and Scripts
+    # ------------------------------------------
+    def on_action_cmd_enter(self):
+        cmd = self.action_cmd_entry.get().strip()
+        if not cmd:
+            return
+        self.action_cmd_entry.delete(0, tk.END)
+        self.send_ipc_cmd_async(cmd)
+
+    def send_ipc_cmd_async(self, cmd_line: str):
+        def run():
+            res = self.ipc_client.exec_cmd(cmd_line, timeout=15.0)
+            self.root.after(0, lambda r=res: self._show_cmd_result(r))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show_cmd_result(self, res):
+        if not res.success:
+            messagebox.showerror("錯誤", res.error or "指令執行失敗")
+        else:
+            msg = res.message or json.dumps(res.data, indent=2, ensure_ascii=False)
+            messagebox.showinfo("執行結果", msg)
+
+    def _reload_scripts_dropdown(self):
+        scripts_dir = Path(__file__).parent / "scripts"
+        if scripts_dir.exists():
+            txt_files = sorted([f.name for f in scripts_dir.glob("*.txt")])
+            self.combo_scripts["values"] = txt_files
+            if txt_files and not self.combo_scripts.get():
+                self.combo_scripts.set(txt_files[0])
+
+    def on_run_script_clicked(self):
+        script_name = self.combo_scripts.get()
+        if not script_name:
+            messagebox.showwarning("警告", "請選擇測試腳本。")
+            return
+
+        script_path = str(Path(__file__).parent / "scripts" / script_name)
+        self.script_tree.delete(*self.script_tree.get_children())
+        self.lbl_script_metrics.config(text=f"正在執行測試腳本: {script_name}...", foreground="#0284c7")
+
+        def run():
+            res = self.ipc_client.run_script(script_path, timeout=120.0)
+            self.root.after(0, lambda r=res, s=script_name: self._handle_script_done(r, s))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _handle_script_done(self, rep: dict, script_name: str):
+        status = rep.get("status", "FAIL")
+        total = rep.get("total_steps", 0)
+        passed = rep.get("passed_count", 0)
+        failed = rep.get("failed_count", 0)
+        errors = rep.get("error_count", 0)
+        elapsed = rep.get("elapsed_sec", 0.0)
+
+        color = "#059669" if status == "PASS" else "#dc2626"
+        summary = f"測試結果: {status}  |  {passed}/{total} 通過, {failed} 失敗, {errors} 錯誤  |  耗時: {elapsed} 秒  ({script_name})"
+        self.lbl_script_metrics.config(text=summary, foreground=color)
+
+    def refresh_devices(self):
+        def run():
+            devs, active = self.ipc_client.get_devices()
+            self.root.after(0, lambda d=devs, a=active: self._render_devices_tree(d))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def refresh_logs(self):
+        def run():
+            logs = self.ipc_client.get_logs(since_id=-1, max_count=50)
+            self.root.after(0, lambda l=logs: self._render_logs_full(l))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _render_logs_full(self, logs: list):
+        self.log_tree.delete(*self.log_tree.get_children())
+        for entry in logs:
+            entry_id = entry.get("id", -1)
+            t_str = str(entry.get("time") or entry.get("timestamp") or time.strftime("%H:%M:%S"))
+            l_type = str(entry.get("type", "INFO")).upper()
+            msg = str(entry.get("msg") or entry.get("message") or "")
+            self.log_tree.insert("", 0, values=(entry_id, t_str, l_type, msg))
+
+    def on_log_row_selected(self, event=None):
+        selected = self.log_tree.selection()
+        if not selected:
+            return
+        vals = self.log_tree.item(selected[0])["values"]
+        self.log_detail_text.delete("1.0", tk.END)
+        log_id = vals[0] if len(vals) > 0 else "-"
+        t_str = vals[1] if len(vals) > 1 else "-"
+        l_type = vals[2] if len(vals) > 2 else "-"
+        msg = vals[3] if len(vals) > 3 else ""
+
+        detail_text = (
+            f"======================================================================\n"
+            f" [LOG DETAIL] ID: {log_id} | Time: {t_str} | Level: {l_type}\n"
+            f"======================================================================\n\n"
+            f"{msg}\n"
+        )
+        self.log_detail_text.insert(tk.END, detail_text)
+
+
+    def on_clear_logs_clicked(self):
+        self.ipc_client.clear_logs()
+        self.log_tree.delete(*self.log_tree.get_children())
+        self.log_detail_text.delete("1.0", tk.END)
+
+    def on_close_window(self):
+        self.polling_running = False
+        if self.internal_broker:
+            try:
+                self.internal_broker.stop()
+            except Exception:
+                pass
+            self.internal_broker = None
         self.root.destroy()
 
 
-    def _refresh_status(self):
-        # Legacy method kept for compatibility bound to buttons
-        pass
 
-    def _refresh_subscriptions(self):
-        """Manually refresh subscription status"""
-        threading.Thread(target=self._refresh_subscriptions_thread, daemon=True).start()
-    
-    def _refresh_subscriptions_thread(self):
-        """Thread to refresh subscription status via IPC"""
-        try:
-            resp = self.ipc.send_command("status")
-            if resp and resp.get("status") == "ok":
-                subscriptions = resp.get("subscriptions", [])
-                if subscriptions:
-                    subs_text = "\n".join(f"  • {sub}" for sub in subscriptions)
-                    self.lbl_subscriptions.config(text=subs_text, foreground="blue")
-                else:
-                    self.lbl_subscriptions.config(text="  (No active subscriptions)", foreground="gray")
-                self._append_log(datetime.now().strftime('%H:%M:%S'), 'info', 
-                                f"Subscriptions refreshed: {len(subscriptions)} active")
-            else:
-                self.lbl_subscriptions.config(text="  (Failed to retrieve)", foreground="red")
-        except Exception as e:
-            self.lbl_subscriptions.config(text=f"  Error: {e}", foreground="red")
-    
-    def _delete_device(self):
-        """Delete selected device from list"""
-        selection = self.tree_devices.selection()
-        if not selection:
-            messagebox.showwarning("No Selection", "Please select a device to delete")
-            return
-        
-        item_id = selection[0]
-        endpoint = self.tree_devices.item(item_id, "text")
-        
-        if messagebox.askyesno("Confirm Delete", f"Delete device '{endpoint}' from list?\n\nThis will remove it from devices.json."):
-            threading.Thread(target=self._delete_device_thread, args=(endpoint,)).start()
-    
-    def _delete_device_thread(self, endpoint):
-        """Thread to delete device via IPC"""
-        try:
-            resp = self.ipc.send_command(f"remove_device {endpoint}")
-            if resp and resp.get("status") == "ok":
-                self.log_queue.put({"logs": [{"id": -1, "time": datetime.now().strftime("%H:%M:%S"), "type": "success", "msg": f"Device '{endpoint}' deleted"}], "last_id": -1})
-                # Trigger immediate refresh
-                time.sleep(0.5)
-                self.ipc.send_command("devices")
-            else:
-                msg = resp.get("msg", "Unknown error") if resp else "No response"
-                self.log_queue.put({"logs": [{"id": -1, "time": datetime.now().strftime("%H:%M:%S"), "type": "error", "msg": f"Delete failed: {msg}"}], "last_id": -1})
-        except Exception as e:
-            self.log_queue.put({"logs": [{"id": -1, "time": datetime.now().strftime("%H:%M:%S"), "type": "error", "msg": f"Delete error: {e}"}], "last_id": -1})
+def main():
+    root = tk.Tk()
+    app = USPGuiApp(root)
+    root.mainloop()
 
-    def _send_command(self):
-        # Check if mini-broker is enabled and running
-        if not self._check_broker_ready():
-            return
-        
-        ep = self.cb_endpoint.get().strip()
-        path = self.ent_path.get().strip()
-        action = self.cb_action.get().lower()
-        val = self.ent_value.get().strip()
-        
-        if not ep:
-            messagebox.showwarning("Input Error", "Target Endpoint is required")
-            return
-        
-        cmd_str = ""
-        if action == "get":
-            cmd_str = f"get {ep} {path}"
-            history_action = "GET"
-        elif action == "set":
-            cmd_str = f"set {ep} {path} {val}"
-            history_action = "SET"
-        elif action == "add":
-            cmd_str = f"add {ep} {path}"
-            history_action = "ADD"
-        elif action == "delete":
-            cmd_str = f"delete {ep} {path}"
-            history_action = "DELETE"
-        elif action == "operate":
-            cmd_str = f"operate {ep} {path} {val}"
-            history_action = "OPERATE"
-        elif action == "getsupporteddm":
-            cmd_str = f"get_supported {ep} {path}"
-            history_action = "GetSupportedDM"
-        elif action == "getinstances":
-            cmd_str = f"get_instances {ep} {path}"
-            history_action = "GetInstances"
-        
-        # Add to history
-        self._add_to_history(history_action, ep, path, val)
-            
-        # Send in a separate thread to avoid freezing UI
-        threading.Thread(target=self._send_command_thread, args=(cmd_str,)).start()
-        
-    def _send_command_thread(self, cmd_str):
-        resp = self.ipc.send_command(cmd_str)
-        
-        # Update history status
-        success = resp and resp.get("status") == "ok"
-        if self.command_history:
-            self.command_history[-1]['status'] = 'success' if success else 'error'
-            self._save_history()
-            # Schedule UI refresh in main thread
-            self.root.after(0, self._refresh_history_list)
-        
-        # Schedule UI update in main thread
-        self.root.after(0, lambda: self._handle_command_response(resp, cmd_str))
-        
-    def _check_broker_ready(self):
-        """Check if broker is ready before sending commands"""
-        # Only check if BROKER_AVAILABLE and mini-broker is enabled
-        if not BROKER_AVAILABLE or not self.mini_broker_enabled:
-            return True
-        
-        # Check if broker is running
-        if not self.broker_running:
-            result = messagebox.askyesno(
-                "Broker Not Running",
-                f"Mini-Broker 已启用但未运行！\n\n"
-                f"Broker 地址: {self.mini_broker_host}:{self.mini_broker_port}\n\n"
-                f"需要先启动 Mini-Broker 才能发送命令。\n\n"
-                f"是否现在启动 Broker？",
-                icon='warning'
-            )
-            if result:
-                self._start_broker()
-                # Wait a moment for broker to start
-                import time
-                time.sleep(0.5)
-                if not self.broker_running:
-                    messagebox.showerror("启动失败", "Broker 启动失败，请检查日志")
-                    return False
-            return False
-        
-        return True
-    
-    def _handle_command_response(self, resp, cmd_str):
-        if resp:
-            if resp.get("status") == "ok":
-                # Log successful command locally as well
-                pass 
-            else:
-                 messagebox.showerror("Error", resp.get("msg", "Unknown error"))
-        else:
-            messagebox.showerror("Connection Error", "Could not talk to daemon")
-
-    def _refresh_config(self):
-        threading.Thread(target=self._refresh_config_thread).start()
-
-    def _refresh_config_thread(self):
-        resp = self.ipc.send_command("get_config")
-        if resp and resp.get("status") == "ok":
-            cfg = resp.get("config", {})
-            
-            # Reload mini-broker config
-            self._load_mini_broker_config()
-            
-            # Update entry widgets in main thread
-            self.root.after(0, lambda: self.ent_broker_host.delete(0, tk.END))
-            self.root.after(0, lambda: self.ent_broker_host.insert(0, cfg.get('broker_host', '')))
-            
-            self.root.after(0, lambda: self.ent_broker_port.delete(0, tk.END))
-            self.root.after(0, lambda: self.ent_broker_port.insert(0, str(cfg.get('broker_port', ''))))
-            
-            # Disable broker config fields if mini-broker is enabled
-            if self.mini_broker_enabled:
-                self.root.after(0, lambda: self.ent_broker_host.config(state='disabled'))
-                self.root.after(0, lambda: self.ent_broker_port.config(state='disabled'))
-                # Update display to show mini-broker is active
-                broker_addr = f"{self.mini_broker_host}:{self.mini_broker_port} (Mini-Broker)"
-                self.root.after(0, lambda: self.lbl_broker_addr.config(text=f"Address: {broker_addr}", foreground="orange"))
-            else:
-                self.root.after(0, lambda: self.ent_broker_host.config(state='normal'))
-                self.root.after(0, lambda: self.ent_broker_port.config(state='normal'))
-                broker_addr = f"{cfg.get('broker_host', 'N/A')}:{cfg.get('broker_port', 'N/A')}"
-                self.root.after(0, lambda: self.lbl_broker_addr.config(text=f"Address: {broker_addr}", foreground=""))
-            
-            self.root.after(0, lambda: self.ent_username.delete(0, tk.END))
-            self.root.after(0, lambda: self.ent_username.insert(0, cfg.get('username', '')))
-            
-            self.root.after(0, lambda: self.ent_ctrl_id.delete(0, tk.END))
-            self.root.after(0, lambda: self.ent_ctrl_id.insert(0, cfg.get('controller_id', '')))
-            
-            self.root.after(0, lambda: self.ent_topic.delete(0, tk.END))
-            self.root.after(0, lambda: self.ent_topic.insert(0, cfg.get('receive_topic', '')))
-            
-            self.root.after(0, lambda: self.ent_ipc_port.delete(0, tk.END))
-            self.root.after(0, lambda: self.ent_ipc_port.insert(0, str(cfg.get('ipc_port', ''))))
-            
-            # Update Debug Level Radio
-            lvl = cfg.get("debug_level", 1)
-            self.root.after(0, lambda: self.var_debug.set(lvl))
-            
-            # Update broker user status
-            self.root.after(0, lambda: self.lbl_broker_user.config(text=f"Username: {cfg.get('username', 'N/A')}"))
-    
-    def _save_config(self):
-        if not messagebox.askyesno("Confirm", "Save configuration changes?\n\nNote: Daemon must be restarted for changes to take effect."):
-            return
-        
-        threading.Thread(target=self._save_config_thread).start()
-    
-    def _save_config_thread(self):
-        fields = {
-            'broker_host': self.ent_broker_host.get(),
-            'broker_port': self.ent_broker_port.get(),
-            'username': self.ent_username.get(),
-            'password': self.ent_password.get(),
-            'controller_id': self.ent_ctrl_id.get(),
-            'receive_topic': self.ent_topic.get(),
-            'ipc_port': self.ent_ipc_port.get()
-        }
-        
-        errors = []
-        for field, value in fields.items():
-            if not value and field != 'password':  # password can be empty
-                continue
-            
-            resp = self.ipc.send_command(f"update_config {field} {value}")
-            if resp and resp.get("status") != "ok":
-                errors.append(f"{field}: {resp.get('msg', 'Unknown error')}")
-        
-        if errors:
-            msg = "Some updates failed:\n" + "\n".join(errors)
-            self.root.after(0, lambda: messagebox.showerror("Save Failed", msg))
-        else:
-            self.root.after(0, lambda: messagebox.showinfo("Success", "Configuration saved successfully!\n\nRestart the daemon to apply changes."))
-
-        
-    def _set_debug_level(self):
-        lvl = self.var_debug.get()
-        threading.Thread(target=self._set_debug_level_thread, args=(lvl,), daemon=True).start()
-    
-    def _set_debug_level_thread(self, level):
-        """Background thread to set debug level"""
-        try:
-            resp = self.ipc.send_command(f"set_debug {level}")
-            if resp and resp.get("status") == "ok":
-                def show_success():
-                    messagebox.showinfo("Success", f"Debug level set to {level}")
-                self.root.after(0, show_success)
-            else:
-                msg = resp.get("msg", "Unknown error") if resp else "No response from daemon"
-                def show_error():
-                    messagebox.showerror("Error", f"Failed to set debug level: {msg}")
-                self.root.after(0, show_error)
-        except Exception as e:
-            def show_error():
-                messagebox.showerror("Error", f"Failed to set debug level: {str(e)}")
-            self.root.after(0, show_error)
-
-    def _reconnect_stomp(self):
-        if messagebox.askyesno("Confirm", "Attempt reconnection to Broker?"):
-             threading.Thread(target=self._reconnect_stomp_thread).start()
-
-    def _reconnect_stomp_thread(self):
-        resp = self.ipc.send_command("reconnect")
-        if resp:
-            msg = resp.get("msg", "")
-            if resp.get("status") == "ok":
-                self.root.after(0, lambda: messagebox.showinfo("Success", msg))
-            else:
-                self.root.after(0, lambda: messagebox.showerror("Error", msg))
-
-    def _mdns_check_status(self):
-        """Check mDNS discovery status"""
-        threading.Thread(target=self._mdns_check_status_thread).start()
-    
-    def _mdns_check_status_thread(self):
-        resp = self.ipc.send_command("mdns_status")
-        if resp and resp.get("status") == "ok":
-            available = resp.get("mdns_available", False)
-            running = resp.get("mdns_running", False)
-            enabled = resp.get("enabled", False)
-            
-            if not available:
-                status_text = "Status: ❌ Not Available (zeroconf not installed)"
-                color = "red"
-            elif running:
-                status_text = "Status: 🟢 Running (Listening for agents)"
-                color = "green"
-            elif enabled:
-                status_text = "Status: ⚪ Enabled but not started"
-                color = "orange"
-            else:
-                status_text = "Status: ⚪ Disabled in config"
-                color = "gray"
-            
-            self.root.after(0, lambda: self.lbl_mdns_status.config(text=status_text, foreground=color))
-        else:
-            self.root.after(0, lambda: self.lbl_mdns_status.config(text="Status: ❓ Unknown", foreground="gray"))
-    
-    def _mdns_start(self):
-        """Start mDNS discovery"""
-        threading.Thread(target=self._mdns_start_thread).start()
-    
-    def _mdns_start_thread(self):
-        resp = self.ipc.send_command("mdns_start")
-        if resp:
-            msg = resp.get("msg", "")
-            if resp.get("status") == "ok":
-                self.root.after(0, lambda: messagebox.showinfo("Success", msg))
-                self.root.after(500, self._mdns_check_status)
-            else:
-                self.root.after(0, lambda: messagebox.showerror("Error", msg))
-    
-    def _mdns_stop(self):
-        """Stop mDNS discovery"""
-        threading.Thread(target=self._mdns_stop_thread).start()
-    
-    def _mdns_stop_thread(self):
-        resp = self.ipc.send_command("mdns_stop")
-        if resp:
-            msg = resp.get("msg", "")
-            self.root.after(0, lambda: messagebox.showinfo("Info", msg))
-            self.root.after(500, self._mdns_check_status)
-    
-    def _mdns_scan(self):
-        """Perform active mDNS scan"""
-        # Update status
-        self.root.after(0, lambda: self.txt_mdns_results.config(state='normal'))
-        self.root.after(0, lambda: self.txt_mdns_results.delete(1.0, tk.END))
-        self.root.after(0, lambda: self.txt_mdns_results.insert(tk.END, "Scanning... (3 seconds)\n"))
-        self.root.after(0, lambda: self.txt_mdns_results.config(state='disabled'))
-        
-        threading.Thread(target=self._mdns_scan_thread).start()
-    
-    def _mdns_scan_thread(self):
-        resp = self.ipc.send_command("mdns_scan 3")
-        
-        if resp and resp.get("status") == "ok":
-            count = resp.get("count", 0)
-            agents = resp.get("agents", [])
-            
-            # Build result text
-            result_text = f"Found {count} agent(s):\n"
-            if agents:
-                for agent in agents:
-                    ep_id = agent.get('endpoint_id', 'unknown')
-                    addr = agent.get('address', 'N/A')
-                    result_text += f"  • {ep_id} @ {addr}\n"
-            else:
-                result_text += "  (No agents found)\n"
-            
-            # Update UI
-            def update_results():
-                self.txt_mdns_results.config(state='normal')
-                self.txt_mdns_results.delete(1.0, tk.END)
-                self.txt_mdns_results.insert(tk.END, result_text)
-                self.txt_mdns_results.config(state='disabled')
-            
-            self.root.after(0, update_results)
-            
-            if count > 0:
-                self.root.after(0, lambda: messagebox.showinfo("Scan Complete", f"Found {count} agent(s). Check device list."))
-        else:
-            msg = resp.get("msg", "Unknown error") if resp else "No response"
-            
-            def update_error():
-                self.txt_mdns_results.config(state='normal')
-                self.txt_mdns_results.delete(1.0, tk.END)
-                self.txt_mdns_results.insert(tk.END, f"Scan failed: {msg}\n")
-                self.txt_mdns_results.config(state='disabled')
-            
-            self.root.after(0, update_error)
-            self.root.after(0, lambda: messagebox.showerror("Scan Error", msg))
-    
-    def _mdns_log(self, log_type, message):
-        """Add message to mDNS debug log"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        
-        def add_log():
-            self.txt_mdns_log.configure(state='normal')
-            self.txt_mdns_log.insert(tk.END, f"[{timestamp}] ", 'timestamp')
-            self.txt_mdns_log.insert(tk.END, f"{message}\n", log_type)
-            
-            if self.var_mdns_autoscroll.get():
-                self.txt_mdns_log.see(tk.END)
-            
-            self.txt_mdns_log.configure(state='disabled')
-        
-        self.root.after(0, add_log)
-    
-    def _add_text_context_menu(self, text_widget):
-        """Add right-click context menu with copy functionality to a text widget"""
-        context_menu = tk.Menu(text_widget, tearoff=0)
-        context_menu.add_command(label="Copy", command=lambda: self._copy_selection(text_widget))
-        context_menu.add_command(label="Select All", command=lambda: self._select_all(text_widget))
-        context_menu.add_separator()
-        context_menu.add_command(label="Clear", command=lambda: self._clear_text_widget(text_widget))
-        
-        def show_context_menu(event):
-            try:
-                context_menu.tk_popup(event.x_root, event.y_root)
-            finally:
-                context_menu.grab_release()
-        
-        text_widget.bind("<Button-3>", show_context_menu)
-    
-    def _copy_selection(self, text_widget):
-        """Copy selected text to clipboard"""
-        try:
-            selected_text = text_widget.get(tk.SEL_FIRST, tk.SEL_LAST)
-            self.root.clipboard_clear()
-            self.root.clipboard_append(selected_text)
-        except tk.TclError:
-            # No selection, copy all
-            text = text_widget.get(1.0, tk.END)
-            self.root.clipboard_clear()
-            self.root.clipboard_append(text)
-    
-    def _select_all(self, text_widget):
-        """Select all text in widget"""
-        text_widget.tag_add(tk.SEL, "1.0", tk.END)
-        text_widget.mark_set(tk.INSERT, "1.0")
-        text_widget.see(tk.INSERT)
-    
-    def _clear_text_widget(self, text_widget):
-        """Clear text widget content"""
-        text_widget.configure(state='normal')
-        text_widget.delete(1.0, tk.END)
-        text_widget.configure(state='disabled')
-    
-    def _mdns_service_selected(self, event):
-        """Show detailed info when a service is selected"""
-        selection = self.tree_mdns_services.selection()
-        if selection:
-            item = selection[0]
-            endpoint = self.tree_mdns_services.item(item, "text")
-            values = self.tree_mdns_services.item(item, "values")
-            
-            info = f"Service Details:\n"
-            info += f"  Endpoint: {endpoint}\n"
-            info += f"  Address: {values[0]}\n"
-            info += f"  Port: {values[1]}\n"
-            info += f"  Path: {values[2]}\n"
-            info += f"  Status: {values[3]}"
-            
-            self._mdns_log("info", f"Selected: {endpoint}")
-
-    def _mdns_scan_debug(self):
-        """Trigger mDNS scan from debug tab"""
-        self._mdns_log("info", "Initiating mDNS scan...")
-        self.btn_mdns_scan_debug.config(state='disabled')
-        threading.Thread(target=self._mdns_scan_debug_thread, daemon=True).start()
-    
-    def _mdns_scan_debug_thread(self):
-        """Background thread for mDNS scanning"""
-        try:
-            timeout = 5.0
-            resp = self.ipc.send_command(f"mdns_scan {timeout}")
-            
-            if resp and resp.get("status") == "ok":
-                count = resp.get("count", 0)
-                agents = resp.get("agents", [])
-                
-                self._mdns_log("info", f"Scan complete - found {count} agent(s)")
-                
-                # Clear and update services table
-                def clear_table():
-                    self.tree_mdns_services.delete(*self.tree_mdns_services.get_children())
-                self.root.after(0, clear_table)
-                
-                for agent in agents:
-                    endpoint = agent.get('endpoint_id', 'N/A')
-                    address = agent.get('host', 'N/A')
-                    port = agent.get('port', 'N/A')
-                    path = agent.get('path', '/usp')
-                    
-                    self._mdns_log("discovered", f"Found: {endpoint} at {address}:{port}")
-                    
-                    # Add to table
-                    def add_to_table(ep=endpoint, addr=address, p=port, pth=path):
-                        self.tree_mdns_services.insert("", "end", text=ep, values=(addr, p, pth, "Discovered"))
-                    self.root.after(0, add_to_table)
-                
-                if count == 0:
-                    self._mdns_log("info", "No agents found on the network")
-            else:
-                msg = resp.get("msg", "Unknown error") if resp else "No response from daemon"
-                self._mdns_log("error", f"Scan failed: {msg}")
-        except Exception as e:
-            self._mdns_log("error", f"Scan error: {str(e)}")
-        finally:
-            def enable_button():
-                self.btn_mdns_scan_debug.config(state='normal')
-            self.root.after(0, enable_button)
-    
-    def _mdns_refresh_debug(self):
-        """Refresh mDNS status in debug tab"""
-        self.btn_mdns_refresh_debug.config(state='disabled')
-        threading.Thread(target=self._mdns_refresh_debug_thread, daemon=True).start()
-    
-    def _mdns_refresh_debug_thread(self):
-        """Background thread for refreshing mDNS status"""
-        try:
-            resp = self.ipc.send_command("mdns_status")
-            if resp and resp.get("status") == "ok":
-                available = resp.get("mdns_available", False)
-                running = resp.get("mdns_running", False)
-                enabled = resp.get("enabled", False)
-                
-                if not available:
-                    status_text = "Status: ❌ Not Available (zeroconf not installed)"
-                    color = "red"
-                    self._mdns_log("error", "mDNS not available - install zeroconf package")
-                elif running:
-                    status_text = "Status: 🟢 Listener Active"
-                    color = "green"
-                    self._mdns_log("info", "mDNS listener is running")
-                elif enabled:
-                    status_text = "Status: ⚪ Enabled but not started"
-                    color = "orange"
-                else:
-                    status_text = "Status: ⚪ Disabled in configuration"
-                    color = "gray"
-                
-                def update_status():
-                    self.lbl_mdns_status_debug.config(text=status_text, foreground=color)
-                self.root.after(0, update_status)
-            else:
-                msg = resp.get("msg", "Unknown error") if resp else "No response from daemon"
-                self._mdns_log("error", f"Status check failed: {msg}")
-        except Exception as e:
-            self._mdns_log("error", f"Refresh error: {str(e)}")
-        finally:
-            def enable_button():
-                self.btn_mdns_refresh_debug.config(state='normal')
-            self.root.after(0, enable_button)
-    
-    def _mdns_clear_logs(self):
-        """Clear mDNS debug logs"""
-        def clear():
-            self.txt_mdns_log.configure(state='normal')
-            self.txt_mdns_log.delete(1.0, tk.END)
-            self.txt_mdns_log.configure(state='disabled')
-        self.root.after(0, clear)
-        self._mdns_log("info", "Logs cleared")
-
-
-    def _load_history(self):
-        """Load command history from file"""
-        if os.path.exists(HISTORY_FILE):
-            try:
-                with open(HISTORY_FILE, 'r') as f:
-                    return json.load(f)
-            except:
-                return []
-        return []
-    
-    def _save_history(self):
-        """Save command history to file"""
-        try:
-            with open(HISTORY_FILE, 'w') as f:
-                json.dump(self.command_history, f, indent=2)
-        except Exception as e:
-            print(f"Failed to save history: {e}")
-    
-    def _load_mini_broker_config(self):
-        """Load mini-broker config from config.json"""
-        config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
-        if os.path.exists(config_file):
-            try:
-                with open(config_file, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                    mini_broker = config.get('mini_broker', {})
-                    self.mini_broker_enabled = mini_broker.get('enable', False)
-                    self.mini_broker_host = mini_broker.get('host', '0.0.0.0')
-                    self.mini_broker_port = mini_broker.get('port', 61613)
-            except Exception as e:
-                print(f"[!] 无法加载 mini-broker 配置: {e}")
-    
-    def _add_to_history(self, action, endpoint, path, value):
-        """Add command to history"""
-        # Check if identical command already exists (ignore timestamp and status)
-        for existing in self.command_history:
-            if (existing['action'] == action and 
-                existing['endpoint'] == endpoint and 
-                existing['path'] == path and 
-                existing.get('value') == value):
-                # Update timestamp and status of existing entry
-                existing['timestamp'] = datetime.now().isoformat()
-                existing['status'] = 'pending'
-                self._save_history()
-                self._refresh_history_list()
-                return
-        
-        # Add new entry if not found
-        entry = {
-            'timestamp': datetime.now().isoformat(),
-            'action': action,
-            'endpoint': endpoint,
-            'path': path,
-            'value': value,
-            'status': 'pending'  # Will be updated after execution
-        }
-        
-        self.command_history.append(entry)
-        
-        # Limit history size
-        if len(self.command_history) > MAX_HISTORY:
-            self.command_history = self.command_history[-MAX_HISTORY:]
-        
-        self._save_history()
-        self._refresh_history_list()
-    
-    def _refresh_history_list(self):
-        """Refresh history listbox"""
-        self.lst_history.delete(0, tk.END)
-        for entry in reversed(self.command_history):  # Show newest first
-            display = f"{entry['action']}: {entry['endpoint']} {entry['path']}"
-            if entry.get('value'):
-                display += f" = {entry['value']}"
-            
-            # Add status indicator
-            status = entry.get('status', 'success')
-            if status == 'error':
-                display += " (✗)"
-            
-            idx = self.lst_history.size()
-            self.lst_history.insert(tk.END, display)
-            
-            # Color failed commands in red
-            if status == 'error':
-                self.lst_history.itemconfig(idx, fg='red')
-    
-    def _history_double_click(self, event):
-        """Double-click to execute"""
-        self._history_execute()
-    
-    def _history_right_click(self, event):
-        """Right-click menu"""
-        selection = self.lst_history.curselection()
-        if not selection:
-            return
-        
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="Load to Form", command=self._history_load)
-        menu.add_command(label="Execute Now", command=self._history_execute)
-        menu.add_separator()
-        menu.add_command(label="Delete This Entry", command=self._history_delete_selected)
-        menu.post(event.x_root, event.y_root)
-    
-    def _history_load(self):
-        """Load selected history to input fields"""
-        selection = self.lst_history.curselection()
-        if not selection:
-            return
-        
-        idx = len(self.command_history) - 1 - selection[0]  # Reverse index
-        entry = self.command_history[idx]
-        
-        # Set action
-        action_map = {"GET": 0, "SET": 1, "ADD": 2, "DELETE": 3, "OPERATE": 4, "GetSupportedDM": 5, "GetInstances": 6}
-        action_idx = action_map.get(entry['action'], 0)
-        self.cb_action.current(action_idx)
-        
-        # Set endpoint
-        # Set endpoint from history
-        endpoint = entry['endpoint']
-        if endpoint in self.cb_endpoint['values']:
-            self.cb_endpoint.set(endpoint)
-        else:
-            # If not in list, refresh devices first
-            self._refresh_devices()
-            if endpoint in self.cb_endpoint['values']:
-                self.cb_endpoint.set(endpoint)
-        
-        # Set path
-        self.ent_path.delete(0, tk.END)
-        self.ent_path.insert(0, entry['path'])
-        
-        # Set value
-        self.ent_value.delete(0, tk.END)
-        if entry.get('value'):
-            self.ent_value.insert(0, entry['value'])
-        
-        # Trigger action change to update UI
-        self._on_action_change(None)
-    
-    def _history_execute(self):
-        """Execute selected history command"""
-        self._history_load()
-        self._send_command()
-    
-    def _history_delete_selected(self):
-        """Delete selected history entry"""
-        selection = self.lst_history.curselection()
-        if not selection:
-            return
-        
-        idx = len(self.command_history) - 1 - selection[0]
-        del self.command_history[idx]
-        self._save_history()
-        self._refresh_history_list()
-    
-    def _history_clear(self):
-        """Clear all history"""
-        if messagebox.askyesno("Confirm", "Clear all command history?"):
-            self.command_history = []
-            self._save_history()
-            self._refresh_history_list()
-
-from datetime import datetime
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    # Set icon if available (skip for now)
-    app = USPControllerGUI(root)
-    root.mainloop()
+    main()

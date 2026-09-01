@@ -15,14 +15,13 @@ if errorlevel 1 (
     exit /b 1
 )
 
-set PYW_EXE=
-if exist ".venv\Scripts\pythonw.exe" set PYW_EXE=.venv\Scripts\pythonw.exe
-if not exist ".venv\Scripts\pythonw.exe" if exist "venv\Scripts\pythonw.exe" set PYW_EXE=venv\Scripts\pythonw.exe
+echo [INFO] Starting USP Controller Interactive CLI with %PY_EXE%...
+%PY_EXE% usp_main.py %*
+set EXIT_CODE=%ERRORLEVEL%
 
-if not "%PYW_EXE%"=="" (
-    start "" "%PYW_EXE%" usp_gui.py
-) else (
-    start "" "%PY_EXE%" usp_gui.py
+if not "%EXIT_CODE%"=="0" (
+    echo [ERROR] CLI exited with code %EXIT_CODE%.
+    pause
 )
 
-exit /b 0
+exit /b %EXIT_CODE%

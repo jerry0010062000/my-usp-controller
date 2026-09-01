@@ -2,6 +2,7 @@
 @chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
+title USP Controller & Broker Daemon
 set PYTHONIOENCODING=utf-8
 
 set PY_EXE=python
@@ -15,14 +16,13 @@ if errorlevel 1 (
     exit /b 1
 )
 
-set PYW_EXE=
-if exist ".venv\Scripts\pythonw.exe" set PYW_EXE=.venv\Scripts\pythonw.exe
-if not exist ".venv\Scripts\pythonw.exe" if exist "venv\Scripts\pythonw.exe" set PYW_EXE=venv\Scripts\pythonw.exe
+echo [INFO] Starting USP Controller & Broker Daemon with %PY_EXE%...
+%PY_EXE% tools/usp_daemon.py %*
+set EXIT_CODE=%ERRORLEVEL%
 
-if not "%PYW_EXE%"=="" (
-    start "" "%PYW_EXE%" usp_gui.py
-) else (
-    start "" "%PY_EXE%" usp_gui.py
+if not "%EXIT_CODE%"=="0" (
+    echo [ERROR] Daemon exited with code %EXIT_CODE%.
+    pause
 )
 
-exit /b 0
+exit /b %EXIT_CODE%

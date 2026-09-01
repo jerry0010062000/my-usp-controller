@@ -1,9 +1,16 @@
 import socket
 import time
 import uuid
-import sys
-import usp_record_1_4_pb2 as record_pb2
-import usp_msg_1_4_pb2 as msg_pb2
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+try:
+    from proto import usp_record_1_4_pb2 as record_pb2
+    from proto import usp_msg_1_4_pb2 as msg_pb2
+except ImportError:
+    import usp_record_1_4_pb2 as record_pb2
+    import usp_msg_1_4_pb2 as msg_pb2
+
 
 BROKER_HOST = '127.0.0.1'
 BROKER_PORT = 61613

@@ -83,6 +83,14 @@ class ScriptingConfig:
 
 
 @dataclass
+class MiniBrokerConfig:
+    """內嵌STOMP Mini-Broker配置"""
+    enable: bool = True
+    host: str = "0.0.0.0"
+    port: int = 61614
+
+
+@dataclass
 class ControllerConfig:
     """USP控制器主配置"""
     # 必要配置
@@ -95,6 +103,7 @@ class ControllerConfig:
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
     scripting: ScriptingConfig = field(default_factory=ScriptingConfig)
+    mini_broker: MiniBrokerConfig = field(default_factory=MiniBrokerConfig)
     
     # 其他配置
     devices_file: str = "devices.json"
@@ -127,7 +136,7 @@ class ControllerConfig:
             transport_config = TransportConfig(
                 protocol=usp_config.get('transport_protocol', 'stomp'),
                 host=usp_config.get('broker_host', '127.0.0.1'),
-                port=usp_config.get('broker_port', 61613),
+                port=usp_config.get('broker_port', 61614),
                 username=usp_config.get('username', 'guest'),
                 password=usp_config.get('password', 'guest'),
                 extra=usp_config.get('transport_extra', {})
@@ -166,6 +175,14 @@ class ControllerConfig:
                 max_retries=scripting_data.get('max_retries', 3),
                 scripts_dir=scripting_data.get('scripts_dir', 'scripts')
             )
+
+            # 構建MiniBrokerConfig
+            mini_data = data.get('mini_broker', {})
+            mini_broker_config = MiniBrokerConfig(
+                enable=mini_data.get('enable', True),
+                host=mini_data.get('host', '0.0.0.0'),
+                port=mini_data.get('port', 61614)
+            )
             
             # 構建主配置
             return cls(
@@ -176,10 +193,12 @@ class ControllerConfig:
                 discovery=discovery_config,
                 heartbeat=heartbeat_config,
                 scripting=scripting_config,
+                mini_broker=mini_broker_config,
                 devices_file=usp_config.get('devices_file', 'devices.json'),
                 debug_level=usp_config.get('debug_level', 0),
                 reply_to_queue=usp_config.get('reply_to_queue')
             )
+
             
         except FileNotFoundError:
             if _create_config_from_example(filepath):
@@ -251,3 +270,15 @@ def load_config(filepath: str = 'config.json') -> ControllerConfig:
 def save_config(config: ControllerConfig, filepath: str = 'config.json') -> None:
     """便捷函數：保存配置"""
     config.to_json(filepath)
+
+
+class ConfigManager:
+    """便捷配置管理器"""
+    load_config = staticmethod(load_config)
+    save_config = staticmethod(save_config)
+    create_default = staticmethod(lambda: ControllerConfig(
+        controller_endpoint_id="proto::controller.default",
+        receive_topic="/queue/usp.controller.default"
+    ))
+
+

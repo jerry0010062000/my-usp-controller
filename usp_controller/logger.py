@@ -5,13 +5,50 @@
 提供執行緒安全的日誌記錄和歷史管理
 """
 
+import sys
+import io
 import threading
 from datetime import datetime
 from typing import List, Dict, Optional, Callable
 from enum import Enum
 
+# Ensure UTF-8 output encoding on Windows
+if sys.platform == 'win32':
+    try:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        if hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+
+def _safe_print(text: str):
+    """Safe console printer avoiding UnicodeEncodeError on Windows CP950 consoles"""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        try:
+            clean_text = (
+                str(text).replace("✓", "[OK]")
+                         .replace("✗", "[FAIL]")
+                         .replace("●", "*")
+                         .replace("○", "o")
+                         .replace("🟢", "[ON]")
+                         .replace("🔴", "[OFF]")
+                         .replace("🚀", "[>]")
+                         .replace("✅", "[OK]")
+            )
+            enc = sys.stdout.encoding or 'ascii'
+            print(clean_text.encode(enc, errors='replace').decode(enc))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 
 class LogLevel(Enum):
+
     """日誌級別"""
     CRITICAL = 0
     ERROR = 1
@@ -39,14 +76,17 @@ class LogEntry:
         self.time = timestamp
         self.type = log_type
         self.msg = message
-    
+
     def to_dict(self) -> Dict:
         return {
             'id': self.id,
             'time': self.time,
+            'timestamp': self.time,
             'type': self.type,
-            'msg': self.msg
+            'msg': self.msg,
+            'message': self.msg
         }
+
 
 
 class Logger:
@@ -120,38 +160,39 @@ class Logger:
                 try:
                     callback(entry)
                 except Exception as e:
-                    print(f"[Logger] Callback error: {e}")
+                    _safe_print(f"[Logger] Callback error: {e}")
             
             return entry
     
     def critical(self, message: str):
         """關鍵錯誤（總是顯示）"""
-        print(f"[!] {message}")
+        _safe_print(f"[!] {message}")
         self._add_entry(LogType.CRITICAL.value, message)
-    
+
     def error(self, message: str, level: int = 0):
         """錯誤訊息"""
         if self.debug_level >= level:
-            print(f"[✗] {message}")
-            self._add_entry(LogType.ERROR.value, message)
-    
-    def success(self, message: str, level: int = 1):
+            _safe_print(f"[FAIL] {message}")
+        self._add_entry(LogType.ERROR.value, message)
+
+    def success(self, message: str, level: int = 0):
         """成功訊息"""
         if self.debug_level >= level:
-            print(f"[✓] {message}")
-            self._add_entry(LogType.SUCCESS.value, message)
-    
-    def info(self, message: str, level: int = 1):
+            _safe_print(f"[OK] {message}")
+        self._add_entry(LogType.SUCCESS.value, message)
+
+
+    def info(self, message: str, level: int = 0):
         """一般資訊"""
         if self.debug_level >= level:
-            print(f"[*] {message}")
-            self._add_entry(LogType.INFO.value, message)
-    
+            _safe_print(f"[*] {message}")
+        self._add_entry(LogType.INFO.value, message)
+
     def data(self, message: str, level: int = 0):
         """數據輸出"""
         if self.debug_level >= level:
-            print(message)
-            self._add_entry(LogType.DATA.value, message)
+            _safe_print(message)
+        self._add_entry(LogType.DATA.value, message)
     
     def stomp_frame(self, direction: str, headers: Dict, body_preview: Optional[bytes] = None, level: int = 2):
         """STOMP幀日誌"""
@@ -159,40 +200,57 @@ class Logger:
             return
         
         arrow = ">>>>" if direction == "send" else "<<<<"
-        print(f"\n{arrow} STOMP Frame {arrow}")
+        _safe_print(f"\n{arrow} STOMP Frame {arrow}")
         
         if self.debug_level >= 2 and headers:
             for key, value in headers.items():
-                print(f"  {key}: {value}")
+                _safe_print(f"  {key}: {value}")
         
         if self.debug_level >= 3 and body_preview:
             if isinstance(body_preview, bytes):
                 if len(body_preview) > 100:
-                    print(f"  Body: {body_preview[:100].hex()}... ({len(body_preview)} bytes)")
+                    _safe_print(f"  Body: {body_preview[:100].hex()}... ({len(body_preview)} bytes)")
                 else:
-                    print(f"  Body: {body_preview.hex()}")
+                    _safe_print(f"  Body: {body_preview.hex()}")
             else:
-                print(f"  Body: {body_preview}")
-        print("")
+                _safe_print(f"  Body: {body_preview}")
+        _safe_print("")
         
         self._add_entry(LogType.STOMP.value, f"{arrow} STOMP {direction}")
     
     def usp_message(self, direction: str, endpoint: str, msg_type: str, 
                     details: Optional[Dict] = None, level: int = 1):
-        """USP訊息日誌"""
+        """USP訊息日誌（記錄完整 Request / Response 訊息細節）"""
         if self.debug_level < level:
             return
-        
-        arrow = "→" if direction == "send" else "←"
-        log_msg = f"{arrow} USP {msg_type} {arrow} {endpoint}"
-        print(log_msg)
-        self._add_entry(LogType.USP.value, log_msg)
-        
-        if self.debug_level >= 2 and details:
+
+        arrow = "->" if direction == "send" else "<-"
+        title = f"{arrow} USP {msg_type} {arrow} {endpoint}"
+
+        full_lines = [title]
+        if details:
             for key, value in details.items():
-                detail_msg = f"    {key}: {value}"
-                print(detail_msg)
-                self._add_entry(LogType.DETAIL.value, detail_msg)
+                if isinstance(value, dict):
+                    full_lines.append(f"  {key}:")
+                    for sk, sv in value.items():
+                        full_lines.append(f"    {sk} = {sv}")
+                elif isinstance(value, list):
+                    full_lines.append(f"  {key}:")
+                    for item in value:
+                        full_lines.append(f"    * {item}")
+                else:
+                    full_lines.append(f"  {key}: {value}")
+
+        full_msg = "\n".join(full_lines)
+        _safe_print(title)
+
+        if self.debug_level >= 1 and details:
+            for line in full_lines[1:]:
+                _safe_print(line)
+
+        self._add_entry(LogType.USP.value, full_msg)
+
+
     
     def get_history(self, since_id: int = -1, max_count: int = 100) -> List[Dict]:
         """獲取日誌歷史"""
@@ -222,6 +280,11 @@ def set_debug_level(level: int) -> bool:
     return _logger_instance.set_debug_level(level)
 
 
+def get_debug_level() -> int:
+    """獲取調試級別"""
+    return _logger_instance.debug_level
+
+
 def get_logger() -> Logger:
     """獲取logger實例"""
     return _logger_instance
@@ -237,3 +300,4 @@ stomp_frame = _logger_instance.stomp_frame
 usp_message = _logger_instance.usp_message
 get_history = _logger_instance.get_history
 clear_history = _logger_instance.clear_history
+

@@ -22,13 +22,38 @@ import socket
 import threading
 import time
 import sys
+import io
+import os
 from collections import defaultdict
 from typing import Dict, List, Set, Optional, Callable
 from dataclasses import dataclass
 import logging
 
+# Force UTF-8 encoding on Windows to avoid CP950 UnicodeEncodeError
+if sys.platform == 'win32':
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+    except Exception:
+        pass
+
+def _safe_print(text: str = ""):
+    """Safe print with CP950 encoding fallback"""
+    try:
+        print(text)
+    except (UnicodeEncodeError, Exception):
+        try:
+            cleaned = text.encode('ascii', errors='replace').decode('ascii')
+            print(cleaned)
+        except Exception:
+            pass
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 
 @dataclass
@@ -147,11 +172,35 @@ class EmbeddedBroker:
             return "Unknown process"
         except Exception:
             return "Cannot detect"
-    
-    def start(self):
+
+    @staticmethod
+    def kill_process_on_port(port: int, exclude_pid: Optional[int] = None) -> bool:
+
+        """Terminate any processes holding the specified port on Windows."""
+        try:
+            import subprocess
+            res = subprocess.run(f'netstat -ano | findstr :{port}', shell=True, capture_output=True, text=True)
+            killed = False
+            if res.stdout:
+                for line in res.stdout.strip().split('\n'):
+                    parts = line.split()
+                    if len(parts) >= 5 and ('LISTENING' in line or 'ESTABLISHED' in line):
+                        pid_str = parts[-1]
+                        if pid_str.isdigit():
+                            pid = int(pid_str)
+                            if exclude_pid is None or pid != exclude_pid:
+                                subprocess.run(f'taskkill /F /PID {pid}', shell=True, capture_output=True)
+                                killed = True
+            return killed
+        except Exception:
+            return False
+
+    def start(self, started_callback=None):
         """Start broker"""
         if self.running:
             logger.warning("Broker already running")
+            if started_callback:
+                started_callback()
             return
         
         # Check if port is available
@@ -168,25 +217,21 @@ class EmbeddedBroker:
                 f"3. Run as administrator\n"
             )
             logger.error(error_msg)
-            raise OSError(f"Port {self.port} unavailable (possibly used by {process_info})")
-        
-        self.running = True
+            raise OSError(f"Port {self.port} unavailable (currently used by {process_info})")
         
         try:
             # Create server socket
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            
-            # Windows specific: Set SO_EXCLUSIVEADDRUSE to prevent other processes
-            if sys.platform == 'win32':
-                try:
-                    # SO_EXCLUSIVEADDRUSE = 0x0004
-                    self.server_socket.setsockopt(socket.SOL_SOCKET, 0x0004, 1)
-                except:
-                    pass  # Ignore if not supported
-            
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(5)
+            self.running = True
+
+            if started_callback:
+                try:
+                    started_callback()
+                except Exception:
+                    pass
         
         except PermissionError as e:
             self.running = False
@@ -203,36 +248,24 @@ class EmbeddedBroker:
         
         except OSError as e:
             self.running = False
-            if e.errno == 10013 or 'WinError 10013' in str(e):
-                process_info = self.find_process_on_port(self.port)
-                error_msg = (
-                    f"ERROR: Port access denied (WinError 10013)\n\n"
-                    f"Port {self.port} may be in use or restricted\n"
-                    f"Process using port: {process_info}\n\n"
-                    f"Solutions:\n"
-                    f"1. Run as administrator\n"
-                    f"2. Kill the process: taskkill /PID <PID> /F\n"
-                    f"3. Use different port (e.g. 61614)\n"
-                    f"4. Check firewall settings\n"
-                )
-                logger.error(error_msg)
-                raise OSError(error_msg) from e
-            else:
-                logger.error(f"Failed to start broker: {e}")
-                raise
+            process_info = self.find_process_on_port(self.port)
+            error_msg = f"Port {self.port} bind failed: {e} (Process on port: {process_info})"
+            logger.error(error_msg)
+            raise OSError(error_msg) from e
         
-        logger.info(f"✅ Embedded STOMP Broker started on {self.host}:{self.port}")
-        logger.info(f"📌 Clients can connect to: stomp://{self.host}:{self.port}")
-        
+        logger.info(f"[OK] Embedded STOMP Broker started on {self.host}:{self.port}")
+        logger.info(f"[INFO] Clients can connect to: stomp://{self.host}:{self.port}")
+
         # Start accept connection thread
         accept_thread = threading.Thread(target=self._accept_connections, daemon=True)
         accept_thread.start()
-    
+
+
     def stop(self):
         """stop broker"""
         logger.info("Stopping broker...")
         self.running = False
-        
+
         # Close all clients
         with self.lock:
             for client in self.clients:
@@ -240,20 +273,21 @@ class EmbeddedBroker:
                     client.conn.close()
                 except:
                     pass
-        
+
         # Close server
         if self.server_socket:
             self.server_socket.close()
-        
-        logger.info("✅ Broker stopped")
-    
+
+        logger.info("[OK] Broker stopped")
+
     def _accept_connections(self):
         """Accept client connections"""
         while self.running:
             try:
                 conn, addr = self.server_socket.accept()
-                logger.info(f"📥 New connection from {addr}")
+                logger.info(f"[CONN] New connection from {addr}")
                 self._emit_debug(f"[CONN] New TCP client {addr}")
+
                 
                 client = Client(conn, addr)
                 
@@ -305,15 +339,20 @@ class EmbeddedBroker:
             self._disconnect_client(client)
     
     def _parse_frame(self, data: bytes) -> Optional[StompFrame]:
-        """Parse STOMP frame"""
+        """Parse STOMP frame supporting both CRLF and LF header separators"""
         try:
             if not data:
                 return None
 
-            header_end = data.find(b'\n\n')
-            if header_end >= 0:
-                header_blob = data[:header_end]
-                body = data[header_end + 2:]
+            header_end_crlf = data.find(b'\r\n\r\n')
+            header_end_lf = data.find(b'\n\n')
+
+            if header_end_crlf >= 0 and (header_end_lf < 0 or header_end_crlf < header_end_lf):
+                header_blob = data[:header_end_crlf]
+                body = data[header_end_crlf + 4:]
+            elif header_end_lf >= 0:
+                header_blob = data[:header_end_lf]
+                body = data[header_end_lf + 2:]
             else:
                 # Heartbeat or malformed frame without body separator
                 header_blob = data
@@ -343,16 +382,33 @@ class EmbeddedBroker:
             return None
 
     def _extract_frame_from_buffer(self, buffer: bytes):
-        """Extract one complete STOMP frame from buffer.
+        """Extract one complete STOMP frame from buffer supporting both CRLF and LF.
 
         Returns (frame_bytes_without_null, consumed_bytes) or (None, 0) if incomplete.
         """
         if not buffer:
             return None, 0
 
-        header_end = buffer.find(b'\n\n')
-        if header_end < 0:
-            return None, 0
+        # Discard leading heartbeat newlines or null bytes
+        stripped_idx = 0
+        while stripped_idx < len(buffer) and buffer[stripped_idx] in (10, 13, 0):
+            stripped_idx += 1
+        if stripped_idx > 0:
+            buffer = buffer[stripped_idx:]
+            if not buffer:
+                return None, stripped_idx
+
+        header_end_crlf = buffer.find(b'\r\n\r\n')
+        header_end_lf = buffer.find(b'\n\n')
+
+        if header_end_crlf >= 0 and (header_end_lf < 0 or header_end_crlf < header_end_lf):
+            header_end = header_end_crlf
+            body_start = header_end + 4
+        elif header_end_lf >= 0:
+            header_end = header_end_lf
+            body_start = header_end + 2
+        else:
+            return None, stripped_idx
 
         header_bytes = buffer[:header_end]
         header_text = header_bytes.decode('utf-8', errors='ignore')
@@ -368,27 +424,26 @@ class EmbeddedBroker:
                         content_length = None
                     break
 
-        body_start = header_end + 2
-
         if content_length is not None and content_length >= 0:
             required = body_start + content_length + 1  # include trailing NULL
             if len(buffer) < required:
-                return None, 0
+                return None, stripped_idx
 
             if buffer[required - 1] != 0:
-                # malformed frame; wait for more bytes conservatively
-                return None, 0
+                # malformed frame or no null; accept body as-is if null is right after
+                frame_bytes = buffer[:body_start + content_length]
+                return frame_bytes, stripped_idx + body_start + content_length + (1 if len(buffer) > body_start + content_length and buffer[body_start + content_length] == 0 else 0)
 
             frame_bytes = buffer[:required - 1]  # exclude trailing NULL
-            return frame_bytes, required
+            return frame_bytes, stripped_idx + required
 
         # No content-length: use NULL terminator
         null_pos = buffer.find(b'\x00', body_start)
         if null_pos < 0:
-            return None, 0
+            return None, stripped_idx
 
         frame_bytes = buffer[:null_pos]
-        return frame_bytes, null_pos + 1
+        return frame_bytes, stripped_idx + null_pos + 1
     
     def _process_frame(self, client: Client, frame: StompFrame):
         """Handle STOMP frame"""
@@ -435,51 +490,52 @@ class EmbeddedBroker:
         )
         
         if client.send_frame(response):
-            logger.info(f"✅ Client {client.addr} connected (session: {client.session_id})")
+            logger.info(f"[OK] Client {client.addr} connected (session: {client.session_id})")
             self._emit_debug(f"[HANDSHAKE] CONNECTED sent to {client.addr} session={client.session_id}")
         else:
             self._emit_debug(f"[HANDSHAKE] Failed sending CONNECTED to {client.addr}")
-    
+
     def _handle_subscribe(self, client: Client, frame: StompFrame):
         """Handle SUBSCRIBE"""
         destination = frame.headers.get("destination")
         sub_id = frame.headers.get("id", str(id(client)))
-        
+
         if not destination:
             logger.warning("SUBSCRIBE without destination")
             return
-        
+
         with self.lock:
             client.subscriptions[sub_id] = destination
             self.subscribers[destination].add(client)
-        
-        logger.info(f"📬 Client {client.addr} subscribed to {destination}")
-        
+
+        logger.info(f"[SUB] Client {client.addr} subscribed to {destination}")
+
         # Send queued messages（if any）
         self._deliver_queued_messages(destination, client)
-    
+
     def _handle_unsubscribe(self, client: Client, frame: StompFrame):
         """Handle UNSUBSCRIBE"""
         sub_id = frame.headers.get("id")
-        
+
         if sub_id and sub_id in client.subscriptions:
             destination = client.subscriptions.pop(sub_id)
-            
+
             with self.lock:
                 if client in self.subscribers[destination]:
                     self.subscribers[destination].remove(client)
-            
-            logger.info(f"📭 Client {client.addr} unsubscribed from {destination}")
-    
+
+            logger.info(f"[UNSUB] Client {client.addr} unsubscribed from {destination}")
+
     def _handle_send(self, client: Client, frame: StompFrame):
         """Handle SEND"""
         destination = frame.headers.get("destination")
-        
+
         if not destination:
             logger.warning("SEND without destination")
             return
-        
-        logger.info(f"📤 Message to {destination} from {client.addr}")
+
+        logger.info(f"[TX] Message to {destination} from {client.addr}")
+
 
         # Preserve sender-provided headers when relaying to subscribers.
         # Remove destination because MESSAGE destination is set explicitly.
@@ -567,41 +623,85 @@ class EmbeddedBroker:
             # Remove client
             if client in self.clients:
                 self.clients.remove(client)
-        
+
         try:
             client.conn.close()
-        except:
+        except Exception:
             pass
 
 
+def kill_process_on_port(port: int, exclude_pid: Optional[int] = None) -> bool:
+    """Terminate any processes holding the specified port on Windows."""
+    return EmbeddedBroker.kill_process_on_port(port, exclude_pid)
+
+
+def start_embedded_broker_thread(host: str = "0.0.0.0", port: int = 61614) -> EmbeddedBroker:
+    """Start embedded STOMP broker in a background daemon thread with startup sync & error check."""
+    broker = EmbeddedBroker(host=host, port=port)
+    started_event = threading.Event()
+    errors = []
+
+    def run():
+        try:
+            broker.start(started_callback=lambda: started_event.set())
+        except Exception as e:
+            errors.append(e)
+            started_event.set()
+
+    t = threading.Thread(target=run, daemon=True, name="EmbeddedBroker-Thread")
+    t.start()
+    started_event.wait(timeout=2.5)
+
+    if errors:
+        raise errors[0]
+    if not broker.running:
+        raise RuntimeError(f"Embedded STOMP Broker failed to bind and start on {host}:{port}")
+
+    return broker
+
+
+
+
 def main():
-    """Command-line startup"""
+    """Command-line standalone STOMP Broker startup"""
     import argparse
-    
-    parser = argparse.ArgumentParser(description="Embedded STOMP Broker (for development/testing)")
-    parser.add_argument("--host", default="0.0.0.0", help="Listen address")
-    parser.add_argument("--port", type=int, default=61613, help="Listen port")
-    
+
+    parser = argparse.ArgumentParser(description="Standalone STOMP Message Broker (for USP TR-369)")
+    parser.add_argument("--host", default="0.0.0.0", help="Listen address (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=61614, help="Listen port (default: 61614)")
     args = parser.parse_args()
-    
+
     broker = EmbeddedBroker(host=args.host, port=args.port)
-    broker.start()
-    
     try:
-        print("\n" + "="*60)
-        print("  Embedded STOMP Broker Started")
-        print("  WARNING: For development/testing only - Use professional broker in production")
-        print("="*60)
-        print(f"\nConnection: stomp://{args.host}:{args.port}")
-        print("Press Ctrl+C to stop\n")
-        
-        while True:
-            time.sleep(1)
-    
+        broker.start()
+    except Exception as e:
+        _safe_print(f"\n[!] 啟動 Broker 失敗: 通訊埠 {args.port} 可能已被佔用或權限不足: {e}")
+        _safe_print(f"[!] 請先嘗試執行 'kill_process_on_port({args.port})' 或關閉佔用該 Port 的程式。\n")
+        sys.exit(1)
+
+    _safe_print("\n" + "=" * 70)
+    _safe_print("  \033[96m[+] STOMP MESSAGE BROKER (Standalone Console Window)\033[0m")
+    _safe_print("=" * 70)
+    _safe_print(f"  * Process PID:     \033[93m{os.getpid()}\033[0m")
+    _safe_print(f"  * STOMP Endpoint:  \033[92mstomp://{args.host}:{args.port}\033[0m")
+    _safe_print(f"  * Listen Port:     \033[92m{args.port} (LISTENING)\033[0m")
+    _safe_print(f"  * Status:          \033[92mONLINE / READY FOR CONNECTIONS\033[0m")
+    _safe_print("=" * 70)
+    _safe_print("  \033[90mPress Ctrl+C in this console window to gracefully stop the Broker.\033[0m")
+    _safe_print("=" * 70 + "\n")
+
+    try:
+        while broker.running:
+            time.sleep(1.0)
     except KeyboardInterrupt:
-        print("\n\nStopping Broker...")
+        _safe_print("\n[!] Ctrl+C received, shutting down STOMP Broker...")
+    finally:
         broker.stop()
+        _safe_print("[OK] STOMP Broker stopped successfully.")
+
 
 
 if __name__ == "__main__":
     main()
+
+
