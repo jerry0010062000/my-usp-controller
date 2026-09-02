@@ -603,17 +603,19 @@ class USPGuiApp:
         ttk.Button(p_filter_row, text="清除過濾 (X)", command=self._clear_param_filter).pack(side=tk.RIGHT)
 
         # Param Treeview Table
-        p_cols = ("path", "value", "type", "updated")
+        p_cols = ("path", "value", "type", "access", "updated")
         self.param_tree = ttk.Treeview(self.tab_params, columns=p_cols, show="headings")
         self.param_tree.heading("path", text="參數路徑 (Parameter Path)")
         self.param_tree.heading("value", text="參數值 (Value)")
         self.param_tree.heading("type", text="型別 (Type)")
+        self.param_tree.heading("access", text="權限 (Access)")
         self.param_tree.heading("updated", text="最後更新時間")
 
-        self.param_tree.column("path", width=380, anchor=tk.W)
-        self.param_tree.column("value", width=240, anchor=tk.W)
-        self.param_tree.column("type", width=90, anchor=tk.W)
-        self.param_tree.column("updated", width=140, anchor=tk.W)
+        self.param_tree.column("path", width=360, anchor=tk.W)
+        self.param_tree.column("value", width=200, anchor=tk.W)
+        self.param_tree.column("type", width=90, anchor=tk.CENTER)
+        self.param_tree.column("access", width=95, anchor=tk.CENTER)
+        self.param_tree.column("updated", width=110, anchor=tk.CENTER)
 
         p_scroll_y = ttk.Scrollbar(self.tab_params, orient=tk.VERTICAL, command=self.param_tree.yview)
         self.param_tree.configure(yscrollcommand=p_scroll_y.set)
@@ -1639,39 +1641,98 @@ class USPGuiApp:
         now_str = time.strftime("%H:%M:%S")
         updated_count = 0
 
+        # TR-369 Type & Access Decoders
+        val_type_map = {
+            0: "Unknown", 1: "Unspecified", 2: "Boolean", 3: "DateTime",
+            4: "Int", 5: "UnsignedInt", 6: "Long", 7: "UnsignedLong",
+            8: "String", 9: "Bytes", 10: "Base64", 11: "HexBinary", 12: "Decimal"
+        }
+        param_access_map = {0: "唯讀 (RO)", 1: "可讀寫 (RW)", 2: "唯寫 (WO)"}
+        obj_access_map = {0: "唯讀 (RO)", 1: "可增刪 (RW)", 2: "僅新增 (Add)", 3: "僅刪除 (Del)"}
+
+        def parse_supported_dm_item(item_obj):
+            nonlocal updated_count
+            s_objs = item_obj.get("supported_objs", [])
+            for s_obj in s_objs:
+                obj_path = s_obj.get("supported_obj_path", "")
+                raw_obj_acc = s_obj.get("access", 0)
+                obj_acc = obj_access_map.get(raw_obj_acc, "物件 (RO)") if isinstance(raw_obj_acc, int) else str(raw_obj_acc)
+                if obj_path:
+                    self._upsert_param_row(obj_path, "(Object Schema)", "Object", obj_acc, now_str)
+                    updated_count += 1
+
+                for p in s_obj.get("supported_params", []):
+                    p_name = p.get("param_name", "")
+                    full_path = (obj_path + p_name) if obj_path.endswith(".") else f"{obj_path}.{p_name}"
+                    raw_t = p.get("value_type", 8)
+                    p_type = val_type_map.get(raw_t, str(raw_t)) if isinstance(raw_t, int) else str(raw_t)
+                    raw_a = p.get("access", 0)
+                    p_acc = param_access_map.get(raw_a, "可讀寫 (RW)" if raw_a == 1 else "唯讀 (RO)") if isinstance(raw_a, int) else str(raw_a)
+                    self._upsert_param_row(full_path, "(Schema Definition)", p_type, p_acc, now_str)
+                    updated_count += 1
+
+                for cmd in s_obj.get("supported_commands", []):
+                    c_name = cmd.get("command_name", "")
+                    full_path = (obj_path + c_name) if obj_path.endswith(".") else f"{obj_path}.{c_name}"
+                    self._upsert_param_row(full_path, "(Command RPC)", "Command", "可執行 (Exec)", now_str)
+                    updated_count += 1
+
+                for ev in s_obj.get("supported_events", []):
+                    e_name = ev.get("event_name", "")
+                    full_path = (obj_path + e_name) if obj_path.endswith(".") else f"{obj_path}.{e_name}"
+                    self._upsert_param_row(full_path, "(Event)", "Event", "事件通知", now_str)
+                    updated_count += 1
+
         if isinstance(res.data, list):
             for item in res.data:
                 if isinstance(item, dict):
-                    # Format: {"Parameter": "...", "Value": "..."} or {"path": "...", "value": "..."}
-                    p = item.get("Parameter") or item.get("path") or item.get("param") or item.get("instantiated_path")
-                    v = item.get("Value") if "Value" in item else item.get("value", "")
-                    ptype = item.get("Type") or item.get("type") or (type(v).__name__ if v != "" else "String")
-                    if p:
-                        self._upsert_param_row(str(p), str(v), str(ptype), now_str)
-                        updated_count += 1
+                    # Check if GetSupportedDM format
+                    if "supported_objs" in item or "req_obj_path" in item:
+                        parse_supported_dm_item(item)
+                    else:
+                        # Format: {"Parameter": "...", "Value": "..."} or {"path": "...", "value": "..."}
+                        p = item.get("Parameter") or item.get("path") or item.get("param") or item.get("instantiated_path")
+                        v = item.get("Value") if "Value" in item else item.get("value", "")
+                        ptype = item.get("Type") or item.get("type") or (type(v).__name__ if v != "" else "String")
+                        pacc = item.get("access") or item.get("writable")
+                        pacc_str = "可讀寫 (RW)" if pacc is True or pacc == 1 else ("唯讀 (RO)" if pacc is False or pacc == 0 else (str(pacc) if pacc else "-"))
+                        if p:
+                            self._upsert_param_row(str(p), str(v), str(ptype), pacc_str, now_str)
+                            updated_count += 1
                 elif isinstance(item, str):
                     # Format: list of instance paths e.g. "Device.IP.Interface.1."
-                    self._upsert_param_row(str(item), "(Instance / Object)", "Object", now_str)
+                    self._upsert_param_row(str(item), "(Instance / Object)", "Object", "實例 (Inst)", now_str)
                     updated_count += 1
 
         elif isinstance(res.data, dict):
-            params = res.data.get("parameters", res.data)
-            if isinstance(params, dict):
-                for p, v in params.items():
-                    ptype = type(v).__name__
-                    self._upsert_param_row(str(p), str(v), ptype, now_str)
+            if "supported_dm" in res.data and isinstance(res.data["supported_dm"], list):
+                for dm_item in res.data["supported_dm"]:
+                    parse_supported_dm_item(dm_item)
+            elif "instances" in res.data and isinstance(res.data["instances"], list):
+                for inst_path in res.data["instances"]:
+                    self._upsert_param_row(str(inst_path), "(Instance / Object)", "Object", "實例 (Inst)", now_str)
                     updated_count += 1
-            elif isinstance(params, list):
-                for item in params:
-                    if isinstance(item, dict):
-                        p = item.get("Parameter") or item.get("path") or item.get("param")
-                        v = item.get("Value", item.get("value", ""))
-                        if p:
-                            self._upsert_param_row(str(p), str(v), "String", now_str)
-                            updated_count += 1
-                    else:
-                        self._upsert_param_row(str(item), "(Instance / Object)", "Object", now_str)
+            else:
+                params = res.data.get("parameters", res.data)
+                if isinstance(params, dict):
+                    for p, v in params.items():
+                        ptype = type(v).__name__
+                        self._upsert_param_row(str(p), str(v), ptype, "-", now_str)
                         updated_count += 1
+                elif isinstance(params, list):
+                    for item in params:
+                        if isinstance(item, dict):
+                            if "supported_objs" in item:
+                                parse_supported_dm_item(item)
+                            else:
+                                p = item.get("Parameter") or item.get("path") or item.get("param")
+                                v = item.get("Value", item.get("value", ""))
+                                if p:
+                                    self._upsert_param_row(str(p), str(v), "String", "-", now_str)
+                                    updated_count += 1
+                        else:
+                            self._upsert_param_row(str(item), "(Instance / Object)", "Object", "實例 (Inst)", now_str)
+                            updated_count += 1
 
         if updated_count > 0:
             self._filter_params()
@@ -1683,7 +1744,7 @@ class USPGuiApp:
             if res.message:
                 lines.append(f"【狀態訊息】\n{res.message}\n")
             elif updated_count > 0:
-                lines.append(f"【狀態訊息】\n已成功查詢並更新 {updated_count} 筆參數至檢視表！\n")
+                lines.append(f"【狀態訊息】\n已成功查詢並更新 {updated_count} 筆參數/架構至檢視表！\n")
             else:
                 lines.append("【狀態訊息】\n操作已成功完成！\n")
 
@@ -1703,7 +1764,7 @@ class USPGuiApp:
         self._filter_params()
 
     def _filter_params(self):
-        """Filter parameters by path, value, or type in real time"""
+        """Filter parameters by path, value, type, or access in real time"""
         filter_text = self.param_filter_var.get().strip().lower()
         self.param_tree.delete(*self.param_tree.get_children())
 
@@ -1713,24 +1774,39 @@ class USPGuiApp:
         for path, item in sorted(self.cached_params.items()):
             val = str(item.get("value", ""))
             ptype = str(item.get("type", ""))
+            access = str(item.get("access", "-"))
             updated = str(item.get("updated", ""))
 
-            # Filter matches path, value, or type
+            # Filter matches path, value, type, or access
             if filter_text:
-                if filter_text not in path.lower() and filter_text not in val.lower() and filter_text not in ptype.lower():
+                if (filter_text not in path.lower() and 
+                    filter_text not in val.lower() and 
+                    filter_text not in ptype.lower() and 
+                    filter_text not in access.lower()):
                     continue
 
-            self.param_tree.insert("", tk.END, values=(path, val, ptype, updated))
+            self.param_tree.insert("", tk.END, values=(path, val, ptype, access, updated))
             displayed += 1
 
         self.lbl_param_count.config(text=f"顯示: {displayed} / {total} 筆")
 
-    def _upsert_param_row(self, path: str, val: str, ptype: str, now_str: str):
-        """Store into cache dict (Treeview will be rendered via _filter_params)"""
+    def _upsert_param_row(self, path: str, val: str, ptype: str, access: str, now_str: str):
+        """Store into cache dict with access/writable support (Treeview rendered via _filter_params)"""
+        existing = self.cached_params.get(path, {})
+
+        # If new access is unspecified ("-"), preserve existing known access
+        if access == "-" and "access" in existing and existing["access"] != "-":
+            access = existing["access"]
+
+        # If new val is "(Schema Definition)" and existing has an actual runtime value, keep the runtime value
+        if val == "(Schema Definition)" and existing.get("value") and existing["value"] not in ("(Schema Definition)", "(Instance / Object)"):
+            val = existing["value"]
+
         self.cached_params[path] = {
             "path": path,
             "value": val,
             "type": ptype,
+            "access": access,
             "updated": now_str
         }
 
