@@ -23,6 +23,111 @@ sys.path.insert(0, str(Path(__file__).parent))
 from usp_controller.ipc import IPCClient, check_port_listening
 
 
+def show_selectable_dialog(parent, title: str, message: str, dialog_type: str = "info"):
+    """
+    Open a modern modal dialog where the text is fully selectable, highlightable,
+    and copyable with keyboard shortcuts and a dedicated 'Copy' button.
+    dialog_type: 'error', 'warning', 'info', or 'success'
+    """
+    top = tk.Toplevel(parent)
+    top.title(title)
+    top.geometry("580x360")
+    top.minsize(440, 250)
+    top.configure(bg="#f8fafc")
+    top.transient(parent)
+
+    # Position relative to parent
+    try:
+        x = parent.winfo_rootx() + (parent.winfo_width() // 2) - 290
+        y = parent.winfo_rooty() + (parent.winfo_height() // 2) - 180
+        top.geometry(f"+{max(50, x)}+{max(50, y)}")
+    except Exception:
+        pass
+
+    # Colors & Icons based on type
+    if dialog_type == "error":
+        header_bg = "#fef2f2"
+        badge_fg = "#dc2626"
+        icon_str = "❌ 錯誤訊息"
+    elif dialog_type == "warning":
+        header_bg = "#fffbeb"
+        badge_fg = "#d97706"
+        icon_str = "⚠️ 警告提示"
+    elif dialog_type == "success":
+        header_bg = "#f0fdf4"
+        badge_fg = "#059669"
+        icon_str = "✅ 執行成功"
+    else:
+        header_bg = "#f0f9ff"
+        badge_fg = "#0284c7"
+        icon_str = "ℹ️ 系統提示"
+
+    # Header Bar
+    hdr = tk.Frame(top, bg=header_bg, padx=14, pady=10)
+    hdr.pack(fill=tk.X)
+    tk.Label(hdr, text=icon_str, font=("Segoe UI", 11, "bold"), fg=badge_fg, bg=header_bg).pack(side=tk.LEFT)
+    tk.Label(hdr, text=title, font=("Segoe UI", 10), fg="#475569", bg=header_bg).pack(side=tk.LEFT, padx=(10, 0))
+
+    # Body with ScrolledText (Selectable / Copyable)
+    body_frame = ttk.Frame(top, padding=12)
+    body_frame.pack(fill=tk.BOTH, expand=True)
+
+    txt = scrolledtext.ScrolledText(
+        body_frame,
+        wrap=tk.WORD,
+        font=("Consolas", 10),
+        bg="#ffffff",
+        fg="#0f172a",
+        padx=10,
+        pady=8,
+        relief="solid",
+        bd=1,
+        selectbackground="#0284c7",
+        selectforeground="#ffffff"
+    )
+    txt.pack(fill=tk.BOTH, expand=True)
+    txt.insert("1.0", str(message))
+
+    # Ctrl+A select all
+    def select_all(event=None):
+        txt.tag_add(tk.SEL, "1.0", tk.END)
+        txt.mark_set(tk.INSERT, "1.0")
+        txt.see(tk.INSERT)
+        return "break"
+
+    txt.bind("<Control-a>", select_all)
+    txt.bind("<Control-A>", select_all)
+
+    # Bottom Actions Bar
+    btn_bar = ttk.Frame(top, padding=(12, 10))
+    btn_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+    def copy_to_clipboard():
+        try:
+            if txt.tag_ranges(tk.SEL):
+                selected_text = txt.get(tk.SEL_FIRST, tk.SEL_LAST)
+            else:
+                selected_text = txt.get("1.0", tk.END).strip()
+            top.clipboard_clear()
+            top.clipboard_append(selected_text)
+            btn_copy.config(text="✓ 已複製至剪貼簿！")
+            top.after(1500, lambda: btn_copy.config(text="📋 複製內容 (Copy)"))
+        except Exception:
+            pass
+
+    btn_copy = ttk.Button(btn_bar, text="📋 複製內容 (Copy)", command=copy_to_clipboard)
+    btn_copy.pack(side=tk.LEFT)
+
+    btn_ok = ttk.Button(btn_bar, text="確定 (OK)", style="Primary.TButton", command=top.destroy)
+    btn_ok.pack(side=tk.RIGHT)
+
+    top.bind("<Escape>", lambda e: top.destroy())
+
+    top.grab_set()
+    txt.focus_set()
+    top.wait_window()
+
+
 class USPGuiApp:
     """
     TR-369 USP Controller GUI Application
@@ -84,6 +189,18 @@ class USPGuiApp:
         self.poll_thread = threading.Thread(target=self._periodic_daemon_polling, daemon=True)
         self.poll_thread.start()
 
+    def show_error(self, title: str, message: str):
+        show_selectable_dialog(self.root, title, message, dialog_type="error")
+
+    def show_warning(self, title: str, message: str):
+        show_selectable_dialog(self.root, title, message, dialog_type="warning")
+
+    def show_info(self, title: str, message: str):
+        show_selectable_dialog(self.root, title, message, dialog_type="info")
+
+    def show_success(self, title: str, message: str):
+        show_selectable_dialog(self.root, title, message, dialog_type="success")
+
     def _setup_styles(self):
         self.style = ttk.Style()
         try:
@@ -108,8 +225,11 @@ class USPGuiApp:
 
         # Treeview Styles
         self.style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"), background="#e2e8f0", foreground="#0f172a")
-        self.style.configure("Treeview", rowheight=26, background="#ffffff", fieldbackground="#ffffff")
-        self.style.map("Treeview", background=[("selected", "#e0f2fe")], foreground=[("selected", "#0369a1")])
+        self.style.configure("Treeview", rowheight=26, background="#ffffff", fieldbackground="#ffffff", foreground="#0f172a")
+        self.style.map("Treeview", 
+            background=[("selected", "#0284c7"), ("!focus", "#e0f2fe")], 
+            foreground=[("selected", "#ffffff"), ("!focus", "#0f172a")]
+        )
 
         # Button Styles
         self.style.configure("Action.TButton", font=("Segoe UI", 9, "bold"), padding=[10, 5])
@@ -257,30 +377,9 @@ class USPGuiApp:
         self.lbl_dev_count = ttk.Label(info_row, text="已發現 0 個設備 (自動刷新中)", foreground="#64748b", font=("Segoe UI", 8))
         self.lbl_dev_count.pack(side=tk.LEFT)
 
-        # Device Treeview Table
-        cols = ("status", "endpoint", "ip", "proto")
-        self.dev_tree = ttk.Treeview(left_frame, columns=cols, show="headings", selectmode="browse")
-        self.dev_tree.heading("status", text="狀態")
-        self.dev_tree.heading("endpoint", text="Agent Endpoint ID")
-        self.dev_tree.heading("ip", text="IP / 通道")
-        self.dev_tree.heading("proto", text="協議")
-
-        self.dev_tree.column("status", width=55, anchor=tk.CENTER)
-        self.dev_tree.column("endpoint", width=190, anchor=tk.W)
-        self.dev_tree.column("ip", width=95, anchor=tk.W)
-        self.dev_tree.column("proto", width=65, anchor=tk.CENTER)
-
-        dev_scroll = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.dev_tree.yview)
-        self.dev_tree.configure(yscrollcommand=dev_scroll.set)
-
-        self.dev_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        dev_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.dev_tree.bind("<<TreeviewSelect>>", self.on_device_selected)
-
-        # Bottom Buttons (Vertical Stack)
+        # Bottom Buttons (Packed first at bottom to reserve space)
         btn_frame = ttk.Frame(left_frame)
-        btn_frame.pack(fill=tk.X, pady=(8, 0), side=tk.BOTTOM)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
         ttk.Button(btn_frame, text="設為操作目標", style="Primary.TButton", command=self.on_set_active_target).pack(side=tk.TOP, fill=tk.X, expand=True, pady=(0, 4))
         ttk.Button(btn_frame, text="探測 / 連線", command=self.on_probe_agent_clicked).pack(side=tk.TOP, fill=tk.X, expand=True, pady=(0, 4))
 
@@ -288,6 +387,33 @@ class USPGuiApp:
         del_frame.pack(side=tk.TOP, fill=tk.X, expand=True)
         ttk.Button(del_frame, text="清除離線", command=self.on_clear_offline_clicked).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
         ttk.Button(del_frame, text="移除選中", command=self.on_remove_selected_device_clicked).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+
+        # Device Treeview Container (Packed between top filter and bottom buttons)
+        tree_container = ttk.Frame(left_frame)
+        tree_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        cols = ("status", "endpoint", "ip", "proto")
+        self.dev_tree = ttk.Treeview(tree_container, columns=cols, show="headings", selectmode="browse")
+        self.dev_tree.heading("status", text="狀態")
+        self.dev_tree.heading("endpoint", text="Agent Endpoint ID")
+        self.dev_tree.heading("ip", text="IP / 通道")
+        self.dev_tree.heading("proto", text="協議")
+
+        self.dev_tree.column("status", width=70, anchor=tk.CENTER)
+        self.dev_tree.column("endpoint", width=180, anchor=tk.W)
+        self.dev_tree.column("ip", width=95, anchor=tk.W)
+        self.dev_tree.column("proto", width=65, anchor=tk.CENTER)
+
+        dev_scroll = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.dev_tree.yview)
+        self.dev_tree.configure(yscrollcommand=dev_scroll.set)
+
+        self.dev_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        dev_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.dev_tree.tag_configure("online", foreground="#059669")
+        self.dev_tree.tag_configure("offline", foreground="#64748b")
+
+        self.dev_tree.bind("<<TreeviewSelect>>", self.on_device_selected)
 
 
 
@@ -334,10 +460,10 @@ class USPGuiApp:
         self.notebook.add(self.tab_actions, text=" 快捷控制與指令台 (Actions & CMD) ")
         self._build_actions_tab()
 
-        # Tab 3: CDRouter Test Scripts
-        self.tab_scripts = ttk.Frame(self.notebook, padding=8)
-        self.notebook.add(self.tab_scripts, text=" CDRouter 測試腳本 (Test Scripts) ")
-        self._build_scripts_tab()
+        # Tab 3: CDRouter Test Scripts (暫時隱藏)
+        # self.tab_scripts = ttk.Frame(self.notebook, padding=8)
+        # self.notebook.add(self.tab_scripts, text=" CDRouter 測試腳本 (Test Scripts) ")
+        # self._build_scripts_tab()
 
         # Tab 4: Server & Port Monitor Dashboard
         self.tab_monitor = ttk.Frame(self.notebook, padding=12)
@@ -977,7 +1103,7 @@ class USPGuiApp:
             content = txt_guide.get("1.0", tk.END).strip()
             top.clipboard_clear()
             top.clipboard_append(content)
-            messagebox.showinfo("已複製", "✅ 設定指南已成功複製至剪貼簿！", parent=top)
+            show_selectable_dialog(top, "已複製", "✅ 設定指南已成功複製至剪貼簿！", dialog_type="success")
 
         def save_to_file():
             from tkinter import filedialog
@@ -992,9 +1118,9 @@ class USPGuiApp:
                 try:
                     with open(fpath, "w", encoding="utf-8") as f:
                         f.write(content)
-                    messagebox.showinfo("成功", f"✅ 已成功儲存至: {fpath}", parent=top)
+                    show_selectable_dialog(top, "成功", f"✅ 已成功儲存至:\n{fpath}", dialog_type="success")
                 except Exception as ex:
-                    messagebox.showerror("錯誤", f"儲存檔案失敗: {ex}", parent=top)
+                    show_selectable_dialog(top, "錯誤", f"儲存檔案失敗:\n{ex}", dialog_type="error")
 
         ttk.Button(btn_bar, text="📋 複製到剪貼簿", style="Primary.TButton", command=copy_to_clipboard).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_bar, text="💾 另存為檔案...", command=save_to_file).pack(side=tk.LEFT, padx=(0, 8))
@@ -1158,11 +1284,13 @@ class USPGuiApp:
         self.dev_tree.delete(*self.dev_tree.get_children())
         for d in filtered:
             ep = d.get("endpoint_id", "")
-            st_text = "[ON]" if d.get("status") == "online" else "[OFF]"
+            is_online = (d.get("status") == "online")
+            st_text = "🟢 [ON]" if is_online else "🔴 [OFF]"
             ip = d.get("ip_address", d.get("reply_to", "STOMP"))
             proto = d.get("protocol", "STOMP").upper()
+            tag = "online" if is_online else "offline"
 
-            item_id = self.dev_tree.insert("", tk.END, values=(st_text, ep, ip, proto))
+            item_id = self.dev_tree.insert("", tk.END, values=(st_text, ep, ip, proto), tags=(tag,))
             if ep == selected_ep or (not selected_ep and ep == self.active_device_id):
                 self.dev_tree.selection_set(item_id)
                 self.selected_device_id = ep
@@ -1172,24 +1300,32 @@ class USPGuiApp:
         if not selected:
             return
         vals = self.dev_tree.item(selected[0])["values"]
-        ep = vals[1]
+        if not vals or len(vals) < 2:
+            return
+        ep = str(vals[1])
         self.selected_device_id = ep
         self.lbl_selected_title.config(text=f"當前選中設備: {ep}")
         st_label = "在線" if "[ON]" in str(vals[0]) else "離線"
         self.lbl_selected_detail.config(text=f"通道: {vals[2]} | 通訊協議: {vals[3]} | 狀態: {st_label}")
+        
+        # Auto sync active target on click
+        if self.active_device_id != ep:
+            self.active_device_id = ep
+            self.lbl_sub_target.config(text=ep, foreground="#0284c7")
+            threading.Thread(target=lambda: self.ipc_client.set_target(ep), daemon=True).start()
 
 
     def on_set_active_target(self):
         if not self.selected_device_id:
-            messagebox.showinfo("提示", "請先在左側清單中選擇一個 Agent 設備。")
+            self.show_info("提示", "請先在左側清單中選擇一個 Agent 設備。")
             return
         ok = self.ipc_client.set_target(self.selected_device_id)
         if ok:
             self.active_device_id = self.selected_device_id
             self.lbl_sub_target.config(text=self.active_device_id, foreground="#0284c7")
-            messagebox.showinfo("成功", f"已將主控目標切換為: {self.selected_device_id}")
+            self.show_success("成功", f"已將主控目標切換為:\n{self.selected_device_id}")
         else:
-            messagebox.showerror("失敗", "切換目標設備失敗，請確認 Daemon 運行狀態。")
+            self.show_error("失敗", "切換目標設備失敗，請確認 Daemon 運行狀態。")
 
     def on_probe_agent_clicked(self):
         """Prompt user for Agent Endpoint ID and proactively probe/discover it"""
@@ -1207,17 +1343,17 @@ class USPGuiApp:
                     self.ipc_client.set_target(ep)
                     self.refresh_devices()
                     self.status_bar.config(text=f"已成功探測並連線至 Agent: {ep}")
-                    messagebox.showinfo("探測成功", f"已成功收到來自 {ep} 的回應，並已自動註冊至設備清單！")
+                    self.show_success("探測成功", f"已成功收到來自 {ep} 的回應，並已自動註冊至設備清單！")
                 else:
                     self.status_bar.config(text=f"探測 {ep} 未收到回應: {res.error}")
-                    messagebox.showwarning("探測未回應", f"向 {ep} 發送請求未收到回應。\n\n可能原因:\n1. DUT 尚未啟動或尚未連上 STOMP Broker\n2. DUT 的 Controller 白名單未設定本機 Controller ID\n3. DUT 的接收 Topic 與設定不一致\n\n詳細錯誤: {res.error}")
+                    self.show_warning("探測未回應", f"向 {ep} 發送請求未收到回應。\n\n可能原因:\n1. DUT 尚未啟動或尚未連上 STOMP Broker (192.168.1.126:61614)\n2. Windows 防火牆未放行 61614 埠\n3. DUT 的 Controller 白名單未設定 Controller ID: proto::controller.default\n4. DUT 的接收 Topic 與設定不一致\n\n詳細錯誤訊息:\n{res.error}")
             self.root.after(0, on_done)
 
         threading.Thread(target=do_probe, daemon=True).start()
 
     def on_remove_selected_device_clicked(self):
         if not self.selected_device_id:
-            messagebox.showinfo("提示", "請先在左側清單中選擇欲移除的設備。")
+            self.show_info("提示", "請先在左側清單中選擇欲移除的設備。")
             return
         if messagebox.askyesno("確認移除", f"確定要從設備清單中移除「{self.selected_device_id}」嗎？"):
             ok = self.ipc_client.remove_device(self.selected_device_id)
@@ -1226,13 +1362,13 @@ class USPGuiApp:
                 self.refresh_devices()
                 self.status_bar.config(text="已移除指定設備。")
             else:
-                messagebox.showerror("錯誤", "移除設備失敗。")
+                self.show_error("錯誤", "移除設備失敗。")
 
     def on_clear_offline_clicked(self):
         count = self.ipc_client.clear_offline_devices()
         self.refresh_devices()
         self.status_bar.config(text=f"已清理 {count} 個離線設備。")
-        messagebox.showinfo("清理完成", f"已成功清除 {count} 個離線設備！")
+        self.show_success("清理完成", f"已成功清除 {count} 個離線設備！")
 
     def on_refresh_connect_clicked(self):
         self.refresh_devices()
@@ -1250,7 +1386,7 @@ class USPGuiApp:
             else:
                 subprocess.Popen([sys.executable, "tools/embedded_broker.py", "--port", "61614"], cwd=str(Path(__file__).parent))
         except Exception as e:
-            messagebox.showerror("啟動錯誤", f"無法啟動 STOMP Broker: {e}")
+            self.show_error("啟動錯誤", f"無法啟動 STOMP Broker:\n{e}")
 
     def stop_broker_process(self):
         """Stop standalone STOMP Broker process and close port 61614"""
@@ -1266,7 +1402,7 @@ class USPGuiApp:
             time.sleep(0.3)
             self._update_gui_offline()
         except Exception as e:
-            messagebox.showerror("錯誤", f"關閉 STOMP Broker 失敗: {e}")
+            self.show_error("錯誤", f"關閉 STOMP Broker 失敗:\n{e}")
 
     def launch_daemon_black_window(self):
         """Launch USP Controller Daemon in its own dedicated black console window"""
@@ -1280,7 +1416,7 @@ class USPGuiApp:
             else:
                 subprocess.Popen([sys.executable, "tools/usp_daemon.py"], cwd=str(Path(__file__).parent))
         except Exception as e:
-            messagebox.showerror("啟動錯誤", f"無法啟動 Controller: {e}")
+            self.show_error("啟動錯誤", f"無法啟動 Controller:\n{e}")
 
     def on_stop_daemon_clicked(self):
         """Ask Controller Daemon to shut down and close its console window"""
@@ -1295,9 +1431,9 @@ class USPGuiApp:
         ok = self.ipc_client.ping()
         elapsed = round((time.time() - t0) * 1000, 2)
         if ok:
-            messagebox.showinfo("Ping 測試", f"Daemon 伺服器連線正常！(延遲: {elapsed} ms)")
+            self.show_success("Ping 測試", f"Daemon 伺服器連線正常！\n(延遲: {elapsed} ms)")
         else:
-            messagebox.showerror("Ping 測試", "無法連接 Daemon 伺服器 (127.0.0.1:6001)。")
+            self.show_error("Ping 測試", "無法連接 Daemon 伺服器 (127.0.0.1:6001)。\n請確認 Controller 守護進程是否已啟動。")
 
     # ------------------------------------------
     # Parameter Operations
@@ -1338,7 +1474,7 @@ class USPGuiApp:
     def on_param_get_clicked(self):
         path = self.param_path_var.get().strip()
         if not path:
-            messagebox.showwarning("警告", "請輸入欲查詢的參數路徑。")
+            self.show_warning("警告", "請輸入欲查詢的參數路徑。")
             return
 
         cmd = f"get {self._get_target_prefix()}{path}"
@@ -1385,9 +1521,13 @@ class USPGuiApp:
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _handle_param_result(self, res):
+    def _handle_param_result(self, res, show_dialog: bool = True):
         if not res.success:
-            messagebox.showerror("操作失敗", res.error or "指令執行未成功")
+            if show_dialog:
+                err_msg = res.error or "指令執行未成功"
+                if res.data:
+                    err_msg += f"\n\n【詳細資訊 / Error Data】:\n{json.dumps(res.data, indent=2, ensure_ascii=False)}"
+                self.show_error("操作失敗", err_msg)
             return
 
         now_str = time.strftime("%H:%M:%S")
@@ -1430,9 +1570,26 @@ class USPGuiApp:
         if updated_count > 0:
             self._filter_params()
             self.status_bar.config(text=f"已成功更新 {updated_count} 筆參數至檢視表 ({now_str})")
-        elif res.message:
-            self.status_bar.config(text=res.message)
-            messagebox.showinfo("成功", res.message)
+
+        # Show complete result & payload dialog
+        if show_dialog:
+            lines = []
+            if res.message:
+                lines.append(f"【狀態訊息】\n{res.message}\n")
+            elif updated_count > 0:
+                lines.append(f"【狀態訊息】\n已成功查詢並更新 {updated_count} 筆參數至檢視表！\n")
+            else:
+                lines.append("【狀態訊息】\n操作已成功完成！\n")
+
+            if res.data is not None:
+                lines.append("【回應 Payload 內容】")
+                if isinstance(res.data, (dict, list)):
+                    lines.append(json.dumps(res.data, indent=2, ensure_ascii=False))
+                else:
+                    lines.append(str(res.data))
+
+            msg = "\n".join(lines) if lines else "操作成功完成 (無回傳內容)"
+            self.show_success("操作成功與 Payload 回應", msg)
 
     def _clear_param_filter(self):
         """Clear filter entry and show all parameters"""
@@ -1492,10 +1649,32 @@ class USPGuiApp:
 
     def _show_cmd_result(self, res):
         if not res.success:
-            messagebox.showerror("錯誤", res.error or "指令執行失敗")
+            err_msg = res.error or "指令執行失敗"
+            if res.data:
+                err_msg += f"\n\n【詳細數據 / Error Data】:\n{json.dumps(res.data, indent=2, ensure_ascii=False)}"
+            self.show_error("執行失敗", err_msg)
         else:
-            msg = res.message or json.dumps(res.data, indent=2, ensure_ascii=False)
-            messagebox.showinfo("執行結果", msg)
+            lines = []
+            if res.message:
+                lines.append(f"【狀態訊息】\n{res.message}\n")
+            
+            if res.data is not None:
+                lines.append("【回應 Payload 內容】")
+                if isinstance(res.data, (dict, list)):
+                    lines.append(json.dumps(res.data, indent=2, ensure_ascii=False))
+                else:
+                    lines.append(str(res.data))
+            
+            msg = "\n".join(lines) if lines else "指令執行成功 (無額外回傳內容)"
+            
+            # Also auto-update parameters into Parameter Explorer table if data contains parameters
+            if res.data:
+                try:
+                    self._handle_param_result(res, show_dialog=False)
+                except Exception:
+                    pass
+                    
+            self.show_success("執行結果與 Payload", msg)
 
     def _reload_scripts_dropdown(self):
         scripts_dir = Path(__file__).parent / "scripts"
@@ -1508,7 +1687,7 @@ class USPGuiApp:
     def on_run_script_clicked(self):
         script_name = self.combo_scripts.get()
         if not script_name:
-            messagebox.showwarning("警告", "請選擇測試腳本。")
+            self.show_warning("警告", "請選擇測試腳本。")
             return
 
         script_path = str(Path(__file__).parent / "scripts" / script_name)
