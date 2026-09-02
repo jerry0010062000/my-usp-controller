@@ -185,9 +185,60 @@ class USPGuiApp:
         # Clean shutdown handler
         self.root.protocol("WM_DELETE_WINDOW", self.on_close_window)
 
+        # Request Lock & Action Buttons State (Race Condition & Freeze Prevention)
+        self._cmd_lock = threading.Lock()
+        self._is_busy = False
+        self._action_buttons: List[ttk.Button] = []
+
         # Start periodic polling
         self.poll_thread = threading.Thread(target=self._periodic_daemon_polling, daemon=True)
         self.poll_thread.start()
+
+    def _register_action_button(self, btn: ttk.Button) -> ttk.Button:
+        """Register an action button so its state is auto-disabled during in-flight requests."""
+        if btn not in self._action_buttons:
+            self._action_buttons.append(btn)
+        return btn
+
+    def _acquire_request_lock(self, action_name: str = "操作") -> bool:
+        """Try to acquire request lock (non-blocking). Returns True if acquired, False if already busy."""
+        if not self._cmd_lock.acquire(blocking=False):
+            self.status_bar.config(text="⚠️ 前一項操作仍在執行中，請稍候再試...")
+            return False
+        self._is_busy = True
+        self._set_ui_busy_state(True, action_name)
+        return True
+
+    def _release_request_lock(self):
+        """Release request lock and restore UI state."""
+        self._is_busy = False
+        self._set_ui_busy_state(False)
+        try:
+            self._cmd_lock.release()
+        except RuntimeError:
+            pass
+
+    def _set_ui_busy_state(self, is_busy: bool, action_name: str = ""):
+        """Update cursor and button states during in-flight requests safely on main thread."""
+        def apply():
+            cursor = "wait" if is_busy else ""
+            try:
+                self.root.configure(cursor=cursor)
+            except Exception:
+                pass
+            btn_state = "disabled" if is_busy else "normal"
+            for btn in self._action_buttons:
+                try:
+                    btn.configure(state=btn_state)
+                except Exception:
+                    pass
+            if is_busy and action_name:
+                self.status_bar.config(text=f"⏳ 正在執行: {action_name} ... (請稍候)")
+
+        if threading.current_thread() is threading.main_thread():
+            apply()
+        else:
+            self.root.after(0, apply)
 
     def show_error(self, title: str, message: str):
         show_selectable_dialog(self.root, title, message, dialog_type="error")
@@ -380,13 +431,23 @@ class USPGuiApp:
         # Bottom Buttons (Packed first at bottom to reserve space)
         btn_frame = ttk.Frame(left_frame)
         btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
-        ttk.Button(btn_frame, text="設為操作目標", style="Primary.TButton", command=self.on_set_active_target).pack(side=tk.TOP, fill=tk.X, expand=True, pady=(0, 4))
-        ttk.Button(btn_frame, text="探測 / 連線", command=self.on_probe_agent_clicked).pack(side=tk.TOP, fill=tk.X, expand=True, pady=(0, 4))
+        btn_target = ttk.Button(btn_frame, text="設為操作目標", style="Primary.TButton", command=self.on_set_active_target)
+        btn_target.pack(side=tk.TOP, fill=tk.X, expand=True, pady=(0, 4))
+        self._register_action_button(btn_target)
+
+        btn_probe = ttk.Button(btn_frame, text="探測 / 連線", command=self.on_probe_agent_clicked)
+        btn_probe.pack(side=tk.TOP, fill=tk.X, expand=True, pady=(0, 4))
+        self._register_action_button(btn_probe)
 
         del_frame = ttk.Frame(btn_frame)
         del_frame.pack(side=tk.TOP, fill=tk.X, expand=True)
-        ttk.Button(del_frame, text="清除離線", command=self.on_clear_offline_clicked).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
-        ttk.Button(del_frame, text="移除選中", command=self.on_remove_selected_device_clicked).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+        btn_clear = ttk.Button(del_frame, text="清除離線", command=self.on_clear_offline_clicked)
+        btn_clear.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        self._register_action_button(btn_clear)
+
+        btn_rm = ttk.Button(del_frame, text="移除選中", command=self.on_remove_selected_device_clicked)
+        btn_rm.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+        self._register_action_button(btn_rm)
 
         # Device Treeview Container (Packed between top filter and bottom buttons)
         tree_container = ttk.Frame(left_frame)
@@ -499,13 +560,33 @@ class USPGuiApp:
         p_btn_row = ttk.Frame(self.tab_params)
         p_btn_row.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Button(p_btn_row, text="查詢 (Get)", style="Primary.TButton", command=self.on_param_get_clicked).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(p_btn_row, text="修改 (Set)", command=self.on_param_set_clicked).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(p_btn_row, text="新增實例 (Add)", command=self.on_param_add_clicked).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(p_btn_row, text="刪除實例 (Del)", command=self.on_param_delete_clicked).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(p_btn_row, text="查詢架構 (GetDM)", command=self.on_param_get_dm_clicked).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(p_btn_row, text="實例清單 (GetInst)", command=self.on_param_get_inst_clicked).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(p_btn_row, text="清空清單", command=self.on_clear_param_tree_clicked).pack(side=tk.RIGHT)
+        b_get = ttk.Button(p_btn_row, text="查詢 (Get)", style="Primary.TButton", command=self.on_param_get_clicked)
+        b_get.pack(side=tk.LEFT, padx=(0, 4))
+        self._register_action_button(b_get)
+
+        b_set = ttk.Button(p_btn_row, text="修改 (Set)", command=self.on_param_set_clicked)
+        b_set.pack(side=tk.LEFT, padx=(0, 4))
+        self._register_action_button(b_set)
+
+        b_add = ttk.Button(p_btn_row, text="新增實例 (Add)", command=self.on_param_add_clicked)
+        b_add.pack(side=tk.LEFT, padx=(0, 4))
+        self._register_action_button(b_add)
+
+        b_del = ttk.Button(p_btn_row, text="刪除實例 (Del)", command=self.on_param_delete_clicked)
+        b_del.pack(side=tk.LEFT, padx=(0, 4))
+        self._register_action_button(b_del)
+
+        b_dm = ttk.Button(p_btn_row, text="查詢架構 (GetDM)", command=self.on_param_get_dm_clicked)
+        b_dm.pack(side=tk.LEFT, padx=(0, 4))
+        self._register_action_button(b_dm)
+
+        b_inst = ttk.Button(p_btn_row, text="實例清單 (GetInst)", command=self.on_param_get_inst_clicked)
+        b_inst.pack(side=tk.LEFT, padx=(0, 4))
+        self._register_action_button(b_inst)
+
+        b_clr = ttk.Button(p_btn_row, text="清空清單", command=self.on_clear_param_tree_clicked)
+        b_clr.pack(side=tk.RIGHT)
+        self._register_action_button(b_clr)
 
         # Row 3: Parameter Filter & Search Bar (Real-time Filter)
         p_filter_row = ttk.Frame(self.tab_params)
@@ -558,25 +639,33 @@ class USPGuiApp:
         c1 = ttk.LabelFrame(grid_frame, text=" ℹ️ 系統與設備資訊 (DeviceInfo) ", padding=12)
         c1.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         ttk.Label(c1, text="查詢 Agent 軟體版本、序號、製造商、運行時間等基礎系統資訊。", wraplength=260).pack(anchor=tk.W, pady=(0, 10))
-        ttk.Button(c1, text="查詢 DeviceInfo", style="Primary.TButton", command=lambda: self.send_ipc_cmd_async("get Device.DeviceInfo.")).pack(anchor=tk.W)
+        btn_c1 = ttk.Button(c1, text="查詢 DeviceInfo", style="Primary.TButton", command=lambda: self.send_ipc_cmd_async("get Device.DeviceInfo."))
+        btn_c1.pack(anchor=tk.W)
+        self._register_action_button(btn_c1)
 
         # Card 2: WiFi & Network Radios
         c2 = ttk.LabelFrame(grid_frame, text=" 📶 WiFi 無線網路管理 (WiFi.Radio) ", padding=12)
         c2.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
         ttk.Label(c2, text="檢視 2.4G / 5G / 6G Radio 頻段狀態、SSID 與頻道設定。", wraplength=260).pack(anchor=tk.W, pady=(0, 10))
-        ttk.Button(c2, text="查詢 WiFi Radios", style="Action.TButton", command=lambda: self.send_ipc_cmd_async("get Device.WiFi.Radio.")).pack(anchor=tk.W)
+        btn_c2 = ttk.Button(c2, text="查詢 WiFi Radios", style="Action.TButton", command=lambda: self.send_ipc_cmd_async("get Device.WiFi.Radio."))
+        btn_c2.pack(anchor=tk.W)
+        self._register_action_button(btn_c2)
 
         # Card 3: DHCP Server & Pools
         c3 = ttk.LabelFrame(grid_frame, text=" 🌐 DHCP 伺服器與位址池 (DHCPv4) ", padding=12)
         c3.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
         ttk.Label(c3, text="管理 DHCPv4 Server Pool 配置，新增/刪除位址發放範圍。", wraplength=260).pack(anchor=tk.W, pady=(0, 10))
-        ttk.Button(c3, text="查詢 DHCP Pools", style="Action.TButton", command=lambda: self.send_ipc_cmd_async("get Device.DHCPv4.Server.Pool.")).pack(anchor=tk.W)
+        btn_c3 = ttk.Button(c3, text="查詢 DHCP Pools", style="Action.TButton", command=lambda: self.send_ipc_cmd_async("get Device.DHCPv4.Server.Pool."))
+        btn_c3.pack(anchor=tk.W)
+        self._register_action_button(btn_c3)
 
         # Card 4: IP Diagnostics / Ping RPC
         c4 = ttk.LabelFrame(grid_frame, text=" ⚡ 遠端診斷與 RPC 操作 (Operate) ", padding=12)
         c4.grid(row=1, column=1, sticky="nsew", padx=8, pady=8)
         ttk.Label(c4, text="發送遠端 RPC 指令或觸發 IPPing 診斷流程。", wraplength=260).pack(anchor=tk.W, pady=(0, 10))
-        ttk.Button(c4, text="查詢 IP.Interface", style="Action.TButton", command=lambda: self.send_ipc_cmd_async("get Device.IP.Interface.")).pack(anchor=tk.W)
+        btn_c4 = ttk.Button(c4, text="查詢 IP.Interface", style="Action.TButton", command=lambda: self.send_ipc_cmd_async("get Device.IP.Interface."))
+        btn_c4.pack(anchor=tk.W)
+        self._register_action_button(btn_c4)
 
         grid_frame.columnconfigure(0, weight=1)
         grid_frame.columnconfigure(1, weight=1)
@@ -593,7 +682,9 @@ class USPGuiApp:
         self.action_cmd_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), ipady=4)
         self.action_cmd_entry.bind("<Return>", lambda e: self.on_action_cmd_enter())
 
-        ttk.Button(c_inner, text="發送指令 (Enter)", style="Primary.TButton", command=self.on_action_cmd_enter).pack(side=tk.LEFT)
+        btn_send = ttk.Button(c_inner, text="發送指令 (Enter)", style="Primary.TButton", command=self.on_action_cmd_enter)
+        btn_send.pack(side=tk.LEFT)
+        self._register_action_button(btn_send)
 
     # ------------------------------------------
     # Tab 3: CDRouter Test Scripts
@@ -1333,21 +1424,27 @@ class USPGuiApp:
         if not ep or not ep.strip():
             return
         ep = ep.strip()
+        if not self._acquire_request_lock(f"探測 Agent ({ep})"):
+            return
+
         self.status_bar.config(text=f"正在向 {ep} 發送 USP 探測請求 (Get Device.DeviceInfo.) ...")
         self.root.update_idletasks()
 
         def do_probe():
-            res = self.ipc_client.exec_cmd(f"get {ep} Device.DeviceInfo.", timeout=8.0)
-            def on_done():
-                if res.success:
-                    self.ipc_client.set_target(ep)
-                    self.refresh_devices()
-                    self.status_bar.config(text=f"已成功探測並連線至 Agent: {ep}")
-                    self.show_success("探測成功", f"已成功收到來自 {ep} 的回應，並已自動註冊至設備清單！")
-                else:
-                    self.status_bar.config(text=f"探測 {ep} 未收到回應: {res.error}")
-                    self.show_warning("探測未回應", f"向 {ep} 發送請求未收到回應。\n\n可能原因:\n1. DUT 尚未啟動或尚未連上 STOMP Broker (192.168.1.126:61614)\n2. Windows 防火牆未放行 61614 埠\n3. DUT 的 Controller 白名單未設定 Controller ID: proto::controller.default\n4. DUT 的接收 Topic 與設定不一致\n\n詳細錯誤訊息:\n{res.error}")
-            self.root.after(0, on_done)
+            try:
+                res = self.ipc_client.exec_cmd(f"get {ep} Device.DeviceInfo.", timeout=8.0)
+                def on_done():
+                    if res.success:
+                        self.ipc_client.set_target(ep)
+                        self.refresh_devices()
+                        self.status_bar.config(text=f"已成功探測並連線至 Agent: {ep}")
+                        self.show_success("探測成功", f"已成功收到來自 {ep} 的回應，並已自動註冊至設備清單！")
+                    else:
+                        self.status_bar.config(text=f"探測 {ep} 未收到回應: {res.error}")
+                        self.show_warning("探測未回應", f"向 {ep} 發送請求未收到回應。\n\n可能原因:\n1. DUT 尚未啟動或尚未連上 STOMP Broker (192.168.1.126:61614)\n2. Windows 防火牆未放行 61614 埠\n3. DUT 的 Controller 白名單未設定 Controller ID: proto::controller.default\n4. DUT 的接收 Topic 與設定不一致\n\n詳細錯誤訊息:\n{res.error}")
+                self.root.after(0, on_done)
+            finally:
+                self._release_request_lock()
 
         threading.Thread(target=do_probe, daemon=True).start()
 
@@ -1514,10 +1611,20 @@ class USPGuiApp:
         self._execute_param_cmd_and_render(cmd)
 
     def _execute_param_cmd_and_render(self, cmd_line: str):
+        op_name = cmd_line.split()[0].upper()
+        if not self._acquire_request_lock(f"參數操作 ({op_name})"):
+            return
 
         def run():
-            res = self.ipc_client.exec_cmd(cmd_line, timeout=10.0)
-            self.root.after(0, lambda r=res: self._handle_param_result(r))
+            try:
+                res = self.ipc_client.exec_cmd(cmd_line, timeout=12.0)
+                self.root.after(0, lambda r=res: self._handle_param_result(r))
+            except Exception as e:
+                from usp_controller.ipc import IPCResponse
+                err_res = IPCResponse(success=False, error=f"請求異常: {e}")
+                self.root.after(0, lambda r=err_res: self._handle_param_result(r))
+            finally:
+                self._release_request_lock()
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1641,9 +1748,19 @@ class USPGuiApp:
         self.send_ipc_cmd_async(cmd)
 
     def send_ipc_cmd_async(self, cmd_line: str):
+        if not self._acquire_request_lock(f"指令 ({cmd_line.split()[0]})"):
+            return
+
         def run():
-            res = self.ipc_client.exec_cmd(cmd_line, timeout=15.0)
-            self.root.after(0, lambda r=res: self._show_cmd_result(r))
+            try:
+                res = self.ipc_client.exec_cmd(cmd_line, timeout=15.0)
+                self.root.after(0, lambda r=res: self._show_cmd_result(r))
+            except Exception as e:
+                from usp_controller.ipc import IPCResponse
+                err_res = IPCResponse(success=False, error=f"執行異常: {e}")
+                self.root.after(0, lambda r=err_res: self._show_cmd_result(r))
+            finally:
+                self._release_request_lock()
 
         threading.Thread(target=run, daemon=True).start()
 
