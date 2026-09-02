@@ -583,6 +583,10 @@ class USPGuiApp:
         b_inst.pack(side=tk.LEFT, padx=(0, 4))
         self._register_action_button(b_inst)
 
+        b_op = ttk.Button(p_btn_row, text="⚡ 執行 RPC (Operate)", style="Action.TButton", command=self.on_param_operate_clicked)
+        b_op.pack(side=tk.LEFT, padx=(0, 4))
+        self._register_action_button(b_op)
+
         b_clr = ttk.Button(p_btn_row, text="清空清單", command=self.on_clear_param_tree_clicked)
         b_clr.pack(side=tk.RIGHT)
         self._register_action_button(b_clr)
@@ -1611,6 +1615,29 @@ class USPGuiApp:
         cmd = f"get_instances {self._get_target_prefix()}{path}"
         self._execute_param_cmd_and_render(cmd)
 
+    def on_param_operate_clicked(self):
+        """Invoke USP Operate / RPC method on target agent"""
+        path = self.param_path_var.get().strip()
+        if not path:
+            self.show_warning("警告", "請輸入欲執行的 RPC 方法路徑。\n(例如: Device.Reboot() 或 Device.IP.Diagnostics.IPPing())")
+            return
+
+        args_input = simpledialog.askstring(
+            "執行 RPC 指令 (Operate / RPC)",
+            f"即將對目標設備執行 RPC 方法:\n{path}\n\n請輸入輸入參數 (Input Arguments，若無請直接按確定，多個參數請以 key=val 格式輸入):\n(範例: Host=8.8.8.8 NumberOfRepetitions=3)",
+            parent=self.root
+        )
+        if args_input is None:
+            return
+
+        args_str = args_input.strip()
+        if args_str:
+            cmd = f"operate {self._get_target_prefix()}{path} {args_str}"
+        else:
+            cmd = f"operate {self._get_target_prefix()}{path}"
+
+        self._execute_param_cmd_and_render(cmd)
+
     def _execute_param_cmd_and_render(self, cmd_line: str):
         op_name = cmd_line.split()[0].upper()
         if not self._acquire_request_lock(f"參數操作 ({op_name})"):
@@ -1689,6 +1716,15 @@ class USPGuiApp:
                     # Check if GetSupportedDM format
                     if "supported_objs" in item or "req_obj_path" in item:
                         parse_supported_dm_item(item)
+                    elif "operation_results" in item:
+                        for op_res in item.get("operation_results", []):
+                            cmd_name = op_res.get("executed_command", "RPC Command")
+                            out_args = op_res.get("output_args", {}) or op_res.get("cmd_output_args", {})
+                            self._upsert_param_row(cmd_name, "執行成功", "Command", "可執行 (Exec)", now_str)
+                            updated_count += 1
+                            for out_k, out_v in out_args.items():
+                                self._upsert_param_row(f"{cmd_name}.{out_k}", str(out_v), type(out_v).__name__, "RPC Output", now_str)
+                                updated_count += 1
                     else:
                         # Format: {"Parameter": "...", "Value": "..."} or {"path": "...", "value": "..."}
                         p = item.get("Parameter") or item.get("path") or item.get("param") or item.get("instantiated_path")
@@ -1712,6 +1748,15 @@ class USPGuiApp:
                 for inst_path in res.data["instances"]:
                     self._upsert_param_row(str(inst_path), "(Instance / Object)", "Object", "實例 (Inst)", now_str)
                     updated_count += 1
+            elif "operation_results" in res.data and isinstance(res.data["operation_results"], list):
+                for op_res in res.data.get("operation_results", []):
+                    cmd_name = op_res.get("executed_command", "RPC Command")
+                    out_args = op_res.get("output_args", {}) or op_res.get("cmd_output_args", {})
+                    self._upsert_param_row(cmd_name, "執行成功", "Command", "可執行 (Exec)", now_str)
+                    updated_count += 1
+                    for out_k, out_v in out_args.items():
+                        self._upsert_param_row(f"{cmd_name}.{out_k}", str(out_v), type(out_v).__name__, "RPC Output", now_str)
+                        updated_count += 1
             else:
                 params = res.data.get("parameters", res.data)
                 if isinstance(params, dict):
