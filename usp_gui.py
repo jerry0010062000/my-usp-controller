@@ -178,17 +178,16 @@ class USPGuiApp:
         self.cfg_mdns_var = tk.BooleanVar(value=True)
         self._load_config_to_vars()
 
-        self._setup_styles()
-        self._build_ui()
-
-
-        # Clean shutdown handler
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close_window)
-
         # Request Lock & Action Buttons State (Race Condition & Freeze Prevention)
         self._cmd_lock = threading.Lock()
         self._is_busy = False
         self._action_buttons: List[ttk.Button] = []
+
+        self._setup_styles()
+        self._build_ui()
+
+        # Clean shutdown handler
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close_window)
 
         # Start periodic polling
         self.poll_thread = threading.Thread(target=self._periodic_daemon_polling, daemon=True)
