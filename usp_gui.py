@@ -1758,18 +1758,53 @@ class USPGuiApp:
             msg = "\n".join(lines) if lines else "操作成功完成 (無回傳內容)"
             self.show_success("操作成功與 Payload 回應", msg)
 
+    def _normalize_schema_pattern(self, schema_path: str) -> str:
+        """Convert a schema path with {i} to a regex pattern matching instances"""
+        import re
+        escaped = re.escape(schema_path)
+        pattern = escaped.replace(r'\{i\}', r'\d+')
+        return f"^{pattern}$"
+
+    def _sync_schema_to_instances(self, schema_path: str, ptype: str, access: str):
+        """When a schema path with {i} is updated, propagate its type & access to all existing instantiated paths"""
+        import re
+        if "{i}" not in schema_path:
+            return
+        pattern = self._normalize_schema_pattern(schema_path)
+        prog = re.compile(pattern)
+        for path, item in self.cached_params.items():
+            if "{i}" not in path and prog.match(path):
+                if access and access != "-":
+                    item["access"] = access
+                if ptype and ptype not in ("-", "String", "Object") and item.get("type") in ("-", "String"):
+                    item["type"] = ptype
+
+    def _find_schema_for_instance(self, inst_path: str):
+        """Find matching schema definition for an instantiated path to inherit type & access"""
+        import re
+        for path, item in self.cached_params.items():
+            if "{i}" in path:
+                pattern = self._normalize_schema_pattern(path)
+                if re.match(pattern, inst_path):
+                    return item.get("type"), item.get("access")
+        return None, None
+
     def _clear_param_filter(self):
         """Clear filter entry and show all parameters"""
         self.param_filter_var.set("")
         self._filter_params()
 
     def _filter_params(self):
-        """Filter parameters by path, value, type, or access in real time"""
+        """Filter parameters by path, value, type, or access in real time (supporting instance matching)"""
+        import re
         filter_text = self.param_filter_var.get().strip().lower()
         self.param_tree.delete(*self.param_tree.get_children())
 
         displayed = 0
         total = len(self.cached_params)
+
+        # Build normalized filter regex if user typed numbered instance
+        filter_norm = re.sub(r'\.\d+\.', '.{i}.', filter_text) if filter_text else ""
 
         for path, item in sorted(self.cached_params.items()):
             val = str(item.get("value", ""))
@@ -1779,7 +1814,9 @@ class USPGuiApp:
 
             # Filter matches path, value, type, or access
             if filter_text:
-                if (filter_text not in path.lower() and 
+                path_lower = path.lower()
+                matches_path = (filter_text in path_lower) or (filter_norm and filter_norm in path_lower)
+                if (not matches_path and 
                     filter_text not in val.lower() and 
                     filter_text not in ptype.lower() and 
                     filter_text not in access.lower()):
@@ -1791,8 +1828,16 @@ class USPGuiApp:
         self.lbl_param_count.config(text=f"顯示: {displayed} / {total} 筆")
 
     def _upsert_param_row(self, path: str, val: str, ptype: str, access: str, now_str: str):
-        """Store into cache dict with access/writable support (Treeview rendered via _filter_params)"""
+        """Store into cache dict with access/writable support and schema-to-instance inheritance"""
         existing = self.cached_params.get(path, {})
+
+        # If this is an instance path (without {i}) and access is unknown, inherit from matching schema
+        if "{i}" not in path and (access == "-" or not access):
+            schema_type, schema_acc = self._find_schema_for_instance(path)
+            if schema_acc:
+                access = schema_acc
+            if schema_type and (ptype == "-" or ptype == "String"):
+                ptype = schema_type
 
         # If new access is unspecified ("-"), preserve existing known access
         if access == "-" and "access" in existing and existing["access"] != "-":
@@ -1809,6 +1854,10 @@ class USPGuiApp:
             "access": access,
             "updated": now_str
         }
+
+        # If this was a schema path with {i}, propagate to all matching existing instances in cache
+        if "{i}" in path:
+            self._sync_schema_to_instances(path, ptype, access)
 
 
 
